@@ -80,6 +80,10 @@ bool PlayerController::openFile(const std::string& filename) {
 }
 
 void PlayerController::play() {
+    if (m_state == PlayerState::ENDED) {
+        seek(0.0);
+    }
+
     if (m_state != PlayerState::OPENED && m_state != PlayerState::PAUSED) {
         return;
     }
@@ -191,12 +195,43 @@ double PlayerController::getCurrentTime() {
         return 0.0;
     }
 
+    if (m_state == PlayerState::ENDED) {
+        return getDuration();
+    }
+
+    double currentTime;
     if (m_hasAudio) {
-        return m_audioDecoder->getAudioClock();
+        currentTime = m_audioDecoder->getAudioClock();
     } else {
         updateClockForVideoOnly();
-        return m_videoClock;
+        currentTime = m_videoClock;
     }
+
+    double duration = getDuration();
+    bool reachedEnd = false;
+
+    if (duration > 0.0 && currentTime >= duration) {
+        reachedEnd = true;
+    } else if (m_demuxer && m_demuxer->isEOF()) {
+        bool videoQueueEmpty = !m_hasVideo || m_videoQueue.empty();
+        bool audioQueueEmpty = !m_hasAudio || m_audioQueue.empty();
+        if (videoQueueEmpty && audioQueueEmpty) {
+            reachedEnd = true;
+        }
+    }
+
+    if (reachedEnd) {
+        currentTime = duration > 0.0 ? duration : currentTime;
+        if (m_state == PlayerState::PLAYING) {
+            m_state = PlayerState::ENDED;
+            if (m_hasAudio && m_audioDecoder) {
+                m_audioDecoder->pause();
+            }
+            std::cout << "Playback reached end, transitioned to ENDED state" << std::endl;
+        }
+    }
+
+    return currentTime;
 }
 
 double PlayerController::getDuration() const {
@@ -225,4 +260,8 @@ void PlayerController::setVolume(float volume) {
     if (m_hasAudio && m_audioDecoder) {
         m_audioDecoder->setVolume(m_volume);
     }
+}
+
+bool PlayerController::isEOF() const {
+    return m_demuxer ? m_demuxer->isEOF() : false;
 }

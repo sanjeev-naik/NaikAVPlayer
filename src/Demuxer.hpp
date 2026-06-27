@@ -37,6 +37,7 @@ private:
     std::atomic<bool> m_seekRequested;
     std::atomic<double> m_seekTargetTime;
     std::mutex m_seekMutex;
+    std::atomic<bool> m_eof;
 
     void threadLoop();
     void performSeek();
@@ -65,4 +66,5 @@ public:
     int64_t getAudioStartTime() const { return m_audioStartTime; }
     double getDuration() const { return m_duration; }
     bool isRunning() const { return m_running; }
+    bool isEOF() const { return m_eof.load(); }
 };
