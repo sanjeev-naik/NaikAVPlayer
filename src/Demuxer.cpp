@@ -18,7 +18,8 @@ Demuxer::Demuxer(const std::string& filename,
       m_audioQueue(audioQueue),
       m_running(false),
       m_seekRequested(false),
-      m_seekTargetTime(0.0) {
+      m_seekTargetTime(0.0),
+      m_eof(false) {
     m_videoTimeBase = {0, 1};
     m_audioTimeBase = {0, 1};
 }
@@ -36,6 +37,9 @@ bool Demuxer::open() {
         std::cerr << "Error: Could not open media file " << m_filename << std::endl;
         return false;
     }
+
+    // Enable fast seek using index tables instead of parsing frames
+    m_formatCtx->flags |= AVFMT_FLAG_FAST_SEEK;
 
     // Retrieve stream info
     if (avformat_find_stream_info(m_formatCtx, nullptr) < 0) {
@@ -78,6 +82,7 @@ bool Demuxer::open() {
               << ", Video Stream: " << m_videoStreamIdx 
               << ", Audio Stream: " << m_audioStreamIdx << std::endl;
 
+    m_eof = false;
     return true;
 }
 
@@ -102,6 +107,7 @@ void Demuxer::seek(double timeInSeconds) {
     
     m_seekTargetTime = timeInSeconds;
     m_seekRequested = true;
+    m_eof = false;
 }
 
 void Demuxer::performSeek() {
@@ -110,6 +116,7 @@ void Demuxer::performSeek() {
     // Capture target time and reset request flag at the start
     double targetTime = m_seekTargetTime;
     m_seekRequested = false;
+    m_eof = false;
     
     // Clear both queues to drop packets from the old position
     m_videoQueue.clear([](AVPacket*& pkt) { av_packet_free(&pkt); });
@@ -130,13 +137,13 @@ void Demuxer::performSeek() {
         targetTs = static_cast<int64_t>(targetTime * AV_TIME_BASE);
     }
     
-    // Seek to nearest keyframe before/at target timestamp
-    int ret = av_seek_frame(m_formatCtx, streamIdx, targetTs, AVSEEK_FLAG_BACKWARD);
+    // Seek to nearest keyframe around target timestamp using modern fast binary-search avformat_seek_file
+    int ret = avformat_seek_file(m_formatCtx, streamIdx, INT64_MIN, targetTs, INT64_MAX, 0);
     if (ret < 0) {
         std::cerr << "Warning: Could not seek to " << targetTime << "s using stream " << streamIdx << std::endl;
         // Fallback to default seek if stream-specific seek fails
         int64_t fallbackTs = static_cast<int64_t>(targetTime * AV_TIME_BASE);
-        av_seek_frame(m_formatCtx, -1, fallbackTs, AVSEEK_FLAG_BACKWARD);
+        avformat_seek_file(m_formatCtx, -1, INT64_MIN, fallbackTs, INT64_MAX, 0);
     } else {
         std::cout << "Successfully seeked format context to " << targetTime << "s" << std::endl;
     }
@@ -174,6 +181,7 @@ void Demuxer::threadLoop() {
             av_packet_free(&packet);
             
             if (ret == AVERROR_EOF) {
+                m_eof = true;
                 // At EOF, sleep a bit so we don't hog CPU. If user seeks back, loop resumes.
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
             } else {

@@ -62,6 +62,7 @@ public:
     float getVolume() const { return m_volume; }
     bool hasAudio() const { return m_hasAudio; }
     bool hasVideo() const { return m_hasVideo; }
+    bool isEOF() const;
     
     VideoDecoder* getVideoDecoder() const { return m_videoDecoder.get(); }
     

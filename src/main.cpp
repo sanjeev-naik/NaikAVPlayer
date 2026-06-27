@@ -197,9 +197,21 @@ int main(int argc, char* argv[]) {
             
             // Loop decoding to drop late frames (catch-up mechanism)
             // A small 10ms threshold prevents jumping frames too aggressively
-            // We limit the number of drops to max 8 frames per render tick to keep the UI fluid
+            // We limit the number of drops to max 8 frames per render tick when playing to keep the UI fluid.
+            // When paused (OPENED state), we allow more drops (up to 2000) to catch up to the seek target instantly.
             int framesDropped = 0;
-            while (decoder->getCurrentFramePts() < timeNow - 0.010 && framesDropped < 8) {
+            int maxDrops = 8;
+            if (decoder->isSeeking()) {
+                // If we are seeking, decode frames instantly (up to 2000) to reach the target position
+                maxDrops = 2000;
+            } else {
+                double ptsBeforeLoop = decoder->getCurrentFramePts();
+                double timeDiff = timeNow - ptsBeforeLoop;
+                if (timeDiff > 0.5) {
+                    maxDrops = 32;
+                }
+            }
+            while (decoder->getCurrentFramePts() < timeNow - 0.010 && framesDropped < maxDrops) {
                 if (!decoder->decodeNextFrame()) {
                     // Stop skipping if we hit EOF or error
                     break;
@@ -207,9 +219,26 @@ int main(int argc, char* argv[]) {
                 framesDropped++;
             }
 
+            // If we have caught up to the seek target or reached EOF, reset seeking flag
+            if (decoder->isSeeking()) {
+                if (decoder->getCurrentFramePts() >= timeNow - 0.080 || controller.getState() == PlayerState::ENDED || controller.isEOF()) {
+                    decoder->setSeeking(false);
+                }
+            }
+
             // Extract the freshly decoded YUV frame
+            bool shouldUpdateTexture = true;
+            // Suppress intermediate texture updates during catch-up to prevent fast-forward or flashing effects
+            if (decoder->getCurrentFramePts() < timeNow - 0.080 && framesDropped > 0) {
+                shouldUpdateTexture = false;
+            }
+
+            if (shouldUpdateTexture) {
+                decoder->convertFrame();
+            }
+
             AVFrame* yuvFrame = decoder->getYUVFrame();
-            if (yuvFrame && yuvFrame->data[0]) {
+            if (shouldUpdateTexture && yuvFrame && yuvFrame->data[0]) {
                 // Re-create video display texture if dimensions changed
                 if (!videoTexture || texWidth != decoder->getWidth() || texHeight != decoder->getHeight()) {
                     if (videoTexture) {

@@ -17,7 +17,8 @@ VideoDecoder::VideoDecoder(AVCodecParameters* codecParams,
       m_yuvBuffer(nullptr),
       m_yuvBufferSize(0),
       m_currentFramePts(0.0),
-      m_flushRequested(false) {}
+      m_flushRequested(false),
+      m_seeking(false) {}
 
 VideoDecoder::~VideoDecoder() {
     if (m_swsCtx) {
@@ -108,6 +109,7 @@ bool VideoDecoder::init() {
 void VideoDecoder::flush() {
     m_flushRequested = true;
     m_currentFramePts = 0.0;
+    m_seeking = true;
 }
 
 bool VideoDecoder::decodeNextFrame() {
@@ -123,42 +125,12 @@ bool VideoDecoder::decodeNextFrame() {
         int ret = avcodec_receive_frame(m_codecCtx, m_decodedFrame);
         if (ret >= 0) {
             // We have successfully decoded a frame.
-            // Setup or reuse the scale context to convert the frame to standard YUV420P
-            if (!m_swsCtx) {
-                m_swsCtx = sws_getContext(
-                    m_codecCtx->width, 
-                    m_codecCtx->height, 
-                    m_codecCtx->pix_fmt,
-                    m_codecCtx->width, 
-                    m_codecCtx->height, 
-                    AV_PIX_FMT_YUV420P,
-                    SWS_BILINEAR, 
-                    nullptr, 
-                    nullptr, 
-                    nullptr
-                );
-            }
-
-            // Perform color format conversion
-            sws_scale(
-                m_swsCtx,
-                m_decodedFrame->data,
-                m_decodedFrame->linesize,
-                0,
-                m_codecCtx->height,
-                m_yuvFrame->data,
-                m_yuvFrame->linesize
-            );
-
             // Compute the Presentation Timestamp (PTS) in seconds relative to the start of the stream
             if (m_decodedFrame->pts != AV_NOPTS_VALUE) {
                 m_currentFramePts = (m_decodedFrame->pts - m_startTime) * av_q2d(m_timeBase);
             } else if (m_decodedFrame->pkt_dts != AV_NOPTS_VALUE) {
                 m_currentFramePts = (m_decodedFrame->pkt_dts - m_startTime) * av_q2d(m_timeBase);
             }
-
-            // Release references of the temporary decoded frame
-            av_frame_unref(m_decodedFrame);
             return true;
         }
 
@@ -182,4 +154,35 @@ bool VideoDecoder::decodeNextFrame() {
             return false;
         }
     }
+}
+
+bool VideoDecoder::convertFrame() {
+    if (!m_codecCtx || !m_decodedFrame || m_decodedFrame->width <= 0) {
+        return false;
+    }
+    if (!m_swsCtx) {
+        m_swsCtx = sws_getContext(
+            m_codecCtx->width, 
+            m_codecCtx->height, 
+            m_codecCtx->pix_fmt,
+            m_codecCtx->width, 
+            m_codecCtx->height, 
+            AV_PIX_FMT_YUV420P,
+            SWS_BILINEAR, 
+            nullptr, 
+            nullptr, 
+            nullptr
+        );
+    }
+    sws_scale(
+        m_swsCtx,
+        m_decodedFrame->data,
+        m_decodedFrame->linesize,
+        0,
+        m_codecCtx->height,
+        m_yuvFrame->data,
+        m_yuvFrame->linesize
+    );
+    av_frame_unref(m_decodedFrame);
+    return true;
 }

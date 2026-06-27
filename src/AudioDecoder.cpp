@@ -117,7 +117,7 @@ bool AudioDecoder::init() {
         return false;
     }
 
-    m_audioBuffer.resize(48000 * 2 * 2); // Initial capacity buffer
+    m_audioBuffer.resize(0); // Initial size 0 to trigger dynamic resize on first frame
     
     std::cout << "Audio initialized successfully. Target format: 48kHz, 16-bit PCM, Stereo" << std::endl;
     return true;
@@ -179,6 +179,9 @@ void AudioDecoder::setClock(double seconds) {
 void AudioDecoder::decodeAndResample() {
     if (m_flushRequested) {
         avcodec_flush_buffers(m_codecCtx);
+        if (m_swrCtx) {
+            swr_init(m_swrCtx);
+        }
         m_audioBufferIndex = 0;
         m_audioBufferSize = 0;
         m_flushRequested = false;
@@ -188,6 +191,20 @@ void AudioDecoder::decodeAndResample() {
         // Try to receive a decoded frame from the decoder
         int ret = avcodec_receive_frame(m_codecCtx, m_decodedFrame);
         if (ret >= 0) {
+            double pts = 0.0;
+            if (m_decodedFrame->pts != AV_NOPTS_VALUE) {
+                double frameSeconds = static_cast<double>(m_decodedFrame->pts) / m_decodedFrame->sample_rate;
+                double startSeconds = static_cast<double>(m_startTime) * av_q2d(m_timeBase);
+                pts = frameSeconds - startSeconds;
+            } else {
+                pts = m_clock;
+            }
+
+            if (pts < m_clock - 0.050) {
+                av_frame_unref(m_decodedFrame);
+                continue;
+            }
+
             // We have a frame! Resample it to stereo 16-bit PCM
             int maxOutSamples = av_rescale_rnd(
                 swr_get_delay(m_swrCtx, m_decodedFrame->sample_rate) + m_decodedFrame->nb_samples,
@@ -220,7 +237,7 @@ void AudioDecoder::decodeAndResample() {
             m_audioBufferIndex = 0;
 
             // Set internal clock to frame start PTS relative to the start of the stream
-            double pts = 0.0;
+            pts = 0.0;
             if (m_decodedFrame->pts != AV_NOPTS_VALUE) {
                 // Convert frame PTS (in codec timebase units: sample count) to seconds
                 double frameSeconds = static_cast<double>(m_decodedFrame->pts) / m_decodedFrame->sample_rate;
