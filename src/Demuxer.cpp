@@ -32,8 +32,14 @@ Demuxer::~Demuxer() {
 }
 
 bool Demuxer::open() {
-    // Open video file
-    if (avformat_open_input(&m_formatCtx, m_filename.c_str(), nullptr, nullptr) < 0) {
+    // Open video file with protocol whitelist restrictions (local file and pipe only)
+    AVDictionary* options = nullptr;
+    av_dict_set(&options, "protocol_whitelist", "file,pipe", 0);
+    
+    int ret = avformat_open_input(&m_formatCtx, m_filename.c_str(), nullptr, &options);
+    av_dict_free(&options);
+
+    if (ret < 0) {
         std::cerr << "Error: Could not open media file " << m_filename << std::endl;
         return false;
     }

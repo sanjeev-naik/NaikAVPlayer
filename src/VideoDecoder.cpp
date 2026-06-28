@@ -18,7 +18,9 @@ VideoDecoder::VideoDecoder(AVCodecParameters* codecParams,
       m_yuvBufferSize(0),
       m_currentFramePts(0.0),
       m_flushRequested(false),
-      m_seeking(false) {}
+      m_seeking(false),
+      m_allocatedWidth(0),
+      m_allocatedHeight(0) {}
 
 VideoDecoder::~VideoDecoder() {
     if (m_swsCtx) {
@@ -101,6 +103,9 @@ bool VideoDecoder::init() {
         return false;
     }
 
+    m_allocatedWidth = m_codecCtx->width;
+    m_allocatedHeight = m_codecCtx->height;
+
     std::cout << "Video initialized successfully. Resolution: " 
               << m_codecCtx->width << "x" << m_codecCtx->height << std::endl;
     return true;
@@ -157,29 +162,85 @@ bool VideoDecoder::decodeNextFrame() {
 }
 
 bool VideoDecoder::convertFrame() {
-    if (!m_codecCtx || !m_decodedFrame || m_decodedFrame->width <= 0) {
+    if (!m_codecCtx || !m_decodedFrame || m_decodedFrame->width <= 0 || m_decodedFrame->height <= 0) {
         return false;
     }
+
+    // Check if the decoded frame's dimensions changed dynamically
+    if (m_decodedFrame->width != m_allocatedWidth || m_decodedFrame->height != m_allocatedHeight) {
+        std::cout << "Dynamic resolution change detected: " 
+                  << m_allocatedWidth << "x" << m_allocatedHeight << " -> "
+                  << m_decodedFrame->width << "x" << m_decodedFrame->height << std::endl;
+
+        // Free old scaling context and YUV buffer
+        if (m_swsCtx) {
+            sws_freeContext(m_swsCtx);
+            m_swsCtx = nullptr;
+        }
+        if (m_yuvBuffer) {
+            av_free(m_yuvBuffer);
+            m_yuvBuffer = nullptr;
+        }
+
+        // Reallocate YUV buffer for the new dimensions
+        m_yuvBufferSize = av_image_get_buffer_size(
+            AV_PIX_FMT_YUV420P,
+            m_decodedFrame->width,
+            m_decodedFrame->height,
+            1
+        );
+        m_yuvBuffer = static_cast<uint8_t*>(av_malloc(m_yuvBufferSize));
+        if (!m_yuvBuffer) {
+            std::cerr << "Error: Could not allocate YUV buffer after resolution change" << std::endl;
+            return false;
+        }
+
+        // Associate the new buffer with the YUV frame
+        int ret = av_image_fill_arrays(
+            m_yuvFrame->data,
+            m_yuvFrame->linesize,
+            m_yuvBuffer,
+            AV_PIX_FMT_YUV420P,
+            m_decodedFrame->width,
+            m_decodedFrame->height,
+            1
+        );
+        if (ret < 0) {
+            std::cerr << "Error: Could not associate YUV buffer on resolution change" << std::endl;
+            av_free(m_yuvBuffer);
+            m_yuvBuffer = nullptr;
+            return false;
+        }
+
+        m_allocatedWidth = m_decodedFrame->width;
+        m_allocatedHeight = m_decodedFrame->height;
+    }
+
     if (!m_swsCtx) {
         m_swsCtx = sws_getContext(
-            m_codecCtx->width, 
-            m_codecCtx->height, 
-            m_codecCtx->pix_fmt,
-            m_codecCtx->width, 
-            m_codecCtx->height, 
+            m_allocatedWidth, 
+            m_allocatedHeight, 
+            static_cast<AVPixelFormat>(m_decodedFrame->format),
+            m_allocatedWidth, 
+            m_allocatedHeight, 
             AV_PIX_FMT_YUV420P,
             SWS_BILINEAR, 
             nullptr, 
             nullptr, 
             nullptr
         );
+        if (!m_swsCtx) {
+            std::cerr << "Error: Could not allocate scaling context on resolution change" << std::endl;
+            return false;
+        }
     }
+
     sws_scale(
         m_swsCtx,
         m_decodedFrame->data,
         m_decodedFrame->linesize,
         0,
-        m_codecCtx->height,
+        m_allocatedHeight,
         m_yuvFrame->data,
         m_yuvFrame->linesize
     );

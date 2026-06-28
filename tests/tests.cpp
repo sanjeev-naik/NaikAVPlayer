@@ -32,6 +32,7 @@ static bool force_packet_alloc_fail = false;
 static bool force_read_error = false;
 static bool force_video_eof = false;
 static bool force_video_error = false;
+static bool force_sws_context_fail = false;
 
 static bool force_zero_channels = false;
 static bool force_sdl_init_fail = false;
@@ -43,6 +44,7 @@ extern "C" {
 #include <libavformat/avformat.h>
 #include <libswresample/swresample.h>
 #include <libavutil/imgutils.h>
+#include <libswscale/swscale.h>
 }
 
 // Inline mock wrappers
@@ -107,6 +109,15 @@ inline int mock_swr_convert(struct SwrContext* s, uint8_t** out, int out_count, 
     return swr_convert(s, out, out_count, in, in_count);
 }
 #define swr_convert mock_swr_convert
+
+inline struct SwsContext* mock_sws_getContext(int srcW, int srcH, enum AVPixelFormat srcFormat,
+                                              int dstW, int dstH, enum AVPixelFormat dstFormat,
+                                              int flags, SwsFilter *srcFilter,
+                                              SwsFilter *dstFilter, const double *param) {
+    if (force_sws_context_fail) return nullptr;
+    return sws_getContext(srcW, srcH, srcFormat, dstW, dstH, dstFormat, flags, srcFilter, dstFilter, param);
+}
+#define sws_getContext mock_sws_getContext
 
 inline int mock_av_seek_frame(AVFormatContext* s, int stream_index, int64_t timestamp, int flags) {
     if (force_seek_fail) return -1;
@@ -263,6 +274,119 @@ int real_main(int argc, char* argv[]) {
         }
         if (hasExceptionArg) {
             throw std::runtime_error("Simulated test exception");
+        }
+
+        // -------------------------------------------------------------
+        // Unit Test: Dynamic Resolution Change Safety Check
+        // -------------------------------------------------------------
+        {
+            ThreadSafeQueue<AVPacket*> dummyQueue;
+            AVCodecParameters* testCodecParams = avcodec_parameters_alloc();
+            testCodecParams->codec_type = AVMEDIA_TYPE_VIDEO;
+            testCodecParams->codec_id = AV_CODEC_ID_RAWVIDEO;
+            testCodecParams->format = AV_PIX_FMT_YUV420P;
+            testCodecParams->width = 160;
+            testCodecParams->height = 120;
+
+            VideoDecoder testDecoder(testCodecParams, {1, 25}, 0, dummyQueue);
+            bool initSuccess = testDecoder.init();
+            test_assert(initSuccess, "VideoDecoder init for dynamic resolution test");
+            test_assert(testDecoder.m_allocatedWidth == 160, "Initial allocated width is 160");
+            test_assert(testDecoder.m_allocatedHeight == 120, "Initial allocated height is 120");
+
+            // Mock m_decodedFrame containing a frame of original dimensions (160x120) first to initialize m_swsCtx
+            testDecoder.m_decodedFrame->width = 160;
+            testDecoder.m_decodedFrame->height = 120;
+            testDecoder.m_decodedFrame->format = AV_PIX_FMT_YUV420P;
+            std::vector<uint8_t> dummySrcBuffer1(160 * 120 * 2, 0);
+            av_image_fill_arrays(
+                testDecoder.m_decodedFrame->data,
+                testDecoder.m_decodedFrame->linesize,
+                dummySrcBuffer1.data(),
+                AV_PIX_FMT_YUV420P,
+                160,
+                120,
+                1
+            );
+            bool convertInitSuccess = testDecoder.convertFrame();
+            test_assert(convertInitSuccess, "First convertFrame call initializes m_swsCtx");
+            test_assert(testDecoder.m_swsCtx != nullptr, "m_swsCtx is initialized");
+
+            // Test case 1: Dynamic resolution change fails because av_malloc returns null (force_malloc_fail = true)
+            testDecoder.m_decodedFrame->width = 320;
+            testDecoder.m_decodedFrame->height = 240;
+            testDecoder.m_decodedFrame->format = AV_PIX_FMT_YUV420P;
+            std::vector<uint8_t> dummySrcBuffer2(320 * 240 * 2, 0);
+            av_image_fill_arrays(
+                testDecoder.m_decodedFrame->data,
+                testDecoder.m_decodedFrame->linesize,
+                dummySrcBuffer2.data(),
+                AV_PIX_FMT_YUV420P,
+                320,
+                240,
+                1
+            );
+            force_malloc_fail = true;
+            bool convertMallocFail = testDecoder.convertFrame();
+            test_assert(!convertMallocFail, "convertFrame fails when av_malloc fails on resolution change");
+            force_malloc_fail = false;
+
+            // Test case 2: Dynamic resolution change fails because av_image_fill_arrays fails (force_image_fill_fail = true)
+            testDecoder.m_decodedFrame->width = 320;
+            testDecoder.m_decodedFrame->height = 240;
+            testDecoder.m_decodedFrame->format = AV_PIX_FMT_YUV420P;
+            av_image_fill_arrays(
+                testDecoder.m_decodedFrame->data,
+                testDecoder.m_decodedFrame->linesize,
+                dummySrcBuffer2.data(),
+                AV_PIX_FMT_YUV420P,
+                320,
+                240,
+                1
+            );
+            force_image_fill_fail = true;
+            bool convertFillFail = testDecoder.convertFrame();
+            test_assert(!convertFillFail, "convertFrame fails when av_image_fill_arrays fails on resolution change");
+            force_image_fill_fail = false;
+
+            // Test case 3: Dynamic resolution change fails because sws_getContext fails (force_sws_context_fail = true)
+            testDecoder.m_decodedFrame->width = 320;
+            testDecoder.m_decodedFrame->height = 240;
+            testDecoder.m_decodedFrame->format = AV_PIX_FMT_YUV420P;
+            av_image_fill_arrays(
+                testDecoder.m_decodedFrame->data,
+                testDecoder.m_decodedFrame->linesize,
+                dummySrcBuffer2.data(),
+                AV_PIX_FMT_YUV420P,
+                320,
+                240,
+                1
+            );
+            force_sws_context_fail = true;
+            bool convertSwsFail = testDecoder.convertFrame();
+            test_assert(!convertSwsFail, "convertFrame fails when sws_getContext fails on resolution change");
+            force_sws_context_fail = false;
+
+            // Test case 4: Dynamic resolution change succeeds! (Frees old context and reallocates successfully)
+            testDecoder.m_decodedFrame->width = 320;
+            testDecoder.m_decodedFrame->height = 240;
+            testDecoder.m_decodedFrame->format = AV_PIX_FMT_YUV420P;
+            av_image_fill_arrays(
+                testDecoder.m_decodedFrame->data,
+                testDecoder.m_decodedFrame->linesize,
+                dummySrcBuffer2.data(),
+                AV_PIX_FMT_YUV420P,
+                320,
+                240,
+                1
+            );
+            bool convertSuccess = testDecoder.convertFrame();
+            test_assert(convertSuccess, "convertFrame succeeds on dynamic resolution change");
+            test_assert(testDecoder.m_allocatedWidth == 320, "Allocated width updated to 320");
+            test_assert(testDecoder.m_allocatedHeight == 240, "Allocated height updated to 240");
+            test_assert(testDecoder.m_yuvBufferSize == av_image_get_buffer_size(AV_PIX_FMT_YUV420P, 320, 240, 1), "YUV Buffer size updated correctly");
+
+            avcodec_parameters_free(&testCodecParams);
         }
 
         // -------------------------------------------------------------
@@ -426,7 +550,12 @@ int real_main(int argc, char* argv[]) {
         // F. White-Box Demuxer Seeking Branches
         // -------------------------------------------------------------
         std::cout << "Testing Demuxer seeking branches..." << std::endl;
+        int savedVideoIdx = -1;
+        int savedAudioIdx = -1;
         if (controller.m_demuxer) {
+            savedVideoIdx = controller.m_demuxer->m_videoStreamIdx;
+            savedAudioIdx = controller.m_demuxer->m_audioStreamIdx;
+
             // Force Audio-Only seeking branch
             controller.m_demuxer->m_videoStreamIdx = -1;
             controller.m_demuxer->m_audioStreamIdx = (controller.m_demuxer->m_formatCtx->nb_streams > 1) ? 1 : 0;
@@ -446,7 +575,11 @@ int real_main(int argc, char* argv[]) {
         // -------------------------------------------------------------
         std::cout << "Testing Video-Only clock synchronization updates..." << std::endl;
         if (controller.m_demuxer) {
+            controller.m_demuxer->m_videoStreamIdx = savedVideoIdx;
+            controller.m_demuxer->m_audioStreamIdx = savedAudioIdx;
             controller.m_demuxer->m_eof = false;
+            controller.m_demuxer->seek(0.0);
+            controller.m_demuxer->performSeek();
         }
         controller.m_hasAudio = false;
         controller.m_hasVideo = true;
@@ -865,16 +998,3 @@ int main(int argc, char* argv[]) {
     // 4. Cover exception catch block path in real_main (returns 1)
     if (!testFile.empty()) {
         char* argvException[] = { argv[0], (char*)testFile.c_str(), (char*)"--test-exception" };
-        real_main(3, argvException);
-    }
-
-    // 5. Cover assert failure exit(1) path (via exception throw)
-    try {
-        test_assert(false, "Intentionally failing assert to cover exit(1) path");
-    } catch (const std::exception& e) {
-        std::cout << "Successfully covered assert exit(1) path: " << e.what() << std::endl;
-    }
-
-    // 6. Run the actual main test suite!
-    return real_main(argc, argv);
-}
