@@ -171,6 +171,13 @@ add_custom_command(TARGET NaikAVPlayer POST_BUILD
     COMMENT "Copying SDL2.dll to output directory..."
 )
 
+add_custom_command(TARGET NaikAVPlayer POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${CMAKE_SOURCE_DIR}/assets/fonts"
+        "$<TARGET_FILE_DIR:NaikAVPlayer>/assets/fonts"
+    COMMENT "Copying Noto Sans fonts to output directory..."
+)
+
 # -------------------------------------------------------------
 # Test Target with Code Coverage
 # -------------------------------------------------------------
@@ -204,4 +211,11 @@ add_custom_command(TARGET NaikAVPlayer_tests POST_BUILD
         $<TARGET_FILE:SDL2::SDL2>
         $<TARGET_FILE_DIR:NaikAVPlayer_tests>
     COMMENT "Copying SDL2.dll to tests output directory..."
+)
+
+add_custom_command(TARGET NaikAVPlayer_tests POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${CMAKE_SOURCE_DIR}/assets/fonts"
+        "$<TARGET_FILE_DIR:NaikAVPlayer_tests>/assets/fonts"
+    COMMENT "Copying Noto Sans fonts to tests output directory..."
 )

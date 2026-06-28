@@ -15,6 +15,8 @@ Built on top of barebones **FFmpeg**, **SDL2**, and **Dear ImGui**, **NaikAVPlay
 - 🎛️ **Software Volume Controls:** Software audio sample attenuator with dynamic byte scaling, including a zero-overhead mute/bypass layout.
 - 📂 **Flexible Media Loading:** Supports drag-and-drop file ingestion directly onto the player window, or custom local file system parsing.
 - 📊 **Diagnostics HUD:** Real-time HUD diagnostics overlay displaying player states, playback clock offsets, media metadata, and resolution metrics.
+- 🎨 **Modern Glassmorphic GUI:** Floating dock and cinematic header layouts with a frosted translucent obsidian design, circular progress grabs, interactive welcome onboarding cards, and toggleable HUD sidebars.
+- 🔤 **Bundled Open-Source Typography:** Integrated with **Noto Sans** fonts (SIL Open Font License 1.1) scanned dynamically from relative paths, avoiding system-dependent proprietary lookups.
 - 🧪 **100% Logic Test Coverage:** A fully instrumented functional integration and white-box test suite executing 100% of the player's core playback controller, demuxer, and audio/video decoder logical lines.
 
 ---
@@ -25,6 +27,7 @@ Built on top of barebones **FFmpeg**, **SDL2**, and **Dear ImGui**, **NaikAVPlay
 - **FFmpeg 8.x (avcodec, avformat, avutil, swscale, swresample)** (local shared binaries)
 - **SDL2** (automatically fetched and dynamically compiled)
 - **Dear ImGui** (automatically fetched and statically compiled)
+- **Noto Sans Font** (bundled open-source SIL OFL 1.1 font files)
 
 ---
 
@@ -71,6 +74,8 @@ Or run it passing a media file path directly as an argument:
 
 ## Verification & Tests
 
+The test video was programmatically generated for testing purposes and contains only synthetic audio and graphics.
+
 Run the coverage-instrumented functional test suite by passing a media file path directly:
 ```powershell
 .\build\NaikAVPlayer_tests.exe "C:\Path\To\video.mp4"
@@ -94,7 +99,8 @@ gcov -o CMakeFiles/NaikAVPlayer_tests.dir/tests/tests.cpp.obj ../src/PlayerContr
 
 ## Open-Source Attribution & Credits
 
-NaikAVPlayer is published under the **MIT License**. It links dynamically and statically to the following libraries:
+NaikAVPlayer is published under the **MIT License**. It links dynamically and statically to the following libraries and assets:
 - **FFmpeg** (Licensed under LGPL v2.1+ / GPL v2.0+)
 - **SDL2** (Licensed under the Zlib License)
 - **Dear ImGui** (Licensed under the MIT License)
+- **Noto Sans Font** (Licensed under the SIL Open Font License 1.1)

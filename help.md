@@ -58,3 +58,14 @@ The player is designed with a premium dark glassmorphism interface.
 - **Escape**: Immediately exit the application.
 - **Timeline Slider**: Left-click or drag on the bottom progress bar to jump to any segment.
 - **Volume Slider**: Adjust the software volume attenuator from 0% to 100%. Click the **Mute** button to silence the sound instantly.
+
+---
+
+## 5. Security & Dependency Maintenance
+
+- **Upstream Security**: NaikAVPlayer relies on external decoders (FFmpeg) to parse and process media streams. Because parsing media files carries inherent security risks (e.g. malformed files attempting to exploit decoder bugs), keeping your shared libraries updated is the best defense.
+- **Updating Libraries**: The project is designed to automatically download the latest stable dependency packages during configuration. To force an update of the local FFmpeg binaries, delete the `thirdparty/ffmpeg` directory and compile the project again:
+  ```bash
+  cmake -B build -G "MinGW Makefiles"
+  cmake --build build
+  ```
