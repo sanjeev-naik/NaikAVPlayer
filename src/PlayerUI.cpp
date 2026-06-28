@@ -179,6 +179,149 @@ void PlayerUI::draw(int windowWidth, int windowHeight,
   }
 }
 
+bool PlayerUI::drawIconButton(const char *str_id, IconType icon, ImVec2 size) {
+  ImGui::PushID(str_id);
+  bool clicked = ImGui::Button("##btn", size);
+
+  ImVec2 minPos = ImGui::GetItemRectMin();
+  ImVec2 maxPos = ImGui::GetItemRectMax();
+  ImVec2 center = ImVec2((minPos.x + maxPos.x) * 0.5f, (minPos.y + maxPos.y) * 0.5f);
+
+  ImU32 color;
+  if (ImGui::IsItemActive()) {
+    color = ImGui::GetColorU32(ImGuiCol_ButtonActive);
+  } else if (ImGui::IsItemHovered()) {
+    color = ImGui::GetColorU32(ImVec4(0.00f, 0.83f, 0.88f, 1.00f)); // Neon cyan hover glow
+  } else {
+    color = ImGui::GetColorU32(ImGuiCol_Text);
+  }
+
+  ImDrawList *drawList = ImGui::GetWindowDrawList();
+  float padding = 6.0f;
+  float w = (maxPos.x - minPos.x) - padding * 2.0f;
+  float h = (maxPos.y - minPos.y) - padding * 2.0f;
+  float sz = std::min(w, h);
+
+  switch (icon) {
+  case IconType::Play: {
+    float r = sz * 0.5f;
+    ImVec2 p1(center.x - r * 0.35f, center.y - r * 0.6f);
+    ImVec2 p2(center.x - r * 0.35f, center.y + r * 0.6f);
+    ImVec2 p3(center.x + r * 0.55f, center.y);
+    drawList->AddTriangleFilled(p1, p2, p3, color);
+    break;
+  }
+  case IconType::Pause: {
+    float r = sz * 0.5f;
+    float barW = r * 0.3f;
+    float barH = r * 1.1f;
+    float gap = r * 0.35f;
+    ImVec2 p1_min(center.x - gap * 0.5f - barW, center.y - barH * 0.5f);
+    ImVec2 p1_max(center.x - gap * 0.5f, center.y + barH * 0.5f);
+    ImVec2 p2_min(center.x + gap * 0.5f, center.y - barH * 0.5f);
+    ImVec2 p2_max(center.x + gap * 0.5f + barW, center.y + barH * 0.5f);
+    drawList->AddRectFilled(p1_min, p1_max, color, 1.5f);
+    drawList->AddRectFilled(p2_min, p2_max, color, 1.5f);
+    break;
+  }
+  case IconType::Stop: {
+    float r = sz * 0.5f;
+    float stopSz = r * 0.9f;
+    ImVec2 p_min(center.x - stopSz * 0.5f, center.y - stopSz * 0.5f);
+    ImVec2 p_max(center.x + stopSz * 0.5f, center.y + stopSz * 0.5f);
+    drawList->AddRectFilled(p_min, p_max, color, 1.5f);
+    break;
+  }
+  case IconType::SeekBackward: {
+    float r = sz * 0.5f;
+    ImVec2 p1(center.x - r * 0.8f, center.y);
+    ImVec2 p2(center.x - r * 0.1f, center.y - r * 0.5f);
+    ImVec2 p3(center.x - r * 0.1f, center.y + r * 0.5f);
+    ImVec2 p4(center.x - r * 0.1f, center.y);
+    ImVec2 p5(center.x + r * 0.6f, center.y - r * 0.5f);
+    ImVec2 p6(center.x + r * 0.6f, center.y + r * 0.5f);
+    drawList->AddTriangleFilled(p1, p2, p3, color);
+    drawList->AddTriangleFilled(p4, p5, p6, color);
+    break;
+  }
+  case IconType::SeekForward: {
+    float r = sz * 0.5f;
+    ImVec2 p1(center.x - r * 0.6f, center.y - r * 0.5f);
+    ImVec2 p2(center.x - r * 0.6f, center.y + r * 0.5f);
+    ImVec2 p3(center.x + r * 0.1f, center.y);
+    ImVec2 p4(center.x - r * 0.1f, center.y - r * 0.5f);
+    ImVec2 p5(center.x - r * 0.1f, center.y + r * 0.5f);
+    ImVec2 p6(center.x + r * 0.6f, center.y);
+    drawList->AddTriangleFilled(p1, p2, p3, color);
+    drawList->AddTriangleFilled(p4, p5, p6, color);
+    break;
+  }
+  case IconType::Folder: {
+    float r = sz * 0.5f;
+    float folderW = r * 1.3f;
+    float folderH = r * 0.9f;
+    ImVec2 p_min(center.x - folderW * 0.5f, center.y - folderH * 0.2f);
+    ImVec2 p_max(center.x + folderW * 0.5f, center.y + folderH * 0.6f);
+    drawList->AddRectFilled(p_min, p_max, color, 1.5f);
+    ImVec2 tab_min(center.x - folderW * 0.5f, center.y - folderH * 0.5f);
+    ImVec2 tab_max(center.x - folderW * 0.1f, center.y - folderH * 0.2f);
+    drawList->AddRectFilled(tab_min, tab_max, color, 1.0f);
+    break;
+  }
+  case IconType::VolumeMute: {
+    float r = sz * 0.5f;
+    float spkH = r * 0.55f;
+    drawList->AddRectFilled(ImVec2(center.x - r * 0.6f, center.y - spkH * 0.5f),
+                           ImVec2(center.x - r * 0.3f, center.y + spkH * 0.5f),
+                           color, 1.0f);
+    ImVec2 pts[4] = {
+        ImVec2(center.x - r * 0.3f, center.y - spkH * 0.5f),
+        ImVec2(center.x, center.y - r * 0.55f),
+        ImVec2(center.x, center.y + r * 0.55f),
+        ImVec2(center.x - r * 0.3f, center.y + spkH * 0.5f)
+    };
+    drawList->AddConvexPolyFilled(pts, 4, color);
+    drawList->AddLine(ImVec2(center.x + r * 0.25f, center.y - r * 0.25f),
+                      ImVec2(center.x + r * 0.65f, center.y + r * 0.25f),
+                      color, 1.5f);
+    drawList->AddLine(ImVec2(center.x + r * 0.65f, center.y - r * 0.25f),
+                      ImVec2(center.x + r * 0.25f, center.y + r * 0.25f),
+                      color, 1.5f);
+    break;
+  }
+  case IconType::VolumeHigh: {
+    float r = sz * 0.5f;
+    float spkH = r * 0.55f;
+    drawList->AddRectFilled(ImVec2(center.x - r * 0.7f, center.y - spkH * 0.5f),
+                           ImVec2(center.x - r * 0.4f, center.y + spkH * 0.5f),
+                           color, 1.0f);
+    ImVec2 pts[4] = {
+        ImVec2(center.x - r * 0.4f, center.y - spkH * 0.5f),
+        ImVec2(center.x - r * 0.1f, center.y - r * 0.55f),
+        ImVec2(center.x - r * 0.1f, center.y + r * 0.55f),
+        ImVec2(center.x - r * 0.4f, center.y + spkH * 0.5f)
+    };
+    drawList->AddConvexPolyFilled(pts, 4, color);
+    drawList->AddLine(ImVec2(center.x + r * 0.15f, center.y - r * 0.25f),
+                      ImVec2(center.x + r * 0.3f, center.y),
+                      color, 1.5f);
+    drawList->AddLine(ImVec2(center.x + r * 0.3f, center.y),
+                      ImVec2(center.x + r * 0.15f, center.y + r * 0.25f),
+                      color, 1.5f);
+    drawList->AddLine(ImVec2(center.x + r * 0.4f, center.y - r * 0.45f),
+                      ImVec2(center.x + r * 0.6f, center.y),
+                      color, 1.5f);
+    drawList->AddLine(ImVec2(center.x + r * 0.6f, center.y),
+                      ImVec2(center.x + r * 0.4f, center.y + r * 0.45f),
+                      color, 1.5f);
+    break;
+  }
+  }
+
+  ImGui::PopID();
+  return clicked;
+}
+
 void PlayerUI::drawWelcomeHUD(int windowWidth, int windowHeight) {
   // Centered modern onboarding panel
   float cardWidth = 540.0f;
@@ -408,7 +551,7 @@ void PlayerUI::drawControlsBar(int windowWidth, int windowHeight) {
   ImGui::SetCursorPosY(46.0f);
 
   // Left Group: Open File Button
-  if (ImGui::Button("Browse File", ImVec2(100, 28))) {
+  if (drawIconButton("##browse", IconType::Folder, ImVec2(36, 28))) {
     if (m_fileDialogCallback) {
       std::string path = m_fileDialogCallback();
       if (!path.empty()) {
@@ -420,14 +563,20 @@ void PlayerUI::drawControlsBar(int windowWidth, int windowHeight) {
       m_showLoadFileDialog = true;
     }
   }
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("Browse Media File");
+  }
 
   // Middle Group: Playback buttons
-  float centerButtonsGroupWidth = 240.0f;
+  float centerButtonsGroupWidth = 172.0f;
   ImGui::SameLine((barWidth - centerButtonsGroupWidth) * 0.5f);
 
   // Seek back button (<<)
-  if (ImGui::Button("<<", ImVec2(40, 28))) {
+  if (drawIconButton("##seek_back", IconType::SeekBackward, ImVec2(36, 28))) {
     m_controller.seek(currentTime - 10.0);
+  }
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("Seek Backward 10s");
   }
   ImGui::SameLine(0.0f, 8.0f);
 
@@ -435,51 +584,69 @@ void PlayerUI::drawControlsBar(int windowWidth, int windowHeight) {
   bool isPlaying = (state == PlayerState::PLAYING);
   if (isPlaying) {
     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.53f, 0.90f, 0.75f));
-    if (ImGui::Button("Pause", ImVec2(60, 28))) {
+    if (drawIconButton("##pause", IconType::Pause, ImVec2(40, 28))) {
       m_controller.pause();
     }
     ImGui::PopStyleColor();
+    if (ImGui::IsItemHovered()) {
+      ImGui::SetTooltip("Pause Playback");
+    }
   } else {
-    if (ImGui::Button("Play", ImVec2(60, 28))) {
+    if (drawIconButton("##play", IconType::Play, ImVec2(40, 28))) {
       if (state != PlayerState::UNINITIALIZED) {
         m_controller.play();
       } else {
         m_showLoadFileDialog = true;
       }
     }
+    if (ImGui::IsItemHovered()) {
+      ImGui::SetTooltip("Start Playback");
+    }
   }
   ImGui::SameLine(0.0f, 8.0f);
 
   // Stop button
-  if (ImGui::Button("Stop", ImVec2(50, 28))) {
+  if (drawIconButton("##stop", IconType::Stop, ImVec2(36, 28))) {
     m_controller.stop();
+  }
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("Stop Playback");
   }
   ImGui::SameLine(0.0f, 8.0f);
 
   // Seek forward button (>>)
-  if (ImGui::Button(">>", ImVec2(40, 28))) {
+  if (drawIconButton("##seek_forward", IconType::SeekForward, ImVec2(36, 28))) {
     m_controller.seek(currentTime + 10.0);
+  }
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("Seek Forward 10s");
   }
 
   // Right Group: Volume and Mute
-  float volumeGroupWidth = 180.0f;
+  float volumeGroupWidth = 144.0f;
   ImGui::SameLine(barWidth - volumeGroupWidth - 20.0f);
 
   // Mute button
   if (m_isMuted) {
     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(1.00f, 0.20f, 0.20f, 0.80f));
-    if (ImGui::Button("Unmute", ImVec2(65, 28))) {
+    if (drawIconButton("##unmute", IconType::VolumeMute, ImVec2(36, 28))) {
       m_isMuted = false;
       m_uiVolume = m_savedVolume;
       m_controller.setVolume(m_uiVolume / 100.0f);
     }
     ImGui::PopStyleColor();
+    if (ImGui::IsItemHovered()) {
+      ImGui::SetTooltip("Unmute Audio");
+    }
   } else {
-    if (ImGui::Button("Mute", ImVec2(55, 28))) {
+    if (drawIconButton("##mute", IconType::VolumeHigh, ImVec2(36, 28))) {
       m_savedVolume = m_uiVolume;
       m_isMuted = true;
       m_uiVolume = 0.0f;
       m_controller.setVolume(0.0f);
+    }
+    if (ImGui::IsItemHovered()) {
+      ImGui::SetTooltip("Mute Audio");
     }
   }
 
