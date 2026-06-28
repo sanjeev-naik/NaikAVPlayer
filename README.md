@@ -89,6 +89,12 @@ Or run it passing a media file path directly as an argument:
 .\build\NaikAVPlayer.exe "C:\Path\To\video.mp4"
 ```
 
+### Keyboard Shortcuts
+- **`Spacebar`**: Toggle Play / Pause.
+- **`Left Arrow`** ($\leftarrow$): Seek backward by 10 seconds.
+- **`Right Arrow`** ($\rightarrow$): Seek forward by 10 seconds.
+- **`Escape`**: Close and exit the player.
+
 ---
 
 ## Verification & Tests

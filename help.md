@@ -55,6 +55,12 @@ The player is designed with a premium dark glassmorphism interface.
 - **Timeline Slider**: Left-click or drag on the bottom progress bar to jump to any segment.
 - **Volume Slider & Toggle**: Adjust the software volume attenuator from 0% to 100%. Click the **Volume/Mute Icon** button next to the volume slider to toggle mute instantly (using a zero-overhead CPU bypass).
 
+### Keyboard Hotkeys:
+- **Spacebar**: Toggle Play / Pause.
+- **Left Arrow key ($\leftarrow$)**: Seek backward by 10 seconds.
+- **Right Arrow key ($\rightarrow$)**: Seek forward by 10 seconds.
+- **Escape**: Immediately close and exit the player.
+
 ---
 
 ## 5. Security & Dependency Maintenance

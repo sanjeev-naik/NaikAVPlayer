@@ -185,13 +185,15 @@ bool PlayerUI::drawIconButton(const char *str_id, IconType icon, ImVec2 size) {
 
   ImVec2 minPos = ImGui::GetItemRectMin();
   ImVec2 maxPos = ImGui::GetItemRectMax();
-  ImVec2 center = ImVec2((minPos.x + maxPos.x) * 0.5f, (minPos.y + maxPos.y) * 0.5f);
+  ImVec2 center =
+      ImVec2((minPos.x + maxPos.x) * 0.5f, (minPos.y + maxPos.y) * 0.5f);
 
   ImU32 color;
   if (ImGui::IsItemActive()) {
     color = ImGui::GetColorU32(ImGuiCol_ButtonActive);
   } else if (ImGui::IsItemHovered()) {
-    color = ImGui::GetColorU32(ImVec4(0.00f, 0.83f, 0.88f, 1.00f)); // Neon cyan hover glow
+    color = ImGui::GetColorU32(
+        ImVec4(0.00f, 0.83f, 0.88f, 1.00f)); // Neon cyan hover glow
   } else {
     color = ImGui::GetColorU32(ImGuiCol_Text);
   }
@@ -272,48 +274,42 @@ bool PlayerUI::drawIconButton(const char *str_id, IconType icon, ImVec2 size) {
     float r = sz * 0.5f;
     float spkH = r * 0.55f;
     drawList->AddRectFilled(ImVec2(center.x - r * 0.6f, center.y - spkH * 0.5f),
-                           ImVec2(center.x - r * 0.3f, center.y + spkH * 0.5f),
-                           color, 1.0f);
-    ImVec2 pts[4] = {
-        ImVec2(center.x - r * 0.3f, center.y - spkH * 0.5f),
-        ImVec2(center.x, center.y - r * 0.55f),
-        ImVec2(center.x, center.y + r * 0.55f),
-        ImVec2(center.x - r * 0.3f, center.y + spkH * 0.5f)
-    };
+                            ImVec2(center.x - r * 0.3f, center.y + spkH * 0.5f),
+                            color, 1.0f);
+    ImVec2 pts[4] = {ImVec2(center.x - r * 0.3f, center.y - spkH * 0.5f),
+                     ImVec2(center.x, center.y - r * 0.55f),
+                     ImVec2(center.x, center.y + r * 0.55f),
+                     ImVec2(center.x - r * 0.3f, center.y + spkH * 0.5f)};
     drawList->AddConvexPolyFilled(pts, 4, color);
     drawList->AddLine(ImVec2(center.x + r * 0.25f, center.y - r * 0.25f),
-                      ImVec2(center.x + r * 0.65f, center.y + r * 0.25f),
-                      color, 1.5f);
+                      ImVec2(center.x + r * 0.65f, center.y + r * 0.25f), color,
+                      1.5f);
     drawList->AddLine(ImVec2(center.x + r * 0.65f, center.y - r * 0.25f),
-                      ImVec2(center.x + r * 0.25f, center.y + r * 0.25f),
-                      color, 1.5f);
+                      ImVec2(center.x + r * 0.25f, center.y + r * 0.25f), color,
+                      1.5f);
     break;
   }
   case IconType::VolumeHigh: {
     float r = sz * 0.5f;
     float spkH = r * 0.55f;
     drawList->AddRectFilled(ImVec2(center.x - r * 0.7f, center.y - spkH * 0.5f),
-                           ImVec2(center.x - r * 0.4f, center.y + spkH * 0.5f),
-                           color, 1.0f);
-    ImVec2 pts[4] = {
-        ImVec2(center.x - r * 0.4f, center.y - spkH * 0.5f),
-        ImVec2(center.x - r * 0.1f, center.y - r * 0.55f),
-        ImVec2(center.x - r * 0.1f, center.y + r * 0.55f),
-        ImVec2(center.x - r * 0.4f, center.y + spkH * 0.5f)
-    };
+                            ImVec2(center.x - r * 0.4f, center.y + spkH * 0.5f),
+                            color, 1.0f);
+    ImVec2 pts[4] = {ImVec2(center.x - r * 0.4f, center.y - spkH * 0.5f),
+                     ImVec2(center.x - r * 0.1f, center.y - r * 0.55f),
+                     ImVec2(center.x - r * 0.1f, center.y + r * 0.55f),
+                     ImVec2(center.x - r * 0.4f, center.y + spkH * 0.5f)};
     drawList->AddConvexPolyFilled(pts, 4, color);
     drawList->AddLine(ImVec2(center.x + r * 0.15f, center.y - r * 0.25f),
-                      ImVec2(center.x + r * 0.3f, center.y),
-                      color, 1.5f);
+                      ImVec2(center.x + r * 0.3f, center.y), color, 1.5f);
     drawList->AddLine(ImVec2(center.x + r * 0.3f, center.y),
-                      ImVec2(center.x + r * 0.15f, center.y + r * 0.25f),
-                      color, 1.5f);
+                      ImVec2(center.x + r * 0.15f, center.y + r * 0.25f), color,
+                      1.5f);
     drawList->AddLine(ImVec2(center.x + r * 0.4f, center.y - r * 0.45f),
-                      ImVec2(center.x + r * 0.6f, center.y),
-                      color, 1.5f);
+                      ImVec2(center.x + r * 0.6f, center.y), color, 1.5f);
     drawList->AddLine(ImVec2(center.x + r * 0.6f, center.y),
-                      ImVec2(center.x + r * 0.4f, center.y + r * 0.45f),
-                      color, 1.5f);
+                      ImVec2(center.x + r * 0.4f, center.y + r * 0.45f), color,
+                      1.5f);
     break;
   }
   }
@@ -361,7 +357,7 @@ void PlayerUI::drawWelcomeHUD(int windowWidth, int windowHeight) {
   // Headline text
   if (m_titleFont)
     ImGui::PushFont(m_titleFont);
-  const char *titleText = "Naik AV Player";
+  const char *titleText = "NaikAVPlayer";
   float titleWidth = ImGui::CalcTextSize(titleText).x;
   ImGui::SetCursorPosX((cardWidth - titleWidth) * 0.5f);
   ImGui::TextColored(ImVec4(0.00f, 0.83f, 0.88f, 1.00f), "%s", titleText);
