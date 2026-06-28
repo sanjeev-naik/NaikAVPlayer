@@ -4,6 +4,8 @@
 #include <string>
 #include <functional>
 
+struct ImFont;
+
 class PlayerUI {
 private:
     PlayerController& m_controller;
@@ -13,6 +15,7 @@ private:
     float m_uiVolume;
     bool m_isMuted;
     float m_savedVolume;
+    bool m_showDiagnostics;
     
     // Auto-hide controls timing
     double m_lastMouseMoveTime;
@@ -22,8 +25,19 @@ private:
     bool m_showLoadFileDialog;
     char m_filePathBuffer[512];
 
+    // Loaded fonts
+    ImFont* m_mainFont;
+    ImFont* m_titleFont;
+    ImFont* m_hudFont;
+
     std::string formatTime(double seconds) const;
     void applyTheme();
+
+    // Modular drawing helpers
+    void drawWelcomeHUD(int windowWidth, int windowHeight);
+    void drawTitleBar(int windowWidth, int windowHeight);
+    void drawControlsBar(int windowWidth, int windowHeight);
+    void drawDiagnosticsHUD(int windowWidth, int windowHeight);
 
 public:
     explicit PlayerUI(PlayerController& controller);

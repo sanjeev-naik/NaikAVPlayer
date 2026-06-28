@@ -55,6 +55,7 @@ public:
 
     // Getters
     PlayerState getState() const { return m_state; }
+    std::string getFilename() const { return m_filename; }
     double getCurrentTime();
     double getDuration() const;
     int getVideoWidth() const;

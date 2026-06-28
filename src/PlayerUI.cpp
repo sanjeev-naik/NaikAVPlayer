@@ -9,15 +9,28 @@ PlayerUI::PlayerUI(PlayerController& controller)
       m_uiVolume(5.0f),
       m_isMuted(false),
       m_savedVolume(5.0f),
+      m_showDiagnostics(false),
       m_lastMouseMoveTime(0.0),
       m_controlsVisible(true),
-      m_showLoadFileDialog(false) {
+      m_showLoadFileDialog(false),
+      m_mainFont(nullptr),
+      m_titleFont(nullptr),
+      m_hudFont(nullptr) {
     m_filePathBuffer[0] = '\0';
 }
 
 PlayerUI::~PlayerUI() {}
 
 void PlayerUI::init() {
+    ImGuiIO& io = ImGui::GetIO();
+    // Load Segoe UI standard Windows fonts if they exist
+    m_mainFont = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf", 17.0f);
+    m_titleFont = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeuib.ttf", 26.0f);
+    if (!m_titleFont) {
+        m_titleFont = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf", 26.0f);
+    }
+    m_hudFont = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf", 14.0f);
+
     applyTheme();
 }
 
@@ -55,147 +68,32 @@ void PlayerUI::draw(int windowWidth, int windowHeight, double currentSystemTime)
         }
     }
 
-    // 1. Render Centered Instructions when Player is Empty
+    // Apply main font if loaded
+    if (m_mainFont) ImGui::PushFont(m_mainFont);
+
+    // 1. Welcome / Instruction Screen (empty state)
     if (state == PlayerState::UNINITIALIZED) {
-        ImGui::SetNextWindowPos(ImVec2(windowWidth * 0.1f, windowHeight * 0.4f));
-        ImGui::SetNextWindowSize(ImVec2(windowWidth * 0.8f, 100.0f));
-        ImGui::Begin("InstructionHUD", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoInputs);
-        
-        // Centered Text Rendering
-        const char* instructionText = "Drag & Drop a video file here to play";
-        float textWidth = ImGui::CalcTextSize(instructionText).x;
-        ImGui::SetCursorPosX((windowWidth * 0.8f - textWidth) * 0.5f);
-        
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.70f, 0.70f, 0.75f, 1.00f));
-        ImGui::Text("%s", instructionText);
-        ImGui::PopStyleColor();
-        
-        const char* subtext = "Or click 'Load File' at the bottom controls bar";
-        float subTextWidth = ImGui::CalcTextSize(subtext).x;
-        ImGui::SetCursorPosX((windowWidth * 0.8f - subTextWidth) * 0.5f);
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.40f, 0.40f, 0.45f, 0.80f));
-        ImGui::Text("%s", subtext);
-        ImGui::PopStyleColor();
-        
-        ImGui::End();
+        drawWelcomeHUD(windowWidth, windowHeight);
     }
 
-    // 2. Render Developer HUD Diagnostics (Top-Left corner)
+    // 2. Top Title Bar HUD
     if (state != PlayerState::UNINITIALIZED && m_controlsVisible) {
-        ImGui::SetNextWindowPos(ImVec2(10.0f, 10.0f));
-        ImGui::SetNextWindowBgAlpha(0.55f);
-        ImGui::Begin("Diagnostics HUD", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav);
-        
-        const char* stateStr = "Unknown";
-        switch (state) {
-            case PlayerState::OPENED:  stateStr = "Opened (Paused)"; break;
-            case PlayerState::PLAYING: stateStr = "Playing"; break;
-            case PlayerState::PAUSED:  stateStr = "Paused"; break;
-            case PlayerState::ENDED:   stateStr = "Ended"; break;
-            case PlayerState::ERROR_STATE: stateStr = "Error"; break;
-            default: break;
-        }
-
-        ImGui::Text("State: %s", stateStr);
-        if (m_controller.hasVideo()) {
-            ImGui::Text("Resolution: %dx%d", m_controller.getVideoWidth(), m_controller.getVideoHeight());
-        }
-        ImGui::Text("Media Time: %s / %s", 
-                    formatTime(m_controller.getCurrentTime()).c_str(), 
-                    formatTime(m_controller.getDuration()).c_str());
-        
-        ImGui::End();
+        drawTitleBar(windowWidth, windowHeight);
     }
 
-    // 3. Render Bottom Control Bar overlay
-    if (m_controlsVisible) {
-        ImGui::SetNextWindowPos(ImVec2(0.0f, windowHeight - 75.0f));
-        ImGui::SetNextWindowSize(ImVec2(static_cast<float>(windowWidth), 75.0f));
-        
-        // Remove window padding for full bleed seeker bar
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f, 6.0f));
-        ImGui::Begin("ControlsBar", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings);
-        
-        double currentTime = m_controller.getCurrentTime();
-        double duration = m_controller.getDuration();
-        
-        // Time readout overlay strings
-        std::string timeDisplay = formatTime(currentTime) + " / " + formatTime(duration);
-        
-        // A. Full width timeline seeker bar
-        ImGui::PushItemWidth(-1.0f);
-        float seekTarget = static_cast<float>(currentTime);
-        if (ImGui::SliderFloat("##seeker", &seekTarget, 0.0f, static_cast<float>(duration), timeDisplay.c_str())) {
-            m_controller.seek(seekTarget);
-        }
-        ImGui::PopItemWidth();
-        
-        ImGui::Spacing();
-
-        // B. Control buttons layout (Play, Pause, Stop, Load, Volume)
-        if (state == PlayerState::PLAYING) {
-            if (ImGui::Button("Pause")) {
-                m_controller.pause();
-            }
-        } else {
-            if (ImGui::Button("Play")) {
-                if (state != PlayerState::UNINITIALIZED) {
-                    m_controller.play();
-                } else {
-                    m_showLoadFileDialog = true;
-                }
-            }
-        }
-        
-        ImGui::SameLine();
-        if (ImGui::Button("Stop")) {
-            m_controller.stop();
-        }
-        
-        ImGui::SameLine();
-        if (ImGui::Button("Load File")) {
-            if (m_fileDialogCallback) {
-                std::string path = m_fileDialogCallback();
-                if (!path.empty()) {
-                    if (m_controller.openFile(path)) {
-                        m_controller.play();
-                    }
-                }
-            } else {
-                m_showLoadFileDialog = true;
-            }
-        }
-
-        // C. Mute and volume slider
-        ImGui::SameLine(0.0f, 20.0f);
-        if (m_isMuted) {
-            if (ImGui::Button("Unmute")) {
-                m_isMuted = false;
-                m_uiVolume = m_savedVolume;
-                m_controller.setVolume(m_uiVolume / 100.0f);
-            }
-        } else {
-            if (ImGui::Button("Mute")) {
-                m_savedVolume = m_uiVolume;
-                m_isMuted = true;
-                m_uiVolume = 0.0f;
-                m_controller.setVolume(0.0f);
-            }
-        }
-        
-        ImGui::SameLine();
-        ImGui::PushItemWidth(100.0f);
-        if (ImGui::SliderFloat("##volume", &m_uiVolume, 0.0f, 100.0f, "Vol: %.0f%%")) {
-            m_isMuted = (m_uiVolume == 0.0f);
-            m_controller.setVolume(m_uiVolume / 100.0f);
-        }
-        ImGui::PopItemWidth();
-        
-        ImGui::End();
-        ImGui::PopStyleVar(); // Restore padding
+    // 3. Diagnostics Info HUD
+    if (state != PlayerState::UNINITIALIZED && m_showDiagnostics) {
+        drawDiagnosticsHUD(windowWidth, windowHeight);
     }
 
-    // 4. File selection modal popup
+    // 4. Bottom Controls Bar Dock
+    if (state != PlayerState::UNINITIALIZED && m_controlsVisible) {
+        drawControlsBar(windowWidth, windowHeight);
+    }
+
+    if (m_mainFont) ImGui::PopFont();
+
+    // 5. File selection modal popup (always accessible)
     if (m_showLoadFileDialog) {
         ImGui::OpenPopup("Load File Modal");
     }
@@ -237,46 +135,416 @@ void PlayerUI::draw(int windowWidth, int windowHeight, double currentSystemTime)
     }
 }
 
+void PlayerUI::drawWelcomeHUD(int windowWidth, int windowHeight) {
+    // Centered modern onboarding panel
+    float cardWidth = 540.0f;
+    float cardHeight = 360.0f;
+    ImGui::SetNextWindowPos(ImVec2((windowWidth - cardWidth) * 0.5f, (windowHeight - cardHeight) * 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(cardWidth, cardHeight));
+    
+    ImGui::Begin("Welcome HUD", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings);
+    
+    // Draw vector icon (Play button inside a sleek glowing circle)
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+    ImVec2 cursorScreenPos = ImGui::GetCursorScreenPos();
+    
+    ImVec2 iconCenter = ImVec2(cursorScreenPos.x + cardWidth * 0.5f, cursorScreenPos.y + 70.0f);
+    float iconRadius = 36.0f;
+    
+    // Circle border
+    drawList->AddCircle(iconCenter, iconRadius, IM_COL32(0, 212, 224, 200), 64, 3.0f);
+    // Outer soft glow
+    drawList->AddCircle(iconCenter, iconRadius + 4.0f, IM_COL32(0, 212, 224, 50), 64, 1.5f);
+    
+    // Triangle (Play symbol) inside the circle
+    ImVec2 p1 = ImVec2(iconCenter.x - 10.0f, iconCenter.y - 16.0f);
+    ImVec2 p2 = ImVec2(iconCenter.x - 10.0f, iconCenter.y + 16.0f);
+    ImVec2 p3 = ImVec2(iconCenter.x + 18.0f, iconCenter.y);
+    drawList->AddTriangleFilled(p1, p2, p3, IM_COL32(30, 136, 229, 255));
+    
+    ImGui::Dummy(ImVec2(0.0f, 120.0f)); // Push cursor below the drawing
+    
+    // Headline text
+    if (m_titleFont) ImGui::PushFont(m_titleFont);
+    const char* titleText = "Naik AV Player";
+    float titleWidth = ImGui::CalcTextSize(titleText).x;
+    ImGui::SetCursorPosX((cardWidth - titleWidth) * 0.5f);
+    ImGui::TextColored(ImVec4(0.00f, 0.83f, 0.88f, 1.00f), "%s", titleText);
+    if (m_titleFont) ImGui::PopFont();
+    
+    ImGui::Spacing();
+    
+    // Subtext description
+    const char* subtext = "Drag & Drop video files here or browse to start playing";
+    float subTextWidth = ImGui::CalcTextSize(subtext).x;
+    ImGui::SetCursorPosX((cardWidth - subTextWidth) * 0.5f);
+    ImGui::TextColored(ImVec4(0.70f, 0.70f, 0.75f, 0.90f), "%s", subtext);
+    
+    ImGui::Spacing();
+    ImGui::Spacing();
+    
+    // Large Browse Button
+    float btnWidth = 180.0f;
+    float btnHeight = 40.0f;
+    ImGui::SetCursorPosX((cardWidth - btnWidth) * 0.5f);
+    if (ImGui::Button("Open Media File", ImVec2(btnWidth, btnHeight))) {
+        if (m_fileDialogCallback) {
+            std::string path = m_fileDialogCallback();
+            if (!path.empty()) {
+                if (m_controller.openFile(path)) {
+                    m_controller.play();
+                }
+            }
+        } else {
+            m_showLoadFileDialog = true;
+        }
+    }
+    
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+    
+    // Shortcuts cheat-sheet
+    if (m_hudFont) ImGui::PushFont(m_hudFont);
+    
+    auto renderKey = [](const char* key, const char* desc) {
+        ImGui::TextDisabled(" [");
+        ImGui::SameLine(0.0f, 0.0f);
+        ImGui::TextColored(ImVec4(0.00f, 0.83f, 0.88f, 0.90f), "%s", key);
+        ImGui::SameLine(0.0f, 0.0f);
+        ImGui::TextDisabled("] ");
+        ImGui::SameLine(0.0f, 0.0f);
+        ImGui::Text("%s   ", desc);
+        ImGui::SameLine(0.0f, 0.0f);
+    };
+    
+    // Centering the shortcut display
+    float rowWidth = ImGui::CalcTextSize(" [Space] Play/Pause    [<- / ->] Seek 10s    [Esc] Exit").x;
+    ImGui::SetCursorPosX((cardWidth - rowWidth) * 0.5f);
+    
+    renderKey("Space", "Play/Pause");
+    renderKey("<- / ->", "Seek 10s");
+    renderKey("Esc", "Exit");
+    
+    ImGui::NewLine(); // terminate the SameLine loop
+    
+    if (m_hudFont) ImGui::PopFont();
+    
+    ImGui::End();
+}
+
+void PlayerUI::drawTitleBar(int windowWidth, int windowHeight) {
+    // Slim header bar floating at the top of the viewport
+    float barHeight = 45.0f;
+    ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f));
+    ImGui::SetNextWindowSize(ImVec2(static_cast<float>(windowWidth), barHeight));
+    
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(15.0f, 10.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.05f, 0.05f, 0.06f, 0.65f));
+    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+    
+    ImGui::Begin("TitleBarHUD", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings);
+    
+    std::string titleText = "NaikAVPlayer";
+    std::string filePath = m_controller.getFilename();
+    if (!filePath.empty()) {
+        size_t lastSlash = filePath.find_last_of("/\\");
+        std::string fileName = (lastSlash == std::string::npos) ? filePath : filePath.substr(lastSlash + 1);
+        titleText += "  |  " + fileName;
+    }
+    
+    if (m_hudFont) ImGui::PushFont(m_hudFont);
+    
+    // Centered title string
+    float textWidth = ImGui::CalcTextSize(titleText.c_str()).x;
+    ImGui::SetCursorPosX((windowWidth - textWidth) * 0.5f);
+    ImGui::SetCursorPosY(11.0f);
+    ImGui::Text("%s", titleText.c_str());
+    
+    // Right-aligned Info/Diagnostics toggle button
+    float btnWidth = 100.0f;
+    ImGui::SetCursorPosX(windowWidth - btnWidth - 15.0f);
+    ImGui::SetCursorPosY(8.0f);
+    
+    if (m_showDiagnostics) {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.53f, 0.90f, 0.80f));
+        if (ImGui::Button("Hide Info", ImVec2(btnWidth, 28.0f))) {
+            m_showDiagnostics = false;
+        }
+        ImGui::PopStyleColor();
+    } else {
+        if (ImGui::Button("Show Info", ImVec2(btnWidth, 28.0f))) {
+            m_showDiagnostics = true;
+        }
+    }
+    
+    if (m_hudFont) ImGui::PopFont();
+    
+    ImGui::End();
+    
+    ImGui::PopStyleColor(2);
+    ImGui::PopStyleVar(2);
+}
+
+void PlayerUI::drawControlsBar(int windowWidth, int windowHeight) {
+    // Floating centered dock design
+    float barWidth = std::min(880.0f, windowWidth * 0.95f);
+    float barHeight = 85.0f;
+    float posX = (windowWidth - barWidth) * 0.5f;
+    float posY = windowHeight - barHeight - 20.0f;
+    
+    ImGui::SetNextWindowPos(ImVec2(posX, posY));
+    ImGui::SetNextWindowSize(ImVec2(barWidth, barHeight));
+    
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 16.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(20.0f, 10.0f));
+    
+    ImGui::Begin("ControlsDock", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings);
+    
+    PlayerState state = m_controller.getState();
+    double currentTime = m_controller.getCurrentTime();
+    double duration = m_controller.getDuration();
+    
+    // Row 1: Timeline Seeker Bar
+    ImGui::SetCursorPosY(12.0f);
+    
+    // Left current time
+    std::string timeCurrentStr = formatTime(currentTime);
+    ImGui::Text("%s", timeCurrentStr.c_str());
+    ImGui::SameLine(0.0f, 10.0f);
+    
+    // Calculate space available for slider
+    float durationTextWidth = ImGui::CalcTextSize(formatTime(duration).c_str()).x;
+    float currentTextWidth = ImGui::CalcTextSize(timeCurrentStr.c_str()).x;
+    float sliderWidth = barWidth - currentTextWidth - durationTextWidth - 65.0f;
+    
+    ImGui::PushItemWidth(sliderWidth);
+    float seekTarget = static_cast<float>(currentTime);
+    
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.0f);
+    if (ImGui::SliderFloat("##seeker", &seekTarget, 0.0f, static_cast<float>(duration), "")) {
+        m_controller.seek(seekTarget);
+    }
+    ImGui::PopStyleVar();
+    ImGui::PopItemWidth();
+    
+    // Right duration
+    ImGui::SameLine(0.0f, 10.0f);
+    std::string timeDurationStr = formatTime(duration);
+    ImGui::Text("%s", timeDurationStr.c_str());
+    
+    // Row 2: Controls and Volume
+    ImGui::SetCursorPosY(46.0f);
+    
+    // Left Group: Open File Button
+    if (ImGui::Button("Browse File", ImVec2(100, 28))) {
+        if (m_fileDialogCallback) {
+            std::string path = m_fileDialogCallback();
+            if (!path.empty()) {
+                if (m_controller.openFile(path)) {
+                    m_controller.play();
+                }
+            }
+        } else {
+            m_showLoadFileDialog = true;
+        }
+    }
+    
+    // Middle Group: Playback buttons
+    float centerButtonsGroupWidth = 240.0f;
+    ImGui::SameLine((barWidth - centerButtonsGroupWidth) * 0.5f);
+    
+    // Seek back button (<<)
+    if (ImGui::Button("<<", ImVec2(40, 28))) {
+        m_controller.seek(currentTime - 10.0);
+    }
+    ImGui::SameLine(0.0f, 8.0f);
+    
+    // Play/Pause button
+    bool isPlaying = (state == PlayerState::PLAYING);
+    if (isPlaying) {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.53f, 0.90f, 0.75f));
+        if (ImGui::Button("Pause", ImVec2(60, 28))) {
+            m_controller.pause();
+        }
+        ImGui::PopStyleColor();
+    } else {
+        if (ImGui::Button("Play", ImVec2(60, 28))) {
+            if (state != PlayerState::UNINITIALIZED) {
+                m_controller.play();
+            } else {
+                m_showLoadFileDialog = true;
+            }
+        }
+    }
+    ImGui::SameLine(0.0f, 8.0f);
+    
+    // Stop button
+    if (ImGui::Button("Stop", ImVec2(50, 28))) {
+        m_controller.stop();
+    }
+    ImGui::SameLine(0.0f, 8.0f);
+    
+    // Seek forward button (>>)
+    if (ImGui::Button(">>", ImVec2(40, 28))) {
+        m_controller.seek(currentTime + 10.0);
+    }
+    
+    // Right Group: Volume and Mute
+    float volumeGroupWidth = 180.0f;
+    ImGui::SameLine(barWidth - volumeGroupWidth - 20.0f);
+    
+    // Mute button
+    if (m_isMuted) {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(1.00f, 0.20f, 0.20f, 0.80f));
+        if (ImGui::Button("Unmute", ImVec2(65, 28))) {
+            m_isMuted = false;
+            m_uiVolume = m_savedVolume;
+            m_controller.setVolume(m_uiVolume / 100.0f);
+        }
+        ImGui::PopStyleColor();
+    } else {
+        if (ImGui::Button("Mute", ImVec2(55, 28))) {
+            m_savedVolume = m_uiVolume;
+            m_isMuted = true;
+            m_uiVolume = 0.0f;
+            m_controller.setVolume(0.0f);
+        }
+    }
+    
+    ImGui::SameLine(0.0f, 8.0f);
+    ImGui::PushItemWidth(100.0f);
+    if (ImGui::SliderFloat("##volume", &m_uiVolume, 0.0f, 100.0f, "Vol: %.0f%%")) {
+        m_isMuted = (m_uiVolume == 0.0f);
+        m_controller.setVolume(m_uiVolume / 100.0f);
+    }
+    ImGui::PopItemWidth();
+    
+    ImGui::End();
+    ImGui::PopStyleVar(2);
+}
+
+void PlayerUI::drawDiagnosticsHUD(int windowWidth, int windowHeight) {
+    if (!m_showDiagnostics) return;
+    
+    // Floating stats card on the top right
+    float cardWidth = 280.0f;
+    float cardHeight = 200.0f;
+    
+    ImGui::SetNextWindowPos(ImVec2(windowWidth - cardWidth - 20.0f, 60.0f));
+    ImGui::SetNextWindowSize(ImVec2(cardWidth, cardHeight));
+    
+    ImGui::Begin("Diagnostics HUD", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings);
+    
+    if (m_hudFont) ImGui::PushFont(m_hudFont);
+    
+    ImGui::TextColored(ImVec4(0.00f, 0.83f, 0.88f, 1.00f), "System Info & Diagnostics");
+    ImGui::Separator();
+    ImGui::Spacing();
+    
+    PlayerState state = m_controller.getState();
+    const char* stateStr = "Unknown";
+    ImVec4 stateColor = ImVec4(0.9f, 0.9f, 0.9f, 1.0f);
+    switch (state) {
+        case PlayerState::UNINITIALIZED: stateStr = "Uninitialized"; stateColor = ImVec4(0.6f, 0.6f, 0.6f, 1.0f); break;
+        case PlayerState::OPENED:        stateStr = "Ready (Paused)"; stateColor = ImVec4(0.12f, 0.53f, 0.90f, 1.00f); break;
+        case PlayerState::PLAYING:       stateStr = "Playing"; stateColor = ImVec4(0.0f, 0.83f, 0.4f, 1.0f); break;
+        case PlayerState::PAUSED:        stateStr = "Paused"; stateColor = ImVec4(0.9f, 0.7f, 0.0f, 1.0f); break;
+        case PlayerState::ENDED:         stateStr = "Ended"; stateColor = ImVec4(0.5f, 0.5f, 0.8f, 1.0f); break;
+        case PlayerState::ERROR_STATE:   stateStr = "Error"; stateColor = ImVec4(1.0f, 0.2f, 0.2f, 1.0f); break;
+    }
+    
+    ImGui::Text("State: ");
+    ImGui::SameLine();
+    ImGui::TextColored(stateColor, "%s", stateStr);
+    
+    ImGui::Spacing();
+    
+    if (m_controller.hasVideo()) {
+        ImGui::Text("Resolution: ");
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.95f, 0.95f, 0.95f, 1.00f), "%dx%d", m_controller.getVideoWidth(), m_controller.getVideoHeight());
+    } else {
+        ImGui::Text("Media Type: ");
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.95f, 0.95f, 0.95f, 1.00f), "Audio Only");
+    }
+    
+    ImGui::Spacing();
+    
+    ImGui::Text("Time: ");
+    ImGui::SameLine();
+    ImGui::TextColored(ImVec4(0.95f, 0.95f, 0.95f, 1.00f), "%s / %s", 
+                       formatTime(m_controller.getCurrentTime()).c_str(), 
+                       formatTime(m_controller.getDuration()).c_str());
+    
+    ImGui::Spacing();
+    
+    ImGui::Text("Audio Output: ");
+    ImGui::SameLine();
+    ImGui::TextColored(m_controller.hasAudio() ? ImVec4(0.0f, 0.83f, 0.4f, 1.0f) : ImVec4(0.6f, 0.6f, 0.6f, 1.0f), 
+                       m_controller.hasAudio() ? "Active" : "None");
+                       
+    ImGui::Text("Video Output: ");
+    ImGui::SameLine();
+    ImGui::TextColored(m_controller.hasVideo() ? ImVec4(0.0f, 0.83f, 0.4f, 1.0f) : ImVec4(0.6f, 0.6f, 0.6f, 1.0f), 
+                       m_controller.hasVideo() ? "Active" : "None");
+    
+    if (m_hudFont) ImGui::PopFont();
+    
+    ImGui::End();
+}
+
 void PlayerUI::applyTheme() {
     ImGuiStyle& style = ImGui::GetStyle();
     
-    // Smooth elements rounding
-    style.WindowRounding = 8.0f;
-    style.FrameRounding = 6.0f;
-    style.GrabRounding = 6.0f;
-    style.PopupRounding = 6.0f;
-    style.WindowBorderSize = 0.0f;
-    style.FrameBorderSize = 1.0f;
+    // Smooth elements rounding for premium feel
+    style.WindowRounding = 14.0f;
+    style.FrameRounding = 8.0f;
+    style.GrabRounding = 12.0f;
+    style.PopupRounding = 10.0f;
+    style.WindowBorderSize = 1.0f;  // Thin border for frosted glass effect
+    style.FrameBorderSize = 0.0f;
+    style.PopupBorderSize = 1.0f;
+    style.ItemSpacing = ImVec2(10.0f, 8.0f);
+    style.WindowPadding = ImVec2(12.0f, 12.0f);
     
     ImVec4* colors = style.Colors;
     
-    // Background acrylic dark grey theme
-    colors[ImGuiCol_WindowBg]             = ImVec4(0.08f, 0.08f, 0.09f, 0.85f);
+    // Glassmorphic background and borders
+    colors[ImGuiCol_WindowBg]             = ImVec4(0.06f, 0.06f, 0.08f, 0.72f); // Translucent obsidian
     colors[ImGuiCol_ChildBg]              = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
-    colors[ImGuiCol_PopupBg]              = ImVec4(0.11f, 0.11f, 0.13f, 0.95f);
-    colors[ImGuiCol_Border]               = ImVec4(0.20f, 0.20f, 0.23f, 0.60f);
+    colors[ImGuiCol_PopupBg]              = ImVec4(0.09f, 0.09f, 0.11f, 0.95f); // Solid dark for popups
+    colors[ImGuiCol_Border]               = ImVec4(0.35f, 0.35f, 0.40f, 0.25f); // Frosted/glowing glass border
     colors[ImGuiCol_BorderShadow]         = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
     
-    // Controls foreground items
-    colors[ImGuiCol_FrameBg]              = ImVec4(0.15f, 0.15f, 0.18f, 0.90f);
-    colors[ImGuiCol_FrameBgHovered]       = ImVec4(0.20f, 0.20f, 0.25f, 0.90f);
-    colors[ImGuiCol_FrameBgActive]        = ImVec4(0.25f, 0.25f, 0.30f, 0.90f);
+    // Sleek frame controls
+    colors[ImGuiCol_FrameBg]              = ImVec4(0.12f, 0.12f, 0.14f, 0.80f);
+    colors[ImGuiCol_FrameBgHovered]       = ImVec4(0.18f, 0.18f, 0.22f, 0.85f);
+    colors[ImGuiCol_FrameBgActive]        = ImVec4(0.22f, 0.22f, 0.26f, 0.90f);
     
-    // Interactive buttons
-    colors[ImGuiCol_Button]               = ImVec4(0.22f, 0.22f, 0.27f, 0.80f);
-    colors[ImGuiCol_ButtonHovered]        = ImVec4(0.30f, 0.30f, 0.38f, 0.90f);
-    colors[ImGuiCol_ButtonActive]         = ImVec4(0.00f, 0.50f, 0.85f, 1.00f); // Sleek cyan highlight
+    // Modern button transitions
+    colors[ImGuiCol_Button]               = ImVec4(0.15f, 0.15f, 0.18f, 0.60f);
+    colors[ImGuiCol_ButtonHovered]        = ImVec4(0.12f, 0.53f, 0.90f, 0.85f); // Neon blue hover
+    colors[ImGuiCol_ButtonActive]         = ImVec4(0.00f, 0.83f, 0.88f, 1.00f); // Neon cyan active
     
-    // Seeker bar histogram/progress coloring
-    colors[ImGuiCol_SliderGrab]           = ImVec4(0.00f, 0.55f, 0.90f, 1.00f);
-    colors[ImGuiCol_SliderGrabActive]     = ImVec4(0.00f, 0.65f, 1.00f, 1.00f);
+    // Progress / Seeker grab colors
+    colors[ImGuiCol_SliderGrab]           = ImVec4(0.12f, 0.53f, 0.90f, 1.00f); // Neon blue
+    colors[ImGuiCol_SliderGrabActive]     = ImVec4(0.00f, 0.83f, 0.88f, 1.00f); // Neon cyan
     
     // Typography
-    colors[ImGuiCol_Text]                 = ImVec4(0.95f, 0.95f, 0.97f, 1.00f);
-    colors[ImGuiCol_TextDisabled]         = ImVec4(0.50f, 0.50f, 0.55f, 1.00f);
+    colors[ImGuiCol_Text]                 = ImVec4(0.98f, 0.98f, 0.98f, 1.00f);
+    colors[ImGuiCol_TextDisabled]         = ImVec4(0.60f, 0.60f, 0.65f, 1.00f);
     
-    // Title headers
-    colors[ImGuiCol_TitleBg]              = ImVec4(0.11f, 0.11f, 0.13f, 1.00f);
-    colors[ImGuiCol_TitleBgActive]        = ImVec4(0.15f, 0.15f, 0.18f, 1.00f);
-    colors[ImGuiCol_TitleBgCollapsed]     = ImVec4(0.11f, 0.11f, 0.13f, 0.50f);
+    // Windows Title Bars
+    colors[ImGuiCol_TitleBg]              = ImVec4(0.06f, 0.06f, 0.08f, 0.80f);
+    colors[ImGuiCol_TitleBgActive]        = ImVec4(0.09f, 0.09f, 0.11f, 0.90f);
+    colors[ImGuiCol_TitleBgCollapsed]     = ImVec4(0.06f, 0.06f, 0.08f, 0.40f);
+    
+    // Scrollbars
+    colors[ImGuiCol_ScrollbarBg]          = ImVec4(0.04f, 0.04f, 0.06f, 0.30f);
+    colors[ImGuiCol_ScrollbarGrab]        = ImVec4(0.20f, 0.20f, 0.25f, 0.60f);
+    colors[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.25f, 0.25f, 0.30f, 0.80f);
+    colors[ImGuiCol_ScrollbarGrabActive]  = ImVec4(0.12f, 0.53f, 0.90f, 0.80f);
 }
