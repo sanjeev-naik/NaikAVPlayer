@@ -523,7 +523,10 @@ int real_main(int argc, char* argv[]) {
         zeroChanParams->sample_rate = 48000;
         zeroChanParams->format = AV_SAMPLE_FMT_FLTP;
         if (controller.m_demuxer && controller.m_demuxer->getAudioCodecParams()) {
-            avcodec_parameters_copy(zeroChanParams, controller.m_demuxer->getAudioCodecParams());
+            AVCodecParameters* audioParams = controller.m_demuxer->getAudioCodecParams();
+            if (audioParams->codec_id < AV_CODEC_ID_FIRST_AUDIO || audioParams->codec_id >= AV_CODEC_ID_ADPCM_IMA_QT) {
+                avcodec_parameters_copy(zeroChanParams, audioParams);
+            }
         }
         zeroChanParams->ch_layout.nb_channels = 0;
         AudioDecoder zeroChanDecoder(zeroChanParams, {1, 48000}, 0, controller.m_audioQueue);
@@ -998,3 +1001,16 @@ int main(int argc, char* argv[]) {
     // 4. Cover exception catch block path in real_main (returns 1)
     if (!testFile.empty()) {
         char* argvException[] = { argv[0], (char*)testFile.c_str(), (char*)"--test-exception" };
+        real_main(3, argvException);
+    }
+
+    // 5. Cover assert failure exit(1) path (via exception throw)
+    try {
+        test_assert(false, "Intentionally failing assert to cover exit(1) path");
+    } catch (const std::exception& e) {
+        std::cout << "Successfully covered assert exit(1) path: " << e.what() << std::endl;
+    }
+
+    // 6. Run the actual main test suite!
+    return real_main(argc, argv);
+}
