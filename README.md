@@ -32,6 +32,81 @@ To maintain extreme performance and rendering accuracy, the core engine adheres 
 
 ---
 
+## Architecture
+
+NaikAVPlayer follows the classic multi-threaded media player design: a demuxer thread, two decoder paths, and a render loop, coordinated through bounded thread-safe queues and a single source of truth for "what time is it."
+
+### Thread Model
+
+```
+┌─────────────┐     packets      ┌──────────────────┐
+│             ├─────────────────►│  Video Queue (100) │──► VideoDecoder ──► SWS Scale ──► SDL Texture
+│   Demuxer   │                  └──────────────────┘                                         ▲
+│  (thread)   │                                                                                │
+│             ├─────────────────►┌──────────────────┐                                          │
+└─────────────┘     packets      │  Audio Queue (150) │──► AudioDecoder ──► SDL Callback ───────┘
+                                  └──────────────────┘         (master clock)
+```
+
+- **Demuxer thread** reads packets via `av_read_frame` and routes them into one of two bounded `ThreadSafeQueue<AVPacket*>` instances (video: 100 packets, audio: 150 — audio packets are smaller, so the queue can hold more before backpressuring).
+- **Video decoding happens on the main/render thread**, pulled on-demand each frame via `try_pop` — it never blocks the UI loop waiting on the queue.
+- **Audio decoding is driven by SDL's audio callback thread**, which pulls from the audio queue and feeds the device buffer directly.
+- The bounded queues use two condition variables (`m_cond_push`/`m_cond_pop`) so a full queue naturally stalls the demuxer (applying backpressure) without spinning, and `abort()` cleanly wakes every blocked thread for shutdown.
+
+#### GPU-Mapped Planar YUV Uploads
+Instead of performing costly YUV-to-RGB color space conversions on the CPU, the video decoder pipeline extracts raw YUV 4:2:0 planar frame data directly. The main thread maps this data onto a hardware-accelerated SDL2 streaming texture (`SDL_PIXELFORMAT_IYUV`) using `SDL_UpdateYUVTexture`. This uploads the raw plane segments directly to GPU-mapped texture memory, allowing the graphics hardware to handle color space conversion and scaling efficiently.
+
+
+### Audio-Master Clock
+
+Rather than syncing playback to system wall-clock time, the player treats **audio as the master clock** whenever an audio stream is present — the standard approach in production media players, since audio dropouts and clicks are far more perceptible to the ear than the eye is to a duplicated or dropped video frame.
+
+The audio clock isn't just "the last decoded packet's timestamp." It's reconstructed sample-accurately:
+
+```
+audio_clock = base_pts_of_current_frame + (bytes_already_consumed_by_SDL / bytes_per_second)
+```
+
+`AudioDecoder::getAudioClock()` combines the PTS of the most recently decoded frame with how far the SDL audio callback has already progressed *into* that frame's buffer, giving sub-frame timing resolution rather than per-packet granularity. This is what makes the `<10ms` drift KPI meaningful rather than aspirational — the reference clock itself is precise enough to support that tolerance.
+
+When there's no audio track, the controller falls back to a wall-clock-driven `m_videoClock` that advances using `steady_clock` deltas between render ticks (`updateClockForVideoOnly`), so video-only files still play at the correct rate.
+
+### Catch-Up Logic: Two Thresholds, Different Jobs
+
+Each render tick, the video path compares the currently-decoded frame's PTS against the master clock and decides whether to drop frames to catch up. Two thresholds govern this, deliberately set apart from each other to avoid thrashing:
+
+| Threshold | Purpose |
+|---|---|
+| **10ms** (`timeNow - 0.010`) | Steady-state drop sensitivity — if the decoded frame is more than 10ms behind, decode-and-discard the next frame instead of displaying it. Tight enough to keep drift imperceptible. |
+| **80ms** (`timeNow - 0.080`) | "Close enough" exit condition — during an active seek catch-up, stop dropping once within 80ms of target. Wide enough to avoid an extra decode cycle just to shave off the last few milliseconds. |
+
+The drop budget itself is adaptive:
+- **Normal playback:** up to 8 frame drops per render tick, keeping the UI loop responsive even if momentarily behind.
+- **Large drift (>500ms behind):** budget raises to 32 drops/tick — covers cases like a slow disk read or a brief stall.
+- **Active seek:** budget raises to 2000 drops/tick, so a seek can decode forward to the target keyframe's neighborhood in a single burst rather than over several render frames.
+
+During seek catch-up, texture updates are suppressed for any frame still more than 80ms behind target — this is what prevents the visual "fast-forward flash" a naive catch-up loop would otherwise show while burning through stale frames.
+
+### Seek Flow
+
+1. UI thread calls `PlayerController::seek()` → pauses audio output, signals the demuxer, and clears both packet queues immediately (don't wait for the demuxer thread to notice).
+2. Demuxer thread independently calls `avformat_seek_file()` (binary-search index seek to the nearest keyframe) and re-clears the queues defensively in case any stale packets were in flight.
+3. Both decoders are flushed (`avcodec_flush_buffers`) to drop any cached reference frames from the old position.
+4. Render loop enters the high-budget catch-up path described above until the decoded PTS lands within 80ms of the seek target.
+
+This two-sided clear (UI thread *and* demuxer thread both clearing the queues) is what keeps perceived seek latency low — the player doesn't wait for an in-flight `av_read_frame()` call to return before discarding old data.
+
+### State Machine Transitions
+The player playback engine is governed by a strict state machine to synchronize operations between threads:
+* **`UNINITIALIZED`:** The player is empty. Loading a media file starts background demuxing and transitions the state to `OPENED`.
+* **`OPENED`:** The media is loaded, and the decoders are prepared. The first frame is decoded and rendered on the screen immediately. Triggering `play()` transitions the state to `PLAYING`.
+* **`PLAYING`:** Audio output is unpaused, and the main loop decodes and syncs video frames to the master clock.
+* **`PAUSED`:** Playback is frozen. The audio device is paused to hold the current clock position.
+* **`ENDED`:** Reached when the demuxer hits EOF and all packet queues are fully drained. The audio device is paused. Seeking back (e.g., `seek(0.0)`) or playing transitions the engine back to active states.
+* **`ERROR_STATE`:** Entered if demuxing or stream initialization fails, prompting safe release of resources.
+
+---
+
 ## Tech Stack & Dependencies
 
 - **C++17** (compiled with GCC/MinGW)
