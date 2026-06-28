@@ -77,6 +77,25 @@ int main(int argc, char* argv[]) {
         return -1;
     }
 
+    // Set the application window icon
+    std::string iconPaths[] = {
+        "assets/app_icon.bmp",
+        "../assets/app_icon.bmp",
+        "../../assets/app_icon.bmp",
+        "./app_icon.bmp"
+    };
+    SDL_Surface* iconSurface = nullptr;
+    for (const auto& path : iconPaths) {
+        iconSurface = SDL_LoadBMP(path.c_str());
+        if (iconSurface) {
+            break;
+        }
+    }
+    if (iconSurface) {
+        SDL_SetWindowIcon(window, iconSurface);
+        SDL_FreeSurface(iconSurface);
+    }
+
     // Create hardware-accelerated renderer with VSync enabled
     SDL_Renderer* renderer = SDL_CreateRenderer(
         window, 

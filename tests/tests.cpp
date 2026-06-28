@@ -913,7 +913,8 @@ int real_main(int argc, char* argv[]) {
             test_assert(testEndController.getState() == PlayerState::ENDED, "EOF + empty queues transitions to ENDED");
 
             // Test 3: Seek backward from ENDED and resume
-            testEndController.seek(10.0);
+            double seekTime = std::min(10.0, testEndController.getDuration() * 0.5);
+            testEndController.seek(seekTime);
             test_assert(!testEndController.m_demuxer->isEOF(), "isEOF() is false immediately after seeking backward");
             test_assert(testEndController.getState() == PlayerState::OPENED, "State is OPENED after seek from ENDED");
 
@@ -924,7 +925,7 @@ int real_main(int argc, char* argv[]) {
 
             testEndController.play();
             test_assert(testEndController.getState() == PlayerState::PLAYING, "State is PLAYING after play");
-            test_assert(std::abs(testEndController.getCurrentTime() - 10.0) < 1.0, "Current time is near seek position");
+            test_assert(std::abs(testEndController.getCurrentTime() - seekTime) < 1.0, "Current time is near seek position");
 
             testEndController.stop();
         }

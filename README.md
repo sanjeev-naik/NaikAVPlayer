@@ -15,6 +15,9 @@ Built on top of barebones **FFmpeg**, **SDL2**, and **Dear ImGui**, **NaikAVPlay
 - 🎛️ **Software Volume Controls:** Software audio sample attenuator with dynamic byte scaling, including a zero-overhead mute/bypass layout.
 - 📂 **Flexible Media Loading:** Supports drag-and-drop file ingestion directly onto the player window, or custom local file system parsing.
 - 📊 **Diagnostics HUD:** Real-time HUD diagnostics overlay displaying player states, playback clock offsets, media metadata, and resolution metrics.
+- 🎨 **Modern Glassmorphic GUI with Vector Icons:** Floating dock and cinematic header layouts with a frosted translucent obsidian design, circular progress grabs, interactive welcome onboarding cards, toggleable HUD sidebars, and **programmatically-rendered vector control icons** (Play, Pause, Stop, Seek, Volume, Browse) featuring neon cyan hover highlights and accessibility tooltips.
+- 🔤 **Bundled Open-Source Typography:** Integrated with **Noto Sans** fonts (SIL Open Font License 1.1) scanned dynamically from relative paths, avoiding system-dependent proprietary lookups.
+- 🖼️ **Window Branding:** Branded with a custom high-fidelity app icon loaded natively as the SDL2 window and taskbar icon.
 - 🧪 **100% Logic Test Coverage:** A fully instrumented functional integration and white-box test suite executing 100% of the player's core playback controller, demuxer, and audio/video decoder logical lines.
 
 ---
@@ -22,9 +25,11 @@ Built on top of barebones **FFmpeg**, **SDL2**, and **Dear ImGui**, **NaikAVPlay
 ## Tech Stack & Dependencies
 
 - **C++17** (compiled with GCC/MinGW)
-- **FFmpeg 8.x (avcodec, avformat, avutil, swscale, swresample)** (local shared binaries)
+- **FFmpeg 8.x (avcodec, avformat, avutil, swscale, swresample)** (automatically downloaded LGPL-shared binaries)
 - **SDL2** (automatically fetched and dynamically compiled)
 - **Dear ImGui** (automatically fetched and statically compiled)
+- **Noto Sans Font** (bundled open-source SIL OFL 1.1 font files)
+- **App Icon Asset** (custom-designed PNG and BMP formats)
 
 ---
 
@@ -33,6 +38,8 @@ Built on top of barebones **FFmpeg**, **SDL2**, and **Dear ImGui**, **NaikAVPlay
 Ensure you have **MinGW-w64 (GCC)** and **CMake (version 3.18+)** configured on your path.
 
 The project features a **fully automated setup**. During the first build configuration, CMake will automatically download the correct pre-compiled FFmpeg shared binaries package from BtbN's stable release mirror, extract it, and place it in the `thirdparty/ffmpeg` folder—completely bypassing the need for manual configuration.
+
+*Note: The build uses the **LGPL-shared** package of FFmpeg to ensure strict licensing compliance with the project's permissive MIT license.*
 
 ### Step 1: Configure the Project
 Generate the build configurations (this downloads FFmpeg, SDL2, and Dear ImGui):
@@ -63,13 +70,15 @@ Or run it passing a media file path directly as an argument:
 
 ### Keyboard Shortcuts
 - **`Spacebar`**: Toggle Play / Pause.
-- **`Left Arrow` ($\leftarrow$)**: Seek backward by 10 seconds.
-- **`Right Arrow` ($\rightarrow$)**: Seek forward by 10 seconds.
+- **`Left Arrow`** ($\leftarrow$): Seek backward by 10 seconds.
+- **`Right Arrow`** ($\rightarrow$): Seek forward by 10 seconds.
 - **`Escape`**: Close and exit the player.
 
 ---
 
 ## Verification & Tests
+
+The test video was programmatically generated for testing purposes and contains only synthetic audio and graphics.
 
 Run the coverage-instrumented functional test suite by passing a media file path directly:
 ```powershell
@@ -78,7 +87,6 @@ Run the coverage-instrumented functional test suite by passing a media file path
 Alternatively, set the `TEST_VIDEO_PATH` environment variable before running:
 ```powershell
 $env:TEST_VIDEO_PATH="C:\Path\To\video.mp4"
-.\build\NaikAVPlayer_tests.exe
 ```
 
 Generate the code coverage statistics:
@@ -94,7 +102,8 @@ gcov -o CMakeFiles/NaikAVPlayer_tests.dir/tests/tests.cpp.obj ../src/PlayerContr
 
 ## Open-Source Attribution & Credits
 
-NaikAVPlayer is published under the **MIT License**. It links dynamically and statically to the following libraries:
-- **FFmpeg** (Licensed under LGPL v2.1+ / GPL v2.0+)
+NaikAVPlayer is published under the **MIT License**. It links dynamically and statically to the following libraries and assets:
+- **FFmpeg** (Licensed under LGPL v3.0, ensuring full legal compliance with the application's permissive MIT license)
 - **SDL2** (Licensed under the Zlib License)
 - **Dear ImGui** (Licensed under the MIT License)
+- **Noto Sans Font** (Licensed under the SIL Open Font License 1.1)

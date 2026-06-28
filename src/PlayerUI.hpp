@@ -4,9 +4,23 @@
 #include <string>
 #include <functional>
 
+#include <imgui.h>
+
 struct ImFont;
 
 class PlayerUI {
+public:
+    enum class IconType {
+        Folder,
+        Play,
+        Pause,
+        Stop,
+        SeekBackward,
+        SeekForward,
+        VolumeMute,
+        VolumeHigh
+    };
+
 private:
     PlayerController& m_controller;
     std::function<std::string()> m_fileDialogCallback;
@@ -38,6 +52,8 @@ private:
     void drawTitleBar(int windowWidth, int windowHeight);
     void drawControlsBar(int windowWidth, int windowHeight);
     void drawDiagnosticsHUD(int windowWidth, int windowHeight);
+
+    bool drawIconButton(const char* str_id, IconType icon, ImVec2 size);
 
 public:
     explicit PlayerUI(PlayerController& controller);
