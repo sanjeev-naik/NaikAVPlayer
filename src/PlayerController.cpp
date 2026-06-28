@@ -65,6 +65,7 @@ bool PlayerController::openFile(const std::string& filename) {
 
     if (!m_hasVideo && !m_hasAudio) {
         std::cerr << "Error: File has no playable video or audio streams" << std::endl;
+        stop();
         m_state = PlayerState::ERROR_STATE;
         return false;
     }

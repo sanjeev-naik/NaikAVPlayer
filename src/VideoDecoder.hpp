@@ -23,6 +23,8 @@ private:
     AVFrame* m_yuvFrame;
     uint8_t* m_yuvBuffer;
     int m_yuvBufferSize;
+    int m_allocatedWidth;
+    int m_allocatedHeight;
 
     double m_currentFramePts;
     std::atomic<bool> m_flushRequested;
