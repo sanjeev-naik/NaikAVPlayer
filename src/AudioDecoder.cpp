@@ -317,6 +317,9 @@ void AudioDecoder::sdlAudioCallback(void* userdata, Uint8* stream, int len) {
         if (volume >= 0.99f) {
             // Perfect bypass copy (faster)
             std::memcpy(dest, src, bytesToCopy);
+        } else if (volume <= 0.01f) {
+            // Perfect bypass for mute (faster, zero overhead)
+            std::memset(dest, 0, bytesToCopy);
         } else {
             // Scale amplitude line-by-line
             for (int i = 0; i < samplesToCopy; ++i) {

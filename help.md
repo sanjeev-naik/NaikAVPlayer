@@ -43,21 +43,17 @@ Launch the compiled executable:
 
 ---
 
-## 4. UI Features & Keyboard Hotkeys
+## 4. UI Features & Controls
 
 The player is designed with a premium dark glassmorphism interface.
 
 ### How to Open Media Files:
 1. **Drag-and-Drop**: Drag any video (`.mp4`, `.mkv`, `.avi`, `.webm`, etc.) or audio (`.mp3`, `.wav`) file directly onto the player window. It will open and start playing instantly!
-2. **Controls Modal**: Click the **Load File** button at the bottom-left controls bar, type the absolute path of your video in the text input, and click **Load & Play**.
+2. **Controls Modal**: Click the **Folder (Browse)** icon button at the bottom-left of the controls bar to browse or input the file path.
 
-### Hotkeys and Input:
-- **Spacebar**: Toggle Play / Pause.
-- **Left Arrow key ($\leftarrow$)**: Seek backward by 10 seconds.
-- **Right Arrow key ($\rightarrow$)**: Seek forward by 10 seconds.
-- **Escape**: Immediately exit the application.
+### GUI Controls:
 - **Timeline Slider**: Left-click or drag on the bottom progress bar to jump to any segment.
-- **Volume Slider**: Adjust the software volume attenuator from 0% to 100%. Click the **Mute** button to silence the sound instantly.
+- **Volume Slider & Toggle**: Adjust the software volume attenuator from 0% to 100%. Click the **Volume/Mute Icon** button next to the volume slider to toggle mute instantly (using a zero-overhead CPU bypass).
 
 ---
 
