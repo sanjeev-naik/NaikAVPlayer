@@ -256,6 +256,46 @@ int PlayerController::getVideoHeight() const {
     return 0;
 }
 
+std::string PlayerController::getVideoCodecName() const {
+    if (m_hasVideo && m_demuxer) {
+        AVCodecParameters* params = m_demuxer->getVideoCodecParams();
+        if (params) {
+            const char* name = avcodec_get_name(params->codec_id);
+            if (name) {
+                return std::string(name);
+            }
+        }
+    }
+    return "Unknown";
+}
+
+std::string PlayerController::getAudioCodecName() const {
+    if (m_hasAudio && m_demuxer) {
+        AVCodecParameters* params = m_demuxer->getAudioCodecParams();
+        if (params) {
+            const char* name = avcodec_get_name(params->codec_id);
+            if (name) {
+                return std::string(name);
+            }
+        }
+    }
+    return "Unknown";
+}
+
+double PlayerController::getAudioClock() {
+    if (m_hasAudio && m_audioDecoder) {
+        return m_audioDecoder->getAudioClock();
+    }
+    return 0.0;
+}
+
+double PlayerController::getVideoClock() const {
+    if (m_hasVideo && m_videoDecoder) {
+        return m_videoDecoder->getCurrentFramePts();
+    }
+    return 0.0;
+}
+
 void PlayerController::setVolume(float volume) {
     m_volume = std::clamp(volume, 0.0f, 1.0f);
     if (m_hasAudio && m_audioDecoder) {

@@ -282,6 +282,7 @@ int main(int argc, char* argv[]) {
                     yuvFrame->data[1], yuvFrame->linesize[1],
                     yuvFrame->data[2], yuvFrame->linesize[2]
                 );
+                playerUI.registerVideoFrameRendered(currentSecs);
             }
         }
 

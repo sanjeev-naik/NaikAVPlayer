@@ -60,6 +60,10 @@ public:
     double getDuration() const;
     int getVideoWidth() const;
     int getVideoHeight() const;
+    std::string getVideoCodecName() const;
+    std::string getAudioCodecName() const;
+    double getAudioClock();
+    double getVideoClock() const;
     float getVolume() const { return m_volume; }
     bool hasAudio() const { return m_hasAudio; }
     bool hasVideo() const { return m_hasVideo; }
