@@ -1,20 +1,20 @@
 cmake_minimum_required(VERSION 3.16)
 project(NaikAVPlayer C CXX)
 
+# Enforce open-source compiler (fail if MSVC is used)
+if(MSVC)
+    message(FATAL_ERROR "MSVC compiler is not supported. Please use an open-source compiler (e.g., MinGW/GCC or Clang).")
+endif()
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # -------------------------------------------------------------
 # Compiler & Linker Hardening Options
 # -------------------------------------------------------------
-if(MSVC)
-    add_compile_options(/GS /sdl /W3)
-    add_link_options(/NXCOMPAT /DYNAMICBASE)
-else()
-    # GCC/MinGW hardening flags
-    add_compile_options(-fstack-protector-strong -D_FORTIFY_SOURCE=2 -Wformat -Wformat-security)
-    add_link_options(-Wl,--dynamicbase -Wl,--nxcompat)
-endif()
+# GCC/MinGW/Clang hardening flags
+add_compile_options(-fstack-protector-strong -D_FORTIFY_SOURCE=2 -Wformat -Wformat-security)
+add_link_options(-Wl,--dynamicbase -Wl,--nxcompat)
 
 # -------------------------------------------------------------
 # Fetch SDL2

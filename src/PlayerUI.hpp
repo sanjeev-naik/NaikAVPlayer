@@ -3,6 +3,7 @@
 #include "PlayerController.hpp"
 #include <string>
 #include <functional>
+#include <deque>
 
 #include <imgui.h>
 
@@ -44,6 +45,10 @@ private:
     ImFont* m_titleFont;
     ImFont* m_hudFont;
 
+    // FPS tracking
+    std::deque<double> m_videoFrameTimes;
+    double m_videoFPS;
+
     std::string formatTime(double seconds) const;
     void applyTheme();
 
@@ -60,6 +65,8 @@ public:
     ~PlayerUI();
 
     void init();
+    
+    void registerVideoFrameRendered(double currentSystemTime);
     
     void setFileDialogCallback(std::function<std::string()> callback) {
         m_fileDialogCallback = callback;

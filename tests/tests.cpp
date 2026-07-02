@@ -928,9 +928,28 @@ int real_main(int argc, char* argv[]) {
         // -------------------------------------------------------------
         std::cout << "Testing Playback End & ENDED State transitions..." << std::endl;
         {
+            // Verify new codec name and clock lookups on uninitialized controller
+            PlayerController uninitController;
+            test_assert(uninitController.getVideoCodecName() == "Unknown", "Uninitialized video codec name is Unknown");
+            test_assert(uninitController.getAudioCodecName() == "Unknown", "Uninitialized audio codec name is Unknown");
+            test_assert(uninitController.getVideoClock() == 0.0, "Uninitialized video clock is 0.0");
+            test_assert(uninitController.getAudioClock() == 0.0, "Uninitialized audio clock is 0.0");
+
             PlayerController testEndController;
             testEndController.openFile(testFile);
             test_assert(testEndController.getState() == PlayerState::OPENED, "testEndController is OPENED");
+
+            // Verify codec name lookups on initialized controller
+            std::string vCodec = testEndController.getVideoCodecName();
+            std::string aCodec = testEndController.getAudioCodecName();
+            test_assert(vCodec != "Unknown" && !vCodec.empty(), "Video codec name is valid");
+            test_assert(aCodec != "Unknown" && !aCodec.empty(), "Audio codec name is valid");
+
+            // Verify clock lookups on initialized controller
+            double vClock = testEndController.getVideoClock();
+            double aClock = testEndController.getAudioClock();
+            test_assert(vClock >= 0.0, "Video clock is non-negative");
+            test_assert(aClock >= 0.0, "Audio clock is non-negative");
 
             testEndController.play();
             test_assert(testEndController.getState() == PlayerState::PLAYING, "testEndController is PLAYING");

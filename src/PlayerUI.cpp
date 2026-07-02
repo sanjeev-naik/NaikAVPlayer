@@ -8,7 +8,7 @@ PlayerUI::PlayerUI(PlayerController &controller)
     : m_controller(controller), m_uiVolume(5.0f), m_isMuted(false),
       m_savedVolume(5.0f), m_showDiagnostics(false), m_lastMouseMoveTime(0.0),
       m_controlsVisible(true), m_showLoadFileDialog(false), m_mainFont(nullptr),
-      m_titleFont(nullptr), m_hudFont(nullptr) {
+      m_titleFont(nullptr), m_hudFont(nullptr), m_videoFPS(0.0) {
   m_filePathBuffer[0] = '\0';
 }
 
@@ -91,8 +91,22 @@ void PlayerUI::notifyMouseActivity(double currentSystemTime) {
   m_controlsVisible = true;
 }
 
+void PlayerUI::registerVideoFrameRendered(double currentSystemTime) {
+  m_videoFrameTimes.push_back(currentSystemTime);
+}
+
 void PlayerUI::draw(int windowWidth, int windowHeight,
                     double currentSystemTime) {
+  // Update video FPS calculation
+  while (!m_videoFrameTimes.empty() && currentSystemTime - m_videoFrameTimes.front() > 1.0) {
+    m_videoFrameTimes.pop_front();
+  }
+  if (m_videoFrameTimes.size() > 1) {
+    m_videoFPS = (m_videoFrameTimes.size() - 1) / (m_videoFrameTimes.back() - m_videoFrameTimes.front());
+  } else {
+    m_videoFPS = 0.0;
+  }
+
   PlayerState state = m_controller.getState();
   bool isPlaying = (state == PlayerState::PLAYING);
   bool imguiWantsMouse = ImGui::GetIO().WantCaptureMouse;
@@ -665,7 +679,7 @@ void PlayerUI::drawDiagnosticsHUD(int windowWidth, int windowHeight) {
 
   // Floating stats card on the top right
   float cardWidth = 300.0f;
-  float cardHeight = 290.0f;
+  float cardHeight = 350.0f;
 
   ImGui::SetNextWindowPos(ImVec2(windowWidth - cardWidth - 20.0f, 60.0f));
   ImGui::SetNextWindowSize(ImVec2(cardWidth, cardHeight));
@@ -743,15 +757,41 @@ void PlayerUI::drawDiagnosticsHUD(int windowWidth, int windowHeight) {
 
   ImGui::Text("Audio Output: ");
   ImGui::SameLine();
-  ImGui::TextColored(m_controller.hasAudio() ? ImVec4(0.0f, 0.83f, 0.4f, 1.0f)
-                                             : ImVec4(0.6f, 0.6f, 0.6f, 1.0f),
-                     m_controller.hasAudio() ? "Active" : "None");
+  if (m_controller.hasAudio()) {
+    char buf[128];
+    std::snprintf(buf, sizeof(buf), "Active (%s) @ %.2fs", 
+                  m_controller.getAudioCodecName().c_str(), 
+                  m_controller.getAudioClock());
+    ImGui::TextColored(ImVec4(0.0f, 0.83f, 0.4f, 1.0f), "%s", buf);
+  } else {
+    ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "None");
+  }
 
   ImGui::Text("Video Output: ");
   ImGui::SameLine();
-  ImGui::TextColored(m_controller.hasVideo() ? ImVec4(0.0f, 0.83f, 0.4f, 1.0f)
-                                             : ImVec4(0.6f, 0.6f, 0.6f, 1.0f),
-                     m_controller.hasVideo() ? "Active" : "None");
+  if (m_controller.hasVideo()) {
+    char buf[128];
+    std::snprintf(buf, sizeof(buf), "Active (%s) @ %.2fs", 
+                  m_controller.getVideoCodecName().c_str(), 
+                  m_controller.getVideoClock());
+    ImGui::TextColored(ImVec4(0.0f, 0.83f, 0.4f, 1.0f), "%s", buf);
+  } else {
+    ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "None");
+  }
+
+  ImGui::Spacing();
+  ImGui::Separator();
+  ImGui::Spacing();
+
+  ImGui::Text("GUI Render FPS: ");
+  ImGui::SameLine();
+  ImGui::TextColored(ImVec4(0.00f, 0.83f, 0.88f, 1.00f), "%.1f", ImGui::GetIO().Framerate);
+
+  if (m_controller.hasVideo()) {
+    ImGui::Text("Video Playback FPS: ");
+    ImGui::SameLine();
+    ImGui::TextColored(ImVec4(0.0f, 0.83f, 0.4f, 1.0f), "%.1f", m_videoFPS);
+  }
 
   ImGui::Spacing();
   ImGui::Separator();
