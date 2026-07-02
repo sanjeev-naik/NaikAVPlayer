@@ -183,7 +183,10 @@ void AudioDecoder::decodeAndResample() {
         if (m_swrCtx) {
             swr_init(m_swrCtx);
         }
-        m_audioBufferIndex = 0;
+        {
+            std::lock_guard<std::mutex> lock(m_clockMutex);
+            m_audioBufferIndex = 0;
+        }
         m_audioBufferSize = 0;
         m_flushRequested = false;
     }
@@ -235,7 +238,6 @@ void AudioDecoder::decodeAndResample() {
             }
 
             m_audioBufferSize = outSamples * m_outChannels * 2;
-            m_audioBufferIndex = 0;
 
             // Set internal clock to frame start PTS relative to the start of the stream
             pts = 0.0;
@@ -252,6 +254,7 @@ void AudioDecoder::decodeAndResample() {
 
             {
                 std::lock_guard<std::mutex> lock(m_clockMutex);
+                m_audioBufferIndex = 0;
                 m_clock = pts;
             }
 
@@ -265,7 +268,10 @@ void AudioDecoder::decodeAndResample() {
             if (!m_queue.try_pop(packet)) {
                 // Queue is empty, cannot send more packets
                 m_audioBufferSize = 0;
-                m_audioBufferIndex = 0;
+                {
+                    std::lock_guard<std::mutex> lock(m_clockMutex);
+                    m_audioBufferIndex = 0;
+                }
                 return;
             }
 
@@ -330,6 +336,9 @@ void AudioDecoder::sdlAudioCallback(void* userdata, Uint8* stream, int len) {
 
         stream += bytesToCopy;
         len -= bytesToCopy;
-        self->m_audioBufferIndex += bytesToCopy;
+        {
+            std::lock_guard<std::mutex> lock(self->m_clockMutex);
+            self->m_audioBufferIndex += bytesToCopy;
+        }
     }
 }
