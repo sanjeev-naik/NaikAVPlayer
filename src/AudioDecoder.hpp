@@ -37,6 +37,7 @@ private:
     std::atomic<bool> m_flushRequested;
     std::atomic<bool> m_paused;
     bool m_startTimeSaved;
+    std::atomic<float> m_volume;
     
     AVFrame* m_decodedFrame;
 
