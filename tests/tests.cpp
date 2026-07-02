@@ -386,6 +386,55 @@ int real_main(int argc, char* argv[]) {
             test_assert(testDecoder.m_allocatedHeight == 240, "Allocated height updated to 240");
             test_assert(testDecoder.m_yuvBufferSize == av_image_get_buffer_size(AV_PIX_FMT_YUV420P, 320, 240, 1), "YUV Buffer size updated correctly");
 
+            // Test case 5: Dynamic format change and slow-path conversion (NV12 -> triggers sws_scale)
+            testDecoder.m_decodedFrame->width = 320;
+            testDecoder.m_decodedFrame->height = 240;
+            testDecoder.m_decodedFrame->format = AV_PIX_FMT_NV12;
+            std::vector<uint8_t> dummySrcBuffer3(320 * 240 * 2, 0);
+            av_image_fill_arrays(
+                testDecoder.m_decodedFrame->data,
+                testDecoder.m_decodedFrame->linesize,
+                dummySrcBuffer3.data(),
+                AV_PIX_FMT_NV12,
+                320,
+                240,
+                1
+            );
+            bool convertSlowSuccess = testDecoder.convertFrame();
+            test_assert(convertSlowSuccess, "convertFrame slow-path succeeds for NV12");
+
+            // Test case 6: Rebind slow-path buffer (triggers if m_yuvFrame->data[0] != m_yuvBuffer)
+            // Trigger fast-path first to reference m_decodedFrame (changing m_yuvFrame->data[0])
+            testDecoder.m_decodedFrame->width = 320;
+            testDecoder.m_decodedFrame->height = 240;
+            testDecoder.m_decodedFrame->format = AV_PIX_FMT_YUV420P;
+            av_image_fill_arrays(
+                testDecoder.m_decodedFrame->data,
+                testDecoder.m_decodedFrame->linesize,
+                dummySrcBuffer2.data(),
+                AV_PIX_FMT_YUV420P,
+                320,
+                240,
+                1
+            );
+            testDecoder.convertFrame();
+
+            // Now trigger slow-path again to run the rebind code block
+            testDecoder.m_decodedFrame->width = 320;
+            testDecoder.m_decodedFrame->height = 240;
+            testDecoder.m_decodedFrame->format = AV_PIX_FMT_NV12;
+            av_image_fill_arrays(
+                testDecoder.m_decodedFrame->data,
+                testDecoder.m_decodedFrame->linesize,
+                dummySrcBuffer3.data(),
+                AV_PIX_FMT_NV12,
+                320,
+                240,
+                1
+            );
+            bool convertRebindSuccess = testDecoder.convertFrame();
+            test_assert(convertRebindSuccess, "convertFrame slow-path buffer re-binding succeeds");
+
             avcodec_parameters_free(&testCodecParams);
         }
 

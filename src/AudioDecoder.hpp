@@ -31,7 +31,7 @@ private:
     
     // Decoding temporary buffers
     std::vector<uint8_t> m_audioBuffer;
-    size_t m_audioBufferIndex;
+    std::atomic<size_t> m_audioBufferIndex;
     size_t m_audioBufferSize;
     
     std::atomic<bool> m_flushRequested;

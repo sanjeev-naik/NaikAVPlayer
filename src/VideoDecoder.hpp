@@ -25,6 +25,7 @@ private:
     int m_yuvBufferSize;
     int m_allocatedWidth;
     int m_allocatedHeight;
+    AVPixelFormat m_allocatedFormat;
 
     double m_currentFramePts;
     std::atomic<bool> m_flushRequested;
