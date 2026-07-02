@@ -21,6 +21,7 @@ AudioDecoder::AudioDecoder(AVCodecParameters* codecParams,
       m_flushRequested(false),
       m_paused(true),
       m_decodedFrame(nullptr) {
+    m_volume = 1.0f;
     
     // Target audio configuration: 48,000Hz, Stereo, 16-bit Signed PCM
     m_outSampleRate = 48000;
@@ -283,12 +284,8 @@ void AudioDecoder::decodeAndResample() {
     }
 }
 
-// Local variable to hold the volume inside main controller (represented as float inside class).
-// We'll manage scaling dynamic factor locally.
-static float g_audioVolume = 1.0f;
-
 void AudioDecoder::setVolume(float volume) {
-    g_audioVolume = std::clamp(volume, 0.0f, 1.0f);
+    m_volume = std::clamp(volume, 0.0f, 1.0f);
 }
 
 void AudioDecoder::sdlAudioCallback(void* userdata, Uint8* stream, int len) {
@@ -312,7 +309,7 @@ void AudioDecoder::sdlAudioCallback(void* userdata, Uint8* stream, int len) {
         int16_t* src = reinterpret_cast<int16_t*>(self->m_audioBuffer.data() + self->m_audioBufferIndex);
         int16_t* dest = reinterpret_cast<int16_t*>(stream);
         int samplesToCopy = bytesToCopy / 2; // 16-bit = 2 bytes per sample
-        float volume = g_audioVolume;
+        float volume = self->m_volume;
 
         if (volume >= 0.99f) {
             // Perfect bypass copy (faster)
