@@ -171,8 +171,16 @@ inline int mock_avcodec_parameters_to_context(AVCodecContext* codec, const AVCod
 }
 #define avcodec_parameters_to_context mock_avcodec_parameters_to_context
 
+
 inline SDL_AudioDeviceID mock_SDL_OpenAudioDevice(const char* device, int iscapture, const SDL_AudioSpec* desired, SDL_AudioSpec* obtained, int allowed_changes) {
     if (force_sdl_audio_fail) return 0;
+#if defined(__linux__)
+    // On Linux CI/headless environments, avoid initializing real ALSA audio subsystem to prevent system driver leaks
+    if (obtained && desired) {
+        *obtained = *desired;
+    }
+    return 9999;
+#else
     SDL_AudioDeviceID dev = SDL_OpenAudioDevice(device, iscapture, desired, obtained, allowed_changes);
     if (dev == 0) {
         // Fallback for CI/limited environments (e.g., Linux dummy audio driver which only allows 1 active device at a time)
@@ -183,6 +191,7 @@ inline SDL_AudioDeviceID mock_SDL_OpenAudioDevice(const char* device, int iscapt
         return 9999;
     }
     return dev;
+#endif
 }
 #define SDL_OpenAudioDevice mock_SDL_OpenAudioDevice
 
