@@ -1,0 +1,393 @@
+cmake_minimum_required(VERSION 3.16)
+project(NaikAVPlayer C CXX)
+
+# Enforce C++17 standard
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# -------------------------------------------------------------
+# Platform Configuration
+# -------------------------------------------------------------
+set(PLATFORM "AUTO" CACHE STRING "Target platform (WINDOWS, LINUX, or AUTO)")
+set_property(CACHE PLATFORM PROPERTY STRINGS "WINDOWS" "LINUX" "AUTO")
+
+# Auto-detect or use explicit target platform
+if(PLATFORM STREQUAL "AUTO")
+    if(WIN32)
+        set(TARGET_PLATFORM_WINDOWS ON)
+    elseif(UNIX AND NOT APPLE)
+        set(TARGET_PLATFORM_LINUX ON)
+    else()
+        message(FATAL_ERROR "Unsupported host platform. Please explicitly specify -DPLATFORM=WINDOWS or -DPLATFORM=LINUX")
+    endif()
+elseif(PLATFORM STREQUAL "WINDOWS")
+    set(TARGET_PLATFORM_WINDOWS ON)
+elseif(PLATFORM STREQUAL "LINUX")
+    set(TARGET_PLATFORM_LINUX ON)
+else()
+    message(FATAL_ERROR "Invalid PLATFORM option specified. Options: WINDOWS, LINUX, AUTO")
+endif()
+
+# -------------------------------------------------------------
+# Compiler & Linker Hardening Options
+# -------------------------------------------------------------
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+    # GCC/MinGW/Clang hardening flags
+    add_compile_options(-fstack-protector-strong -D_FORTIFY_SOURCE=2 -Wformat -Wformat-security)
+elseif(MSVC)
+    # MSVC uses its own security flags instead of GCC/Clang warnings
+    add_compile_options(/GS)
+endif()
+if(TARGET_PLATFORM_WINDOWS)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        add_link_options(-Wl,--dynamicbase -Wl,--nxcompat)
+    elseif(MSVC)
+        add_link_options(/DYNAMICBASE /NXCOMPAT)
+    endif()
+endif()
+
+# -------------------------------------------------------------
+# Fetch SDL2
+# -------------------------------------------------------------
+include(FetchContent)
+
+# Optimize SDL2 build time: build shared only, disable tests/docs
+set(SDL_SHARED ON CACHE BOOL "" FORCE)
+set(SDL_STATIC OFF CACHE BOOL "" FORCE)
+set(SDL_TEST OFF CACHE BOOL "" FORCE)
+
+message(STATUS "Fetching SDL2...")
+FetchContent_Declare(
+    SDL2
+    GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
+    GIT_TAG release-2.30.3
+)
+FetchContent_MakeAvailable(SDL2)
+
+# -------------------------------------------------------------
+# Fetch Dear ImGui
+# -------------------------------------------------------------
+message(STATUS "Fetching Dear ImGui...")
+FetchContent_Declare(
+    imgui
+    GIT_REPOSITORY https://github.com/ocornut/imgui.git
+    GIT_TAG v1.90.4
+)
+FetchContent_MakeAvailable(imgui)
+
+# Create a static library for ImGui
+add_library(imgui STATIC
+    ${imgui_SOURCE_DIR}/imgui.cpp
+    ${imgui_SOURCE_DIR}/imgui_draw.cpp
+    ${imgui_SOURCE_DIR}/imgui_widgets.cpp
+    ${imgui_SOURCE_DIR}/imgui_tables.cpp
+    ${imgui_SOURCE_DIR}/imgui_demo.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl2.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_sdlrenderer2.cpp
+)
+
+# ImGui needs SDL headers
+target_link_libraries(imgui PRIVATE SDL2::SDL2)
+target_include_directories(imgui PUBLIC
+    ${imgui_SOURCE_DIR}
+    ${imgui_SOURCE_DIR}/backends
+)
+
+# -------------------------------------------------------------
+# Fetch Native File Dialog Extended (NFD)
+# -------------------------------------------------------------
+message(STATUS "Fetching Native File Dialog Extended (NFD)...")
+set(NFD_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+    nativefiledialog-extended
+    GIT_REPOSITORY https://github.com/btzy/nativefiledialog-extended.git
+    GIT_TAG        v1.2.1
+)
+FetchContent_MakeAvailable(nativefiledialog-extended)
+
+
+# -------------------------------------------------------------
+# Configure FFmpeg (Download automatically if missing on Windows)
+# -------------------------------------------------------------
+if(TARGET_PLATFORM_WINDOWS)
+    set(FFMPEG_DIR "${CMAKE_SOURCE_DIR}/thirdparty/ffmpeg")
+
+    if(NOT EXISTS "${FFMPEG_DIR}/include/libavcodec/avcodec.h" OR NOT EXISTS "${FFMPEG_DIR}/lib/avcodec.lib")
+        message(STATUS "FFmpeg headers/libraries not found in thirdparty/ffmpeg. Setting up automatically...")
+        
+        set(FFMPEG_ZIP_URL "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-lgpl-shared.zip")
+        set(FFMPEG_ZIP_PATH "${CMAKE_BINARY_DIR}/ffmpeg_download.zip")
+        set(FFMPEG_EXTRACT_DIR "${CMAKE_BINARY_DIR}/ffmpeg_extracted")
+
+        message(STATUS "Downloading FFmpeg shared binaries from ${FFMPEG_ZIP_URL}...")
+        file(DOWNLOAD "${FFMPEG_ZIP_URL}" "${FFMPEG_ZIP_PATH}" 
+             SHOW_PROGRESS 
+             STATUS download_status)
+
+        list(GET download_status 0 status_code)
+        list(GET download_status 1 status_msg)
+        if(NOT status_code EQUAL 0)
+            message(FATAL_ERROR "Failed to download FFmpeg (Code: ${status_code}): ${status_msg}")
+        endif()
+
+        message(STATUS "Extracting FFmpeg package...")
+        file(ARCHIVE_EXTRACT INPUT "${FFMPEG_ZIP_PATH}" DESTINATION "${FFMPEG_EXTRACT_DIR}")
+
+        # Find the extracted folder name
+        file(GLOB EXTRACTED_FOLDERS "${FFMPEG_EXTRACT_DIR}/ffmpeg-*")
+        list(LENGTH EXTRACTED_FOLDERS folders_len)
+        if(folders_len EQUAL 0)
+            message(FATAL_ERROR "No extracted FFmpeg folder found. Extraction may have failed.")
+        endif()
+        list(GET EXTRACTED_FOLDERS 0 FFMPEG_SRC_DIR)
+
+        message(STATUS "Installing FFmpeg to thirdparty/ffmpeg...")
+        file(REMOVE_RECURSE "${FFMPEG_DIR}") # Clear clean install
+        file(MAKE_DIRECTORY "${FFMPEG_DIR}")
+        
+        file(COPY "${FFMPEG_SRC_DIR}/bin" DESTINATION "${FFMPEG_DIR}")
+        file(COPY "${FFMPEG_SRC_DIR}/include" DESTINATION "${FFMPEG_DIR}")
+        file(COPY "${FFMPEG_SRC_DIR}/lib" DESTINATION "${FFMPEG_DIR}")
+        
+        # Copy LICENSE and README if present
+        if(EXISTS "${FFMPEG_SRC_DIR}/LICENSE.txt")
+            file(COPY "${FFMPEG_SRC_DIR}/LICENSE.txt" DESTINATION "${FFMPEG_DIR}")
+        endif()
+        if(EXISTS "${FFMPEG_SRC_DIR}/README.txt")
+            file(COPY "${FFMPEG_SRC_DIR}/README.txt" DESTINATION "${FFMPEG_DIR}")
+        endif()
+
+        file(REMOVE "${FFMPEG_ZIP_PATH}")
+        file(REMOVE_RECURSE "${FFMPEG_EXTRACT_DIR}")
+        message(STATUS "FFmpeg setup complete!")
+    endif()
+
+    include_directories(SYSTEM "${FFMPEG_DIR}/include")
+    link_directories("${FFMPEG_DIR}/lib")
+endif()
+
+# -------------------------------------------------------------
+# Main Executable
+# -------------------------------------------------------------
+# Separate logic source files from main.cpp
+set(PLAYER_LOGIC_SOURCES
+    src/PlayerController.cpp
+    src/Demuxer.cpp
+    src/VideoDecoder.cpp
+    src/AudioDecoder.cpp
+)
+
+add_executable(NaikAVPlayer 
+    src/main.cpp 
+    src/PlayerUI.cpp
+    ${PLAYER_LOGIC_SOURCES}
+)
+
+# Link libraries to our executable
+target_link_libraries(NaikAVPlayer PRIVATE
+    imgui
+    SDL2::SDL2
+    avcodec
+    avformat
+    avutil
+    swscale
+    swresample
+    nfd
+)
+
+# Ensure standard Win32 subsystems link correctly for MinGW only
+if(TARGET_PLATFORM_WINDOWS AND CMAKE_CXX_COMPILER_ID MATCHES "GNU")
+    target_link_libraries(NaikAVPlayer PRIVATE mingw32)
+endif()
+
+# Link Linux specific libraries
+if(TARGET_PLATFORM_LINUX)
+    target_link_libraries(NaikAVPlayer PRIVATE pthread dl)
+endif()
+
+# Copy FFmpeg and SDL DLLs to executable output directory so it runs smoothly on Windows
+if(TARGET_PLATFORM_WINDOWS)
+    add_custom_command(TARGET NaikAVPlayer POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${FFMPEG_DIR}/bin"
+            $<TARGET_FILE_DIR:NaikAVPlayer>
+        COMMENT "Copying FFmpeg DLLs to output directory..."
+    )
+
+    add_custom_command(TARGET NaikAVPlayer POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy
+            $<TARGET_FILE:SDL2::SDL2>
+            $<TARGET_FILE_DIR:NaikAVPlayer>
+        COMMENT "Copying SDL2.dll to output directory..."
+    )
+endif()
+
+add_custom_command(TARGET NaikAVPlayer POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${CMAKE_SOURCE_DIR}/assets/fonts"
+        "$<TARGET_FILE_DIR:NaikAVPlayer>/assets/fonts"
+    COMMENT "Copying Noto Sans fonts to output directory..."
+)
+
+# -------------------------------------------------------------
+# Test Target
+# -------------------------------------------------------------
+add_executable(NaikAVPlayer_tests 
+    tests/tests.cpp
+)
+
+option(ENABLE_COVERAGE "Enable code coverage instrumentation" ON)
+
+if(ENABLE_COVERAGE)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        # Enable GCC/Clang code coverage flags for tests
+        target_compile_options(NaikAVPlayer_tests PRIVATE --coverage -O0 -g)
+        target_link_options(NaikAVPlayer_tests PRIVATE --coverage)
+    elseif(MSVC)
+        target_compile_options(NaikAVPlayer_tests PRIVATE /Zi /Od)
+        target_link_options(NaikAVPlayer_tests PRIVATE /DEBUG)
+    endif()
+else()
+    if(MSVC)
+        target_compile_options(NaikAVPlayer_tests PRIVATE /Od)
+    else()
+        target_compile_options(NaikAVPlayer_tests PRIVATE -O0 -g)
+    endif()
+endif()
+
+target_link_libraries(NaikAVPlayer_tests PRIVATE
+    SDL2::SDL2
+    avcodec
+    avformat
+    avutil
+    swscale
+    swresample
+)
+
+if(TARGET_PLATFORM_LINUX)
+    target_link_libraries(NaikAVPlayer_tests PRIVATE pthread dl)
+endif()
+
+# Copy FFmpeg and SDL DLLs to tests output directory on Windows
+if(TARGET_PLATFORM_WINDOWS)
+    add_custom_command(TARGET NaikAVPlayer_tests POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${FFMPEG_DIR}/bin"
+            $<TARGET_FILE_DIR:NaikAVPlayer_tests>
+        COMMENT "Copying FFmpeg DLLs to tests output directory..."
+    )
+
+    add_custom_command(TARGET NaikAVPlayer_tests POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy
+            $<TARGET_FILE:SDL2::SDL2>
+            $<TARGET_FILE_DIR:NaikAVPlayer_tests>
+        COMMENT "Copying SDL2.dll to tests output directory..."
+    )
+endif()
+
+add_custom_command(TARGET NaikAVPlayer_tests POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${CMAKE_SOURCE_DIR}/assets/fonts"
+        "$<TARGET_FILE_DIR:NaikAVPlayer_tests>/assets/fonts"
+    COMMENT "Copying Noto Sans fonts to tests output directory..."
+)
+
+# -------------------------------------------------------------
+# Install Rules
+# -------------------------------------------------------------
+include(GNUInstallDirs)
+
+install(TARGETS NaikAVPlayer
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+)
+
+install(DIRECTORY assets/fonts/
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/NaikAVPlayer/fonts
+)
+
+install(FILES assets/app_icon.png
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/icons/hicolor/256x256/apps
+    RENAME naikavplayer.png
+)
+
+# Generate the .desktop launcher file at configure time so the repo doesn't
+# need to carry a separate packaging/naikavplayer.desktop source file.
+if(TARGET_PLATFORM_LINUX)
+    set(DESKTOP_FILE "${CMAKE_BINARY_DIR}/naikavplayer.desktop")
+    file(WRITE "${DESKTOP_FILE}"
+"[Desktop Entry]
+Type=Application
+Name=NaikAVPlayer
+Comment=Lightweight C++ media player
+Exec=${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_BINDIR}/NaikAVPlayer
+Icon=naikavplayer
+Terminal=false
+Categories=AudioVideo;Player;
+")
+
+    install(FILES "${DESKTOP_FILE}"
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/applications
+    )
+endif()
+
+# Refresh desktop/icon caches after install so the launcher shows up
+# immediately without a logout/login (best-effort; ignored if tools absent).
+if(TARGET_PLATFORM_LINUX)
+    install(CODE "
+        find_program(UPDATE_DESKTOP_DB update-desktop-database)
+        if(UPDATE_DESKTOP_DB)
+            execute_process(COMMAND \${UPDATE_DESKTOP_DB} ${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_DATADIR}/applications)
+        endif()
+        find_program(GTK_UPDATE_ICON_CACHE gtk-update-icon-cache)
+        if(GTK_UPDATE_ICON_CACHE)
+            execute_process(COMMAND \${GTK_UPDATE_ICON_CACHE} -f ${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_DATADIR}/icons/hicolor)
+        endif()
+    ")
+endif()
+
+# -------------------------------------------------------------
+# Uninstall Target (Linux)
+# -------------------------------------------------------------
+# The uninstall script is generated inline at configure time (no external
+# cmake_uninstall.cmake.in file needed). It reads install_manifest.txt,
+# which CMake writes automatically after `cmake --install`, and removes
+# exactly the files that were installed.
+if(TARGET_PLATFORM_LINUX AND NOT TARGET uninstall)
+    set(UNINSTALL_SCRIPT "${CMAKE_CURRENT_BINARY_DIR}/cmake_uninstall.cmake")
+
+    file(WRITE "${UNINSTALL_SCRIPT}"
+"cmake_policy(SET CMP0007 NEW)
+
+if(NOT EXISTS \"${CMAKE_CURRENT_BINARY_DIR}/install_manifest.txt\")
+    message(FATAL_ERROR \"Cannot find install manifest: ${CMAKE_CURRENT_BINARY_DIR}/install_manifest.txt\")
+endif()
+
+file(READ \"${CMAKE_CURRENT_BINARY_DIR}/install_manifest.txt\" files)
+string(REGEX REPLACE \"\\n\" \";\" files \"\${files}\")
+list(REVERSE files)
+
+foreach(file \${files})
+    message(STATUS \"Uninstalling: \$ENV{DESTDIR}\${file}\")
+    if(IS_SYMLINK \"\$ENV{DESTDIR}\${file}\" OR EXISTS \"\$ENV{DESTDIR}\${file}\")
+        execute_process(
+            COMMAND \"${CMAKE_COMMAND}\" -E remove \"\$ENV{DESTDIR}\${file}\"
+            RESULT_VARIABLE rm_retval
+        )
+        if(NOT \"\${rm_retval}\" STREQUAL 0)
+            message(FATAL_ERROR \"Problem when removing \$ENV{DESTDIR}\${file}\")
+        endif()
+    else()
+        message(STATUS \"File \$ENV{DESTDIR}\${file} does not exist.\")
+    endif()
+endforeach()
+")
+
+    add_custom_target(uninstall
+        COMMAND ${CMAKE_COMMAND} -P "${UNINSTALL_SCRIPT}"
+        COMMENT "Uninstalling NaikAVPlayer..."
+    )
+endif()
+
+# Enable CTest and register test suite
+enable_testing()
+add_test(NAME NaikAVPlayer_tests COMMAND NaikAVPlayer_tests "${CMAKE_SOURCE_DIR}/assets/hd_test_video_with_audio.mp4")
