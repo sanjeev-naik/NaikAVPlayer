@@ -20,16 +20,14 @@ Built on top of barebones **FFmpeg**, **SDL2**, and **Dear ImGui**, **NaikAVPlay
 - 📊 **Diagnostics HUD:** Real-time HUD diagnostics overlay displaying player states, playback clock offsets, media metadata, resolution metrics, and a security note warning for decoder maintenance.
 - 🎨 **Modern Glassmorphic GUI with Vector Icons:** Floating dock and cinematic header layouts with a frosted translucent obsidian design, circular progress grabs, interactive welcome onboarding cards, toggleable HUD sidebars, and **programmatically-rendered vector control icons** (Play, Pause, Stop, Seek, Volume, Loop, Browse) featuring neon cyan hover highlights and accessibility tooltips.
 - 🔤 **Bundled Open-Source Typography:** Integrated with **Noto Sans** fonts (SIL Open Font License 1.1) scanned dynamically from relative and installed system paths, avoiding system-dependent proprietary lookups.
-- 🖼️ **Window Branding:** Branded with a custom high-fidelity app icon loaded natively as the SDL2 window and taskbar icon.
-- 🧪 **100% Logic Test Coverage:** A fully instrumented functional integration and white-box test suite executing 100% of the player's core playback controller, demuxer, and audio/video decoder logical lines.
 
 ---
 
 ## Key Performance Indicators (KPIs)
 
 To maintain extreme performance and rendering accuracy, the core engine adheres to strict engineering targets:
-- ⏱️ **Audio-Video Drift (`< 10ms`):** Frame-alignment threshold relative to the audio device master clock timeline. If the video frame PTS lags by more than 10ms (`timeNow - 0.010` in `main.cpp`), the player enters a fast-forward decode loop to drop late frames and catch up instantly.
-- 🏎️ **Seek Latency (`< 80ms`):** Average seek-to-keyframe catch-up response under normal workloads. The player immediately flushes packet queues and codec caches, then deactivates seeking catch-up once the current frame PTS is within 80ms (`timeNow - 0.080` in `main.cpp`) of the target seek clock.
+- ⏱️ **Audio-Video Drift (`< 10ms`):** Frame-alignment target relative to the audio device master clock timeline. If the video frame PTS lags behind the current playback clock, the render loop in `main.cpp` drains the decoded frame queue to discard late frames and present the most recent frame instantly.
+- 🏎️ **Seek Latency (`< 80ms`):** Seek-to-keyframe catch-up response time under normal workloads. The player immediately flushes packet queues and codec caches, then deactivates seeking catch-up in `PlayerController.cpp` once the decoded frame PTS reaches within 5ms (`m_catchupTarget - 0.005`) of the seek target.
 - 🧪 **Code Quality (`100.00%`):** Unit and integration test line coverage on all core playback, demuxing, and decoding engine files (`AudioDecoder.cpp`, `VideoDecoder.cpp`, `Demuxer.cpp`, `PlayerController.cpp`, and `ThreadSafeQueue.hpp`).
 - 🎛️ **Audio Attenuation:** Zero-overhead software attenuator bypass for mute and full volume states. Full volume (`volume >= 0.99f`) bypasses the scaling loop using `std::memcpy`; mute volume (`volume <= 0.01f`) bypasses the loop using `std::memset` to 0.
 
