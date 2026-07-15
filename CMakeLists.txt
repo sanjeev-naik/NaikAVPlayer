@@ -15,7 +15,7 @@ set_property(CACHE PLATFORM PROPERTY STRINGS "WINDOWS" "LINUX" "AUTO")
 if(PLATFORM STREQUAL "AUTO")
     if(WIN32)
         set(TARGET_PLATFORM_WINDOWS ON)
-    elseif(UNIX AND NOT APPLE)
+    elseif(UNIX)
         set(TARGET_PLATFORM_LINUX ON)
     else()
         message(FATAL_ERROR "Unsupported host platform. Please explicitly specify -DPLATFORM=WINDOWS or -DPLATFORM=LINUX")
@@ -31,7 +31,7 @@ endif()
 # -------------------------------------------------------------
 # Compiler & Linker Hardening Options
 # -------------------------------------------------------------
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     # GCC/MinGW/Clang hardening flags
     add_compile_options(-fstack-protector-strong -D_FORTIFY_SOURCE=2 -Wformat -Wformat-security)
 elseif(MSVC)
@@ -39,10 +39,31 @@ elseif(MSVC)
     add_compile_options(/GS)
 endif()
 if(TARGET_PLATFORM_WINDOWS)
-    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         add_link_options(-Wl,--dynamicbase -Wl,--nxcompat)
     elseif(MSVC)
         add_link_options(/DYNAMICBASE /NXCOMPAT)
+    endif()
+endif()
+
+# -------------------------------------------------------------
+# C++ Compiler Warnings & Sanitizer Settings
+# -------------------------------------------------------------
+option(TREAT_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ON)
+option(ENABLE_SANITIZERS "Enable Address and Undefined Behavior Sanitizers" OFF)
+
+set(PROJECT_WARNING_FLAGS "")
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    set(PROJECT_WARNING_FLAGS "-Wall" "-Wextra" "-Wpedantic")
+    if(TREAT_WARNINGS_AS_ERRORS)
+        list(APPEND PROJECT_WARNING_FLAGS "-Werror")
+    endif()
+endif()
+
+if(ENABLE_SANITIZERS)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer)
+        add_link_options(-fsanitize=address,undefined)
     endif()
 endif()
 
@@ -51,10 +72,27 @@ endif()
 # -------------------------------------------------------------
 include(FetchContent)
 
-# Optimize SDL2 build time: build shared only, disable tests/docs
+# Optimize SDL2 build time: build shared only, disable unused subsystems
 set(SDL_SHARED ON CACHE BOOL "" FORCE)
 set(SDL_STATIC OFF CACHE BOOL "" FORCE)
 set(SDL_TEST OFF CACHE BOOL "" FORCE)
+
+# Enable only required subsystems for NaikAVPlayer
+set(SDL_VIDEO ON CACHE BOOL "" FORCE)
+set(SDL_AUDIO ON CACHE BOOL "" FORCE)
+set(SDL_TIMERS ON CACHE BOOL "" FORCE)
+set(SDL_EVENTS ON CACHE BOOL "" FORCE)
+set(SDL_THREADS ON CACHE BOOL "" FORCE)
+set(SDL_RENDER ON CACHE BOOL "" FORCE)
+
+# Disable all other unused subsystems
+set(SDL_JOYSTICK OFF CACHE BOOL "" FORCE)
+set(SDL_HAPTIC OFF CACHE BOOL "" FORCE)
+set(SDL_SENSOR OFF CACHE BOOL "" FORCE)
+set(SDL_POWER OFF CACHE BOOL "" FORCE)
+set(SDL_HIDAPI OFF CACHE BOOL "" FORCE)
+set(SDL_LOCALE OFF CACHE BOOL "" FORCE)
+set(SDL_MISC OFF CACHE BOOL "" FORCE)
 
 message(STATUS "Fetching SDL2...")
 FetchContent_Declare(
@@ -205,6 +243,9 @@ if(TARGET_PLATFORM_LINUX)
     target_link_libraries(NaikAVPlayer PRIVATE pthread dl)
 endif()
 
+# Apply compiler warning flags to main application target
+target_compile_options(NaikAVPlayer PRIVATE ${PROJECT_WARNING_FLAGS})
+
 # Copy FFmpeg and SDL DLLs to executable output directory so it runs smoothly on Windows
 if(TARGET_PLATFORM_WINDOWS)
     add_custom_command(TARGET NaikAVPlayer POST_BUILD
@@ -239,7 +280,7 @@ add_executable(NaikAVPlayer_tests
 option(ENABLE_COVERAGE "Enable code coverage instrumentation" ON)
 
 if(ENABLE_COVERAGE)
-    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         # Enable GCC/Clang code coverage flags for tests
         target_compile_options(NaikAVPlayer_tests PRIVATE --coverage -O0 -g)
         target_link_options(NaikAVPlayer_tests PRIVATE --coverage)
@@ -267,6 +308,9 @@ target_link_libraries(NaikAVPlayer_tests PRIVATE
 if(TARGET_PLATFORM_LINUX)
     target_link_libraries(NaikAVPlayer_tests PRIVATE pthread dl)
 endif()
+
+# Apply compiler warning flags to test suite target
+target_compile_options(NaikAVPlayer_tests PRIVATE ${PROJECT_WARNING_FLAGS})
 
 # Copy FFmpeg and SDL DLLs to tests output directory on Windows
 if(TARGET_PLATFORM_WINDOWS)
@@ -390,4 +434,62 @@ endif()
 
 # Enable CTest and register test suite
 enable_testing()
-add_test(NAME NaikAVPlayer_tests COMMAND NaikAVPlayer_tests "${CMAKE_SOURCE_DIR}/assets/hd_test_video_with_audio.mp4")
+
+set(TEST_VIDEO_PATH "${CMAKE_SOURCE_DIR}/assets/hd_test_video_with_audio.mp4")
+
+# Automatically generate a dummy test video using FFmpeg if it's not present
+if(NOT EXISTS "${TEST_VIDEO_PATH}")
+    if(CMAKE_HOST_WIN32)
+        find_program(FFMPEG_EXE NAMES ffmpeg PATHS "${FFMPEG_DIR}/bin" NO_DEFAULT_PATH)
+        if(NOT FFMPEG_EXE)
+            find_program(FFMPEG_EXE ffmpeg)
+        endif()
+    else()
+        find_program(FFMPEG_EXE ffmpeg)
+    endif()
+
+    if(FFMPEG_EXE)
+        message(STATUS "Generating dummy test video for test suite: ${TEST_VIDEO_PATH}...")
+        
+        # Try libx264 (standard for GPL builds)
+        execute_process(
+            COMMAND ${FFMPEG_EXE} -y -f lavfi -i testsrc=duration=5:size=640x360:rate=30
+                    -f lavfi -i sine=frequency=1000:duration=5 -c:v libx264 -c:a aac ${TEST_VIDEO_PATH}
+            RESULT_VARIABLE FFMPEG_GEN_RESULT
+            OUTPUT_QUIET
+            ERROR_QUIET
+        )
+        
+        # Fallback to libopenh264 (standard for Cisco/LGPL builds)
+        if(NOT FFMPEG_GEN_RESULT EQUAL 0)
+            execute_process(
+                COMMAND ${FFMPEG_EXE} -y -f lavfi -i testsrc=duration=5:size=640x360:rate=30
+                        -f lavfi -i sine=frequency=1000:duration=5 -c:v libopenh264 -c:a aac ${TEST_VIDEO_PATH}
+                RESULT_VARIABLE FFMPEG_GEN_RESULT
+                OUTPUT_QUIET
+                ERROR_QUIET
+            )
+        endif()
+
+        # Fallback to h264_mf (Windows Media Foundation)
+        if(NOT FFMPEG_GEN_RESULT EQUAL 0)
+            execute_process(
+                COMMAND ${FFMPEG_EXE} -y -f lavfi -i testsrc=duration=5:size=640x360:rate=30
+                        -f lavfi -i sine=frequency=1000:duration=5 -c:v h264_mf -c:a aac ${TEST_VIDEO_PATH}
+                RESULT_VARIABLE FFMPEG_GEN_RESULT
+                OUTPUT_QUIET
+                ERROR_QUIET
+            )
+        endif()
+
+        if(NOT FFMPEG_GEN_RESULT EQUAL 0)
+            message(WARNING "Failed to generate dummy test video. Unit tests might fail without test_video.mp4.")
+        else()
+            message(STATUS "Successfully generated dummy test video.")
+        endif()
+    else()
+        message(WARNING "ffmpeg executable not found. Unable to automatically generate test_video.mp4.")
+    endif()
+endif()
+
+add_test(NAME NaikAVPlayer_tests COMMAND NaikAVPlayer_tests "${TEST_VIDEO_PATH}")

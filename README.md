@@ -42,19 +42,22 @@ NaikAVPlayer follows the classic multi-threaded media player design: a demuxer t
 ### Thread Model
 
 ```
-┌─────────────┐     packets      ┌──────────────────┐
-│             ├─────────────────►│  Video Queue (100) │──► VideoDecoder ──► SWS Scale ──► SDL Texture
-│   Demuxer   │                  └──────────────────┘                                         ▲
-│  (thread)   │                                                                                │
-│             ├─────────────────►┌──────────────────┐                                          │
-└─────────────┘     packets      │  Audio Queue (150) │──► AudioDecoder ──► SDL Callback ───────┘
-                                  └──────────────────┘         (master clock)
+┌─────────────┐   packets   ┌──────────────────┐               ┌────────────────────┐
+│             ├────────────►│  Video Queue     │──► Video      │ Decoded Frame      │──► Main/Render Loop
+│   Demuxer   │             │ (AVPacket* [100])│    Decoder    │ Queue              │    (SDL YUV Texture)
+│  (thread)   │             └──────────────────┘    (thread)   │ (DecodedFrame [8]) │
+│             │                                                └────────────────────┘
+│             │   packets   ┌──────────────────┐
+│             ├────────────►│  Audio Queue     │──► AudioDecoder (decoded on-demand)
+└─────────────┘             │ (AVPacket* [150])│    (SDL callback thread)
+                            └──────────────────┘
 ```
 
-- **Demuxer thread** reads packets via `av_read_frame` and routes them into one of two bounded `ThreadSafeQueue<AVPacket*>` instances (video: 100 packets, audio: 150 — audio packets are smaller, so the queue can hold more before backpressuring).
-- **Video decoding happens on the main/render thread**, pulled on-demand each frame via `try_pop` — it never blocks the UI loop waiting on the queue.
-- **Audio decoding is driven by SDL's audio callback thread**, which pulls from the audio queue and feeds the device buffer directly.
-- The bounded queues use two condition variables (`m_cond_push`/`m_cond_pop`) so a full queue naturally stalls the demuxer (applying backpressure) without spinning, and `abort()` cleanly wakes every blocked thread for shutdown.
+- **Demuxer thread**: Reads raw packets via `av_read_frame` and routes them into bounded `ThreadSafeQueue<AVPacket*>` instances (video capacity: 100 packets, audio capacity: 150 packets).
+- **Video decoder thread**: Dedicated background thread that pops packets from the video queue, decodes them (via hardware or software fallback), converts the frames, and pushes them into the bounded `m_decodedFrameQueue` (capacity: 8 frames).
+- **Audio decoding**: Run sample-accurately inside the SDL audio callback thread. It pulls packets from the audio queue, decodes them to PCM, and feeds the output buffer.
+- **Main / Render thread**: Peeks and pops decoded frames from `m_decodedFrameQueue` whose PTS is less than or equal to the current master clock time, updates the SDL YUV texture on the GPU, and renders the UI.
+- The bounded queues use two condition variables (`m_cond_push`/`m_cond_pop`) so a full queue naturally stalls the producer (applying backpressure) without CPU spinning, and `abort()` cleanly wakes every blocked thread for shutdown.
 
 #### GPU-Mapped Planar YUV Uploads
 Instead of performing costly YUV-to-RGB color space conversions on the CPU, the video decoder pipeline extracts raw YUV 4:2:0 planar frame data directly. The main thread maps this data onto a hardware-accelerated SDL2 streaming texture (`SDL_PIXELFORMAT_IYUV`) using `SDL_UpdateYUVTexture`. This uploads the raw plane segments directly to GPU-mapped texture memory, allowing the graphics hardware to handle color space conversion and scaling efficiently.
@@ -76,30 +79,29 @@ audio_clock = base_pts_of_current_frame + (bytes_already_consumed_by_SDL / bytes
 
 When there's no audio track, the controller falls back to a wall-clock-driven `m_videoClock` that advances using `steady_clock` deltas between render ticks (`updateClockForVideoOnly`), so video-only files still play at the correct rate.
 
-### Catch-Up Logic: Two Thresholds, Different Jobs
+### Catch-Up & Frame-Dropping Logic
 
-Each render tick, the video path compares the currently-decoded frame's PTS against the master clock and decides whether to drop frames to catch up. Two thresholds govern this, deliberately set apart from each other to avoid thrashing:
+The player ensures audio-video synchronization and low latency using a two-tier catch-up/frame-dropping model:
 
-| Threshold | Purpose |
-|---|---|
-| **10ms** (`timeNow - 0.010`) | Steady-state drop sensitivity — if the decoded frame is more than 10ms behind, decode-and-discard the next frame instead of displaying it. Tight enough to keep drift imperceptible. |
-| **80ms** (`timeNow - 0.080`) | "Close enough" exit condition — during an active seek catch-up, stop dropping once within 80ms of target. Wide enough to avoid an extra decode cycle just to shave off the last few milliseconds. |
+1. **Decoder-side Seek Catch-up (SeekCatchupMode)**:
+   - When a seek is triggered, the player enters `SeekCatchupMode::LANDING` and starts a new epoch (`m_catchupEpoch`).
+   - The video decoder thread rapidly decodes packets from the seek position but discards the frames without scaling or updating textures if their PTS is less than `m_catchupTarget - 0.005` (5ms threshold).
+   - Once a frame at or past the target is successfully decoded, it is pushed to the decoded frame queue, and the catch-up mode is deactivated (`SeekCatchupMode::NONE`).
+   - This discards stale pre-seek frames and ensures seeking finishes almost instantaneously.
 
-The drop budget itself is adaptive:
-- **Normal playback:** up to 8 frame drops per render tick, keeping the UI loop responsive even if momentarily behind.
-- **Large drift (>500ms behind):** budget raises to 32 drops/tick — covers cases like a slow disk read or a brief stall.
-- **Active seek:** budget raises to 2000 drops/tick, so a seek can decode forward to the target keyframe's neighborhood in a single burst rather than over several render frames.
-
-During seek catch-up, texture updates are suppressed for any frame still more than 80ms behind target — this is what prevents the visual "fast-forward flash" a naive catch-up loop would otherwise show while burning through stale frames.
+2. **Render-side Frame-Dropping (Draining Queue)**:
+   - In the main render thread, the player loop drains frames from the `m_decodedFrameQueue` whose PTS is less than or equal to the master clock (`timeNow`).
+   - If rendering lags behind decoding, the loop pops and frees outdated frames (`av_frame_free`) in a single tick until it reaches the frame closest to/matching `timeNow`, avoiding video presentation lag.
 
 ### Seek Flow
 
-1. UI thread calls `PlayerController::seek()` → pauses audio output, signals the demuxer, and clears both packet queues immediately (don't wait for the demuxer thread to notice).
-2. Demuxer thread independently calls `avformat_seek_file()` (binary-search index seek to the nearest keyframe) and re-clears the queues defensively in case any stale packets were in flight.
+1. UI thread calls `PlayerController::seek()` → pauses audio output, increments the catch-up epoch (`m_catchupEpoch`), sets the mode to `SeekCatchupMode::LANDING`, and clears the decoded frame queue immediately.
+2. Demuxer thread independently calls `avformat_seek_file()` (binary-search index seek to the nearest keyframe) and signals the decoders.
 3. Both decoders are flushed (`avcodec_flush_buffers`) to drop any cached reference frames from the old position.
-4. Render loop enters the high-budget catch-up path described above until the decoded PTS lands within 80ms of the seek target.
+4. Video decoder thread discards frames up to the seek target (`m_catchupTarget - 0.005`) during the catch-up landing phase.
+5. Render loop displays the target frame as soon as it arrives, and audio is unpaused.
 
-This two-sided clear (UI thread *and* demuxer thread both clearing the queues) is what keeps perceived seek latency low — the player doesn't wait for an in-flight `av_read_frame()` call to return before discarding old data.
+This clean seek lifecycle minimizes perceived seek latency — the player doesn't wait for in-flight decoding to finish before discarding old data.
 
 ### State Machine Transitions
 The player playback engine is governed by a strict state machine to synchronize operations between threads:
@@ -183,6 +185,23 @@ cmake -B build -G "MinGW Makefiles" -DPLATFORM=WINDOWS
 **Explicitly Target Linux:**
 ```bash
 cmake -B build -DPLATFORM=LINUX
+```
+
+**Cross-Compile for Windows on Linux:**
+If you are on a Linux host (e.g. Ubuntu) and want to cross-compile for Windows, you can use the MinGW-w64 GCC toolchain:
+```bash
+# Install the cross-compiler
+sudo apt-get install -y mingw-w64
+
+# Configure CMake targeting Windows
+cmake -B build-windows \
+  -DPLATFORM=WINDOWS \
+  -DCMAKE_SYSTEM_NAME=Windows \
+  -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc \
+  -DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-g++
+
+# Build Windows binaries
+cmake --build build-windows
 ```
 
 ---
@@ -301,7 +320,7 @@ ctest --test-dir build --output-on-failure
 ```
 
 #### 3. Native Direct Execution
-Alternatively, run the compiled test executable directly:
+Alternatively, run the compiled test executable directly using the automatically generated test video:
 ```powershell
 # Windows
 .\build\NaikAVPlayer_tests.exe ".\assets\hd_test_video_with_audio.mp4"
@@ -315,7 +334,7 @@ Or use the `TEST_VIDEO_PATH` environment variable:
 $env:TEST_VIDEO_PATH=".\assets\hd_test_video_with_audio.mp4"
 .\build\NaikAVPlayer_tests.exe
 
-# Linux/macOS
+# Linux
 export TEST_VIDEO_PATH="./assets/hd_test_video_with_audio.mp4"
 ./build/NaikAVPlayer_tests
 ```
@@ -333,12 +352,15 @@ This generates `.gcov` files confirming **100.00% Line Coverage** for the core p
 
 ### CI/CD Pipeline (GitHub Actions)
 
-The project has a robust **GitHub Actions CI/CD pipeline** (configured in [.github/workflows/ci.yml](.github/workflows/ci.yml)) that validates all pull requests, pushes to main/master, and runs nightly builds.
+The project features an automated **GitHub Actions CI/CD pipeline** (configured in [.github/workflows/ci.yml](.github/workflows/ci.yml)) that runs on every commit (`push`) and pull request (`pull_request`).
 
-- **Cross-Platform Verification:** Compiles and runs tests on both Windows (MinGW-w64 GCC) and Linux (Ubuntu GCC).
-- **Sanitizers:** Runs the integration tests under AddressSanitizer (ASan) and UndefinedBehaviorSanitizer (UBSan) on every PR/schedule to catch memory safety issues.
-- **Static Analysis:** Performs static analysis using `cppcheck` on C++ source files.
-- **Compiler Caching (`ccache`):** The pipeline uses `ccache` to cache compile units globally. This speeds up build pipelines by bypassing recompilation of heavy dependencies like SDL2 and Dear ImGui (bringing compilation down from minutes to under 5 seconds).
+The pipeline executes entirely on a Linux runner (`ubuntu-latest`) and performs the following verification steps:
+- **C++ Compiler Warnings Check:** Compiles both targets with compiler warnings treated as errors (`-Werror`) for strict code quality.
+- **Native Linux Build & Test:** Compiles the player and runs the test suite natively under Linux using GCC.
+- **Sanitizers:** Re-compiles and runs the native test suite under AddressSanitizer (ASan) and UndefinedBehaviorSanitizer (UBSan) to check for memory safety and undefined behavior.
+- **Static Analysis:** Performs static analysis using `cppcheck` on all C++ source files.
+- **Windows Cross-Compilation:** Cross-compiles the application for Windows using the MinGW-w64 GCC toolchain (`x86_64-w64-mingw32-gcc`/`g++`).
+- **Compiler Caching (`ccache`):** Employs `ccache` to cache compilation units globally, significantly reducing compile times for upstream dependencies (SDL2, ImGui, NFD) on subsequent workflow runs.
 
 ---
 

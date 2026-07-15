@@ -47,6 +47,23 @@ cmake -B build -G "MinGW Makefiles" -DPLATFORM=WINDOWS
 cmake -B build -DPLATFORM=LINUX
 ```
 
+**Cross-Compile for Windows on Linux:**
+If you are on a Linux machine (e.g. Ubuntu) and want to cross-compile Windows binaries:
+```bash
+# Install the cross-compiler
+sudo apt-get install -y mingw-w64
+
+# Configure CMake for Windows target
+cmake -B build-windows \
+  -DPLATFORM=WINDOWS \
+  -DCMAKE_SYSTEM_NAME=Windows \
+  -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc \
+  -DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-g++
+
+# Build binaries
+cmake --build build-windows
+```
+
 ### Step B: Compile Project
 Build the binaries:
 ```bash
@@ -151,7 +168,10 @@ NaikAVPlayer natively supports hardware-accelerated H.264 decoding to deliver ma
 
 ## 7. GitHub Actions CI/CD & Caching
 
-The project includes an automated GitHub Actions pipeline (configured in [.github/workflows/ci.yml](.github/workflows/ci.yml)) that verifies code health:
-- **Build Configurations**: Builds with GCC on Ubuntu, and MinGW-w64 GCC on Windows (Release and Debug targets).
-- **Static Analysis & Sanitizers**: Runs code quality audits (`cppcheck`) and validates memory safety via ASan/UBSan testing.
-- **Compiler Caching (`ccache`)**: Speeds up verification times by keeping a global `.ccache` cache on GitHub Actions. It bypasses recompilation of large dependencies like SDL2 and ImGui, reducing rebuild times on the cloud to under 5 seconds.
+The project includes an automated GitHub Actions pipeline (configured in [.github/workflows/ci.yml](.github/workflows/ci.yml)) that runs on every commit (`push`) and pull request (`pull_request`) to verify code health:
+- **C++ Compiler Warnings Check**: Builds the application targets with compiler warnings treated as errors (`-Werror`) for strict compliance.
+- **Native Linux Build & Test**: Compiles the codebase using GCC on an Ubuntu runner and executes the test suite.
+- **Sanitizers Verification**: Compiles and runs the native Linux test suite under AddressSanitizer (ASan) and UndefinedBehaviorSanitizer (UBSan) to detect memory management bugs and undefined behavior.
+- **Static Analysis**: Performs static analysis checks on all source and test C++ files using `cppcheck`.
+- **Windows Cross-Compilation**: Cross-compiles Windows executables on the Linux runner using the MinGW-w64 GCC cross-compiler (`x86_64-w64-mingw32-gcc`/`g++`).
+- **Compiler Caching (`ccache`)**: Speeds up verification times by caching compiled object units globally on GitHub Actions. It bypasses recompiling large upstream dependencies like SDL2 and Dear ImGui, cutting down build times significantly.

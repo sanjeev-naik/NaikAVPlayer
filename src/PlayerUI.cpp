@@ -496,6 +496,7 @@ void PlayerUI::drawWelcomeHUD(int windowWidth, int windowHeight) {
 }
 
 void PlayerUI::drawTitleBar(int windowWidth, int windowHeight) {
+  (void)windowHeight;
   // Slim header bar floating at the top of the viewport
   float barHeight = 45.0f;
   ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f));
@@ -765,6 +766,7 @@ void PlayerUI::drawControlsBar(int windowWidth, int windowHeight) {
 }
 
 void PlayerUI::drawDiagnosticsHUD(int windowWidth, int windowHeight) {
+  (void)windowHeight;
   if (!m_showDiagnostics)
     return;
 

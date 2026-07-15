@@ -219,6 +219,7 @@ inline int mock_avcodec_receive_frame(AVCodecContext* avctx, AVFrame* frame) {
 #define avcodec_receive_frame mock_avcodec_receive_frame
 
 inline int mock_av_hwframe_transfer_data(AVFrame* dst, const AVFrame* src, int flags) {
+    (void)flags;
     if (force_hw_transfer_fail) return -1;
     dst->width = src->width;
     dst->height = src->height;
@@ -1234,9 +1235,9 @@ int main(int argc, char* argv[]) {
     // 3. Cover TEST_VIDEO_PATH env variable parsing path inside real_main
     {
 #ifdef _WIN32
-        _putenv_s("TEST_VIDEO_PATH", "dummy_val");
+        _putenv_s("TEST_VIDEO_PATH", testFile.c_str());
 #else
-        setenv("TEST_VIDEO_PATH", "dummy_val", 1);
+        setenv("TEST_VIDEO_PATH", testFile.c_str(), 1);
 #endif
         char* argvEnv[] = { argv[0] };
         real_main(1, argvEnv);

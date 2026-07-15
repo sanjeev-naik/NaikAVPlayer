@@ -1,0 +1,120 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ "**" ]
+  pull_request:
+    branches: [ "**" ]
+
+jobs:
+  build-linux:
+    name: Linux Build & Test (GCC)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            ffmpeg \
+            libavcodec-dev \
+            libavformat-dev \
+            libavutil-dev \
+            libswscale-dev \
+            libswresample-dev \
+            libsdl2-dev \
+            libgtk-3-dev \
+            ccache \
+            cppcheck
+
+      - name: Setup Compiler Cache (ccache)
+        uses: chriskuehl/ccache-action@v1.2
+        with:
+          key: linux-gcc-ccache
+
+      - name: Configure CMake (Native Linux)
+        env:
+          CC: "ccache gcc"
+          CXX: "ccache g++"
+        run: |
+          cmake -B build-linux \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DTREAT_WARNINGS_AS_ERRORS=ON \
+            -DPLATFORM=LINUX
+
+      - name: Build (Native Linux)
+        run: |
+          cmake --build build-linux --config Release -j$(nproc)
+
+      - name: Run Tests (Native Linux)
+        run: |
+          cd build-linux
+          ctest --output-on-failure
+
+      - name: Run Static Analysis (cppcheck)
+        run: |
+          cppcheck --enable=warning,style,performance,portability \
+            --inline-suppr \
+            --std=c++17 \
+            --error-exitcode=1 \
+            src/ tests/
+
+      - name: Configure CMake with Sanitizers (ASan/UBSan)
+        env:
+          CC: "ccache gcc"
+          CXX: "ccache g++"
+        run: |
+          cmake -B build-sanitizers \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DENABLE_SANITIZERS=ON \
+            -DPLATFORM=LINUX
+
+      - name: Build with Sanitizers (ASan/UBSan)
+        run: |
+          cmake --build build-sanitizers --config Debug -j$(nproc)
+
+      - name: Run Tests with Sanitizers
+        run: |
+          cd build-sanitizers
+          ctest --output-on-failure
+
+  cross-compile-windows:
+    name: Windows Cross-Compilation (MinGW-w64 on Linux)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install Cross-Compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            ffmpeg \
+            mingw-w64 \
+            ccache
+
+      - name: Setup Compiler Cache (ccache)
+        uses: chriskuehl/ccache-action@v1.2
+        with:
+          key: windows-mingw-ccache
+
+      - name: Configure CMake (Cross-Compile for Windows)
+        env:
+          CC: "ccache x86_64-w64-mingw32-gcc"
+          CXX: "ccache x86_64-w64-mingw32-g++"
+        run: |
+          cmake -B build-windows \
+            -DPLATFORM=WINDOWS \
+            -DCMAKE_SYSTEM_NAME=Windows \
+            -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc \
+            -DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-g++ \
+            -DTREAT_WARNINGS_AS_ERRORS=ON \
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build (Cross-Compile for Windows)
+        run: |
+          cmake --build build-windows --config Release -j$(nproc)

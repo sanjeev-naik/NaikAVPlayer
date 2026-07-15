@@ -105,7 +105,7 @@ int main(int argc, char* argv[]) {
     playerUI.init();
 
     // Register native file dialog for all platforms (nativefiledialog-extended
-    // handles Windows/Linux/macOS natively)
+    // handles Windows/Linux natively)
     playerUI.setFileDialogCallback([]() {
         return openNativeFileDialog();
     });
