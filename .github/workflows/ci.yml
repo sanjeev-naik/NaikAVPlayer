@@ -31,7 +31,7 @@ jobs:
             cppcheck
 
       - name: Setup Compiler Cache (ccache)
-        uses: chriskuehl/ccache-action@v1.2
+        uses: hendrikmuhs/ccache-action@v1
         with:
           key: linux-gcc-ccache
 
@@ -98,7 +98,7 @@ jobs:
             ccache
 
       - name: Setup Compiler Cache (ccache)
-        uses: chriskuehl/ccache-action@v1.2
+        uses: hendrikmuhs/ccache-action@v1
         with:
           key: windows-mingw-ccache
 
