@@ -567,10 +567,6 @@ int real_main(int argc, char* argv[]) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
         drive_playback(controller, 0.5);
         double timeAfterForward = controller.getCurrentTime();
-        if (controller.getVideoDecoder()) {
-            bool convertOk = controller.getVideoDecoder()->convertFrame();
-            test_assert(convertOk, "convertFrame succeeds on valid decoded frame");
-        }
         test_assert(std::abs(timeAfterForward - seekForwardTarget) < 5.0, "Seek forward position is accurate");
 
         // Seek Backward

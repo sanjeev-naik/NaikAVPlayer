@@ -99,6 +99,7 @@ FetchContent_Declare(
     SDL2
     GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
     GIT_TAG release-2.30.3
+    GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(SDL2)
 
@@ -110,6 +111,7 @@ FetchContent_Declare(
     imgui
     GIT_REPOSITORY https://github.com/ocornut/imgui.git
     GIT_TAG v1.90.4
+    GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(imgui)
 
@@ -140,6 +142,7 @@ FetchContent_Declare(
     nativefiledialog-extended
     GIT_REPOSITORY https://github.com/btzy/nativefiledialog-extended.git
     GIT_TAG        v1.2.1
+    GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(nativefiledialog-extended)
 
