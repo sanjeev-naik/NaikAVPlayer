@@ -77,6 +77,8 @@ jobs:
           cmake --build build-sanitizers --config Debug -j$(nproc)
 
       - name: Run Tests with Sanitizers
+        env:
+          LSAN_OPTIONS: suppressions=${{ github.workspace }}/tests/lsan.supp
         run: |
           cd build-sanitizers
           ctest --output-on-failure
