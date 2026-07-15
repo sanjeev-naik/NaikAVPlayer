@@ -79,6 +79,7 @@ jobs:
       - name: Run Tests with Sanitizers
         env:
           ASAN_OPTIONS: detect_leaks=1
+          LSAN_OPTIONS: suppressions=${{ github.workspace }}/tests/lsan.supp
         run: |
           cd build-sanitizers
           ctest --output-on-failure
