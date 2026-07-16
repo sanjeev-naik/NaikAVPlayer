@@ -1,0 +1,4 @@
+# LeakSanitizer suppressions for external libraries
+# Suppress all leaks originating from the SDL2 library (including TLS error buffers and driver structures)
+leak:SDL_
+leak:libSDL2
