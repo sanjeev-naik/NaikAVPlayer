@@ -7,7 +7,8 @@
 #include <cstdlib>
 
 #define SDL_MAIN_HANDLED
-#include <SDL2/SDL.h>
+#include <SDL3/SDL.h>
+#include <SDL3/SDL_main.h>
 
 extern "C" {
 #include <libavutil/version.h>
@@ -173,31 +174,25 @@ inline int mock_avcodec_parameters_to_context(AVCodecContext* codec, const AVCod
 
 
 
-inline SDL_AudioDeviceID mock_SDL_OpenAudioDevice(const char* device, int iscapture, const SDL_AudioSpec* desired, SDL_AudioSpec* obtained, int allowed_changes) {
-    if (force_sdl_audio_fail) return 0;
+inline SDL_AudioStream* mock_SDL_OpenAudioDeviceStream(SDL_AudioDeviceID devid, const SDL_AudioSpec* spec, SDL_AudioStreamCallback callback, void* userdata) {
+    if (force_sdl_audio_fail) return nullptr;
 #if defined(__linux__)
     // On Linux CI/headless environments, avoid initializing real ALSA audio subsystem to prevent system driver leaks
-    (void)device;
-    (void)iscapture;
-    (void)allowed_changes;
-    if (obtained && desired) {
-        *obtained = *desired;
-    }
-    return 9999;
+    (void)devid;
+    (void)callback;
+    (void)userdata;
+    return SDL_CreateAudioStream(spec, spec);
 #else
-    SDL_AudioDeviceID dev = SDL_OpenAudioDevice(device, iscapture, desired, obtained, allowed_changes);
-    if (dev == 0) {
-        // Fallback for CI/limited environments (e.g., Linux dummy audio driver which only allows 1 active device at a time)
-        std::cout << "[Test Mock] SDL_OpenAudioDevice failed: " << SDL_GetError() << ". Falling back to virtual device ID 9999." << std::endl;
-        if (obtained && desired) {
-            *obtained = *desired;
-        }
-        return 9999;
+    SDL_AudioStream* stream = SDL_OpenAudioDeviceStream(devid, spec, callback, userdata);
+    if (!stream) {
+        // Fallback for CI/limited environments
+        std::cout << "[Test Mock] SDL_OpenAudioDeviceStream failed: " << SDL_GetError() << ". Falling back to virtual stream." << std::endl;
+        return SDL_CreateAudioStream(spec, spec);
     }
-    return dev;
+    return stream;
 #endif
 }
-#define SDL_OpenAudioDevice mock_SDL_OpenAudioDevice
+#define SDL_OpenAudioDeviceStream mock_SDL_OpenAudioDeviceStream
 
 inline void mock_avcodec_free_context(AVCodecContext** pavctx) {
     if (pavctx && *pavctx && global_saved_codec && global_fake_codec_ptr) {
@@ -251,8 +246,8 @@ inline int mock_av_read_frame(AVFormatContext* s, AVPacket* pkt) {
 }
 #define av_read_frame mock_av_read_frame
 
-inline int mock_SDL_Init(Uint32 flags) {
-    if (force_sdl_init_fail) return -1;
+inline bool mock_SDL_Init(SDL_InitFlags flags) {
+    if (force_sdl_init_fail) return false;
     return SDL_Init(flags);
 }
 #define SDL_Init mock_SDL_Init
@@ -302,9 +297,9 @@ void drive_playback(PlayerController& controller, double seconds) {
 int real_main(int argc, char* argv[]) {
     std::cout << "Starting NaikAVPlayer 100% coverage integration tests..." << std::endl;
 
-    // Initialize SDL Audio & Timer
+    // Initialize SDL Audio
     SDL_SetMainReady();
-    if (SDL_Init(SDL_INIT_AUDIO | SDL_INIT_TIMER) < 0) {
+    if (!SDL_Init(SDL_INIT_AUDIO)) {
         std::cerr << "Failed to initialize SDL: " << SDL_GetError() << std::endl;
         return 1;
     }

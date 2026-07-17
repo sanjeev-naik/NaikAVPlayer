@@ -1,8 +1,9 @@
 #define SDL_MAIN_HANDLED
-#include <SDL2/SDL.h>
+#include <SDL3/SDL.h>
+#include <SDL3/SDL_main.h>
 #include <imgui.h>
-#include <imgui_impl_sdl2.h>
-#include <imgui_impl_sdlrenderer2.h>
+#include <imgui_impl_sdl3.h>
+#include <imgui_impl_sdlrenderer3.h>
 #include <iostream>
 #include <string>
 #include "PlayerController.hpp"
@@ -29,29 +30,24 @@ int main(int argc, char* argv[]) {
     // Initialize Native File Dialog Extended (RAII)
     NFD::Guard nfdGuard;
 
-    // Initialize SDL2 (Video, Audio, Timer, and Event subsystems)
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_TIMER | SDL_INIT_EVENTS) < 0) {
-        std::cerr << "Error: Could not initialize SDL2: " << SDL_GetError() << std::endl;
+    // Initialize SDL3 (Video and Audio subsystems)
+    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO)) {
+        std::cerr << "Error: Could not initialize SDL3: " << SDL_GetError() << std::endl;
         return -1;
     }
-
-    // Set texture filtering to linear for high-quality scaling
-    SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "linear");
 
     // Create the application window
     int winWidth = 960;
     int winHeight = 540;
     SDL_Window* window = SDL_CreateWindow(
         "NaikAVPlayer",
-        SDL_WINDOWPOS_CENTERED,
-        SDL_WINDOWPOS_CENTERED,
         winWidth,
         winHeight,
-        SDL_WINDOW_RESIZABLE | SDL_WINDOW_SHOWN | SDL_WINDOW_ALLOW_HIGHDPI
+        SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY
     );
 
     if (!window) {
-        std::cerr << "Error: Could not create SDL2 Window: " << SDL_GetError() << std::endl;
+        std::cerr << "Error: Could not create SDL3 Window: " << SDL_GetError() << std::endl;
         SDL_Quit();
         return -1;
     }
@@ -72,22 +68,19 @@ int main(int argc, char* argv[]) {
     }
     if (iconSurface) {
         SDL_SetWindowIcon(window, iconSurface);
-        SDL_FreeSurface(iconSurface);
+        SDL_DestroySurface(iconSurface);
     }
 
-    // Create hardware-accelerated renderer with VSync enabled
-    SDL_Renderer* renderer = SDL_CreateRenderer(
-        window, 
-        -1, 
-        SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC
-    );
+    // Create hardware-accelerated renderer
+    SDL_Renderer* renderer = SDL_CreateRenderer(window, nullptr);
 
     if (!renderer) {
-        std::cerr << "Error: Could not create SDL2 Renderer: " << SDL_GetError() << std::endl;
+        std::cerr << "Error: Could not create SDL3 Renderer: " << SDL_GetError() << std::endl;
         SDL_DestroyWindow(window);
         SDL_Quit();
         return -1;
     }
+    SDL_SetRenderVSync(renderer, 1); // Enable VSync
 
     // Setup Dear ImGui context
     IMGUI_CHECKVERSION();
@@ -95,9 +88,9 @@ int main(int argc, char* argv[]) {
     ImGuiIO& io = ImGui::GetIO(); (void)io;
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard; // Enable keyboard navigation
 
-    // Bind ImGui to SDL2 and SDL_Renderer
-    ImGui_ImplSDL2_InitForSDLRenderer(window, renderer);
-    ImGui_ImplSDLRenderer2_Init(renderer);
+    // Bind ImGui to SDL3 and SDL_Renderer
+    ImGui_ImplSDL3_InitForSDLRenderer(window, renderer);
+    ImGui_ImplSDLRenderer3_Init(renderer);
 
     // Initialize player modules
     PlayerController controller;
@@ -111,7 +104,7 @@ int main(int argc, char* argv[]) {
     });
 
     // Enable drag and drop events
-    SDL_EventState(SDL_DROPFILE, SDL_ENABLE);
+    SDL_SetEventEnabled(SDL_EVENT_DROP_FILE, true);
 
     // If a file was passed as a command-line argument, load it immediately
     if (argc > 1) {
@@ -125,7 +118,7 @@ int main(int argc, char* argv[]) {
     SDL_Texture* videoTexture = nullptr;
     int texWidth = 0;
     int texHeight = 0;
-    Uint32 texFormat = SDL_PIXELFORMAT_UNKNOWN;
+    SDL_PixelFormat texFormat = SDL_PIXELFORMAT_UNKNOWN;
     DecodedFrame currentFrame;
 
     bool quit = false;
@@ -148,38 +141,37 @@ int main(int argc, char* argv[]) {
 
         // 1. Process Windows Events & Input Routing
         while (SDL_PollEvent(&event)) {
-            ImGui_ImplSDL2_ProcessEvent(&event);
+            ImGui_ImplSDL3_ProcessEvent(&event);
 
             // Notify UI of mouse or keyboard events to prevent auto-hiding
-            if (event.type == SDL_MOUSEMOTION || event.type == SDL_MOUSEBUTTONDOWN || event.type == SDL_KEYDOWN) {
+            if (event.type == SDL_EVENT_MOUSE_MOTION || event.type == SDL_EVENT_MOUSE_BUTTON_DOWN || event.type == SDL_EVENT_KEY_DOWN) {
                 playerUI.notifyMouseActivity(currentSecs);
             }
 
-            if (event.type == SDL_QUIT) {
+            if (event.type == SDL_EVENT_QUIT) {
                 quit = true;
             } 
-            else if (event.type == SDL_WINDOWEVENT) {
-                if (event.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
-                    winWidth = event.window.data1;
-                    winHeight = event.window.data2;
-                } else if (event.window.event == SDL_WINDOWEVENT_MINIMIZED) {
-                    windowMinimized = true;
-                } else if (event.window.event == SDL_WINDOWEVENT_RESTORED) {
-                    windowMinimized = false;
-                }
+            else if (event.type == SDL_EVENT_WINDOW_RESIZED) {
+                winWidth = event.window.data1;
+                winHeight = event.window.data2;
             }
-            else if (event.type == SDL_DROPFILE) {
+            else if (event.type == SDL_EVENT_WINDOW_MINIMIZED) {
+                windowMinimized = true;
+            }
+            else if (event.type == SDL_EVENT_WINDOW_RESTORED) {
+                windowMinimized = false;
+            }
+            else if (event.type == SDL_EVENT_DROP_FILE) {
                 // Drag & Drop media file loading
-                char* droppedFilepath = event.drop.file;
+                const char* droppedFilepath = event.drop.data;
                 std::cout << "Dropped file detected: " << droppedFilepath << std::endl;
                 if (controller.openFile(droppedFilepath)) {
                     controller.play();
                 }
-                SDL_free(droppedFilepath); // Free drop filepath memory
             } 
-            else if (event.type == SDL_KEYDOWN && !io.WantCaptureKeyboard) {
+            else if (event.type == SDL_EVENT_KEY_DOWN && !io.WantCaptureKeyboard) {
                 // Process keyboard hotkeys
-                switch (event.key.keysym.sym) {
+                switch (event.key.key) {
                     case SDLK_SPACE:
                         if (controller.getState() == PlayerState::PLAYING) {
                             controller.pause();
@@ -198,7 +190,7 @@ int main(int argc, char* argv[]) {
                     case SDLK_ESCAPE:
                         quit = true;
                         break;
-                    case SDLK_l:
+                    case SDLK_L:
                         controller.setLoopEnabled(!controller.isLoopEnabled());
                         break;
                     default:
@@ -262,7 +254,7 @@ int main(int argc, char* argv[]) {
             }
 
             if (currentFrame.frame && currentFrame.frame->data[0]) {
-                Uint32 targetFormat = SDL_PIXELFORMAT_IYUV;
+                SDL_PixelFormat targetFormat = SDL_PIXELFORMAT_IYUV;
                 if (currentFrame.frame->format == AV_PIX_FMT_NV12) {
                     targetFormat = SDL_PIXELFORMAT_NV12;
                 } else if (currentFrame.frame->format == AV_PIX_FMT_NV21) {
@@ -284,6 +276,9 @@ int main(int argc, char* argv[]) {
                         texWidth,
                         texHeight
                     );
+                    if (videoTexture) {
+                        SDL_SetTextureScaleMode(videoTexture, SDL_SCALEMODE_LINEAR);
+                    }
                 }
 
                 if (shouldUpdateTexture) {
@@ -327,35 +322,35 @@ int main(int argc, char* argv[]) {
 
         // A. Draw Centered Letterboxed Video Frame
         if (videoTexture) {
-            SDL_Rect dstRect;
+            SDL_FRect dstRect;
             float windowAspect = static_cast<float>(winWidth) / winHeight;
             float videoAspect = static_cast<float>(texWidth) / texHeight;
 
             if (windowAspect > videoAspect) {
                 // Window is wider than video -> pillarbox (draw side bars)
-                dstRect.h = winHeight;
-                dstRect.w = static_cast<int>(winHeight * videoAspect);
-                dstRect.x = (winWidth - dstRect.w) / 2;
-                dstRect.y = 0;
+                dstRect.h = static_cast<float>(winHeight);
+                dstRect.w = winHeight * videoAspect;
+                dstRect.x = static_cast<float>(winWidth - dstRect.w) / 2.0f;
+                dstRect.y = 0.0f;
             } else {
                 // Window is taller than video -> letterbox (draw top/bottom bars)
-                dstRect.w = winWidth;
-                dstRect.h = static_cast<int>(winWidth / videoAspect);
-                dstRect.x = 0;
-                dstRect.y = (winHeight - dstRect.h) / 2;
+                dstRect.w = static_cast<float>(winWidth);
+                dstRect.h = winWidth / videoAspect;
+                dstRect.x = 0.0f;
+                dstRect.y = static_cast<float>(winHeight - dstRect.h) / 2.0f;
             }
-            SDL_RenderCopy(renderer, videoTexture, nullptr, &dstRect);
+            SDL_RenderTexture(renderer, videoTexture, nullptr, &dstRect);
         }
 
         // B. Render Dear ImGui UI Overlay
-        ImGui_ImplSDLRenderer2_NewFrame();
-        ImGui_ImplSDL2_NewFrame();
+        ImGui_ImplSDLRenderer3_NewFrame();
+        ImGui_ImplSDL3_NewFrame();
         ImGui::NewFrame();
 
         playerUI.draw(winWidth, winHeight, currentSecs);
 
         ImGui::Render();
-        ImGui_ImplSDLRenderer2_RenderDrawData(ImGui::GetDrawData());
+        ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(), renderer);
 
         // Display frame. Skipped while minimized: Windows throttles/blocks
         // vsync Present() on an occluded swapchain, and letting that block
@@ -379,8 +374,8 @@ int main(int argc, char* argv[]) {
     }
     controller.stop();
 
-    ImGui_ImplSDLRenderer2_Shutdown();
-    ImGui_ImplSDL2_Shutdown();
+    ImGui_ImplSDLRenderer3_Shutdown();
+    ImGui_ImplSDL3_Shutdown();
     ImGui::DestroyContext();
 
     SDL_DestroyRenderer(renderer);
