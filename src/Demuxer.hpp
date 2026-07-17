@@ -22,11 +22,8 @@ private:
     std::string m_filename;
     AVFormatContext* m_formatCtx;
     
-    // Atomic because tests/tests.cpp's white-box seeking-branch coverage
-    // mutates these directly from the main thread while threadLoop() is
-    // still running on m_thread and reading them on every packet.
-    std::atomic<int> m_videoStreamIdx;
-    std::atomic<int> m_audioStreamIdx;
+    int m_videoStreamIdx;
+    int m_audioStreamIdx;
     
     AVCodecParameters* m_videoCodecParams;
     AVCodecParameters* m_audioCodecParams;
@@ -75,8 +72,8 @@ public:
     void setCatchup(SeekCatchupMode mode, double targetSeconds);
 
     // Getters
-    int getVideoStreamIndex() const { return m_videoStreamIdx.load(); }
-    int getAudioStreamIndex() const { return m_audioStreamIdx.load(); }
+    int getVideoStreamIndex() const { return m_videoStreamIdx; }
+    int getAudioStreamIndex() const { return m_audioStreamIdx; }
     AVCodecParameters* getVideoCodecParams() const { return m_videoCodecParams; }
     AVCodecParameters* getAudioCodecParams() const { return m_audioCodecParams; }
     AVRational getVideoTimeBase() const { return m_videoTimeBase; }
