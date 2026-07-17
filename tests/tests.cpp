@@ -6,6 +6,7 @@
 #include <vector>
 #include <cstdlib>
 #include <atomic>
+#include <mutex>
 
 #define SDL_MAIN_HANDLED
 #include <SDL3/SDL.h>
@@ -53,6 +54,7 @@ static std::atomic<bool> force_hw_transfer_fail{false};
 static std::atomic<bool> force_receive_eagain{false};
 static std::atomic<bool> mock_send_packet_success{false};
 static std::atomic<bool> mock_hw_transfer_nv12{false};
+static std::mutex mock_read_frame_mutex;
 static std::function<void()> on_mock_read_frame = nullptr;
 struct AVCodec;
 static const struct AVCodec* global_saved_codec = nullptr;
@@ -240,8 +242,14 @@ inline int mock_av_hwframe_transfer_data(AVFrame* dst, const AVFrame* src, int f
 inline int mock_av_read_frame(AVFormatContext* s, AVPacket* pkt) {
     if (force_read_eof) return AVERROR_EOF;
     if (force_read_error) return -5;
-    if (on_mock_read_frame) {
-        on_mock_read_frame();
+    
+    std::function<void()> callback = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(mock_read_frame_mutex);
+        callback = on_mock_read_frame;
+    }
+    if (callback) {
+        callback();
     }
     return av_read_frame(s, pkt);
 }
@@ -1315,14 +1323,20 @@ int main(int argc, char* argv[]) {
             PlayerController controller;
             if (controller.openFile(testFile)) {
                 Demuxer* demuxer = controller.m_demuxer.get();
-                on_mock_read_frame = [demuxer]() {
-                    demuxer->m_seekRequested.store(true);
-                };
+                {
+                    std::lock_guard<std::mutex> lock(mock_read_frame_mutex);
+                    on_mock_read_frame = [demuxer]() {
+                        demuxer->m_seekRequested.store(true);
+                    };
+                }
                 
                 controller.play();
                 std::this_thread::sleep_for(std::chrono::milliseconds(20));
                 
-                on_mock_read_frame = nullptr;
+                {
+                    std::lock_guard<std::mutex> lock(mock_read_frame_mutex);
+                    on_mock_read_frame = nullptr;
+                }
             }
         }
 
