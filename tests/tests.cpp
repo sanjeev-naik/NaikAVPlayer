@@ -771,6 +771,8 @@ int real_main(int argc, char* argv[]) {
             controller.m_demuxer->m_audioStreamIdx = (controller.m_demuxer->m_formatCtx->nb_streams > 1) ? 1 : 0;
             controller.m_demuxer->m_audioTimeBase = {1, 44100};
             controller.m_demuxer->seek(10.0);
+            controller.m_videoQueue.clear([](AVPacket*& pkt) { av_packet_free(&pkt); });
+            controller.m_audioQueue.clear([](AVPacket*& pkt) { av_packet_free(&pkt); });
             while (controller.m_demuxer->m_seekRequested.load()) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
             }
@@ -782,6 +784,8 @@ int real_main(int argc, char* argv[]) {
             controller.m_demuxer->m_videoStreamIdx = -1;
             controller.m_demuxer->m_audioStreamIdx = -1;
             controller.m_demuxer->seek(10.0);
+            controller.m_videoQueue.clear([](AVPacket*& pkt) { av_packet_free(&pkt); });
+            controller.m_audioQueue.clear([](AVPacket*& pkt) { av_packet_free(&pkt); });
             while (controller.m_demuxer->m_seekRequested.load()) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
             }
@@ -799,6 +803,8 @@ int real_main(int argc, char* argv[]) {
             controller.m_demuxer->m_audioStreamIdx = savedAudioIdx;
             controller.m_demuxer->m_eof = false;
             controller.m_demuxer->seek(0.0);
+            controller.m_videoQueue.clear([](AVPacket*& pkt) { av_packet_free(&pkt); });
+            controller.m_audioQueue.clear([](AVPacket*& pkt) { av_packet_free(&pkt); });
             while (controller.m_demuxer->m_seekRequested.load()) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
             }
