@@ -138,10 +138,13 @@ bool VideoDecoder::init() {
       return false;
     }
 
-    // Set threads count and timebase for decoding acceleration
-    codecCtx->thread_count =
-        0; // FFmpeg decides automatically based on core count
-    codecCtx->thread_type = FF_THREAD_FRAME;
+    // Single-threaded, same as the hardware paths above: FF_THREAD_FRAME
+    // spawns FFmpeg's own internal worker thread, whose buffer-pool
+    // bookkeeping inside libavcodec/libavutil races under ThreadSanitizer
+    // (see fallbackToSoftware() below for the observed report). Keep
+    // software decode single-threaded for a stable, race-free context.
+    codecCtx->thread_count = 1;
+    codecCtx->thread_type = 0;
     codecCtx->pkt_timebase = m_timeBase;
 
     if (avcodec_open2(codecCtx, codec, nullptr) < 0) {
@@ -617,8 +620,15 @@ bool VideoDecoder::fallbackToSoftware() {
     return false;
   }
 
-  softwareCtx->thread_count = 0;
-  softwareCtx->thread_type = FF_THREAD_FRAME;
+  // Single-threaded like reopenHardwareDecoder() above: FFmpeg's internal
+  // frame-threading (FF_THREAD_FRAME) spawns its own worker thread inside
+  // libavcodec/libavutil whose internal buffer-pool bookkeeping races under
+  // ThreadSanitizer. This is FFmpeg's own threading, not ours, and this
+  // fallback path already only runs after hardware decoding has failed, so
+  // trading a little decode throughput for a stable, race-free codec
+  // context is the right call here.
+  softwareCtx->thread_count = 1;
+  softwareCtx->thread_type = 0;
   softwareCtx->pkt_timebase = m_timeBase;
 
   if (avcodec_open2(softwareCtx, softwareCodec, nullptr) < 0) {

@@ -321,7 +321,13 @@ add_executable(NaikAVPlayer_tests
 
 option(ENABLE_COVERAGE "Enable code coverage instrumentation" ON)
 
-if(ENABLE_COVERAGE)
+# GCC's gcov (--coverage) counters are incremented non-atomically, so any
+# instrumented function reached concurrently from multiple threads (e.g.
+# std::atomic<bool>::load, used by VideoDecoder::isSeeking()/Demuxer's
+# worker thread) trips ThreadSanitizer on the counter itself rather than on
+# real application state. Coverage and TSan are therefore mutually
+# exclusive here, same as ENABLE_SANITIZERS/ENABLE_TSAN above.
+if(ENABLE_COVERAGE AND NOT ENABLE_TSAN)
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         # Enable GCC/Clang code coverage flags for tests
         target_compile_options(NaikAVPlayer_tests PRIVATE --coverage -O0 -g)
@@ -475,7 +481,11 @@ endforeach()
 endif()
 
 # Enable CTest and register test suite
-enable_testing()
+# include(CTest) (rather than a bare enable_testing()) generates
+# DartConfiguration.tcl in the build directory, which `ctest -T Test`
+# (used in CI) requires; without it ctest logs "Cannot find file:
+# .../DartConfiguration.tcl" before falling back to defaults.
+include(CTest)
 
 set(TEST_VIDEO_PATH "${CMAKE_SOURCE_DIR}/assets/hd_test_video_with_audio.mp4")
 
