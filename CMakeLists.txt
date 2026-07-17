@@ -51,6 +51,11 @@ endif()
 # -------------------------------------------------------------
 option(TREAT_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ON)
 option(ENABLE_SANITIZERS "Enable Address and Undefined Behavior Sanitizers" OFF)
+option(ENABLE_TSAN "Enable ThreadSanitizer" OFF)
+
+if(ENABLE_SANITIZERS AND ENABLE_TSAN)
+    message(FATAL_ERROR "Address/Undefined Sanitizers and ThreadSanitizer are mutually exclusive. Please enable only one.")
+endif()
 
 set(PROJECT_WARNING_FLAGS "")
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
@@ -64,6 +69,13 @@ if(ENABLE_SANITIZERS)
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer)
         add_link_options(-fsanitize=address,undefined)
+    endif()
+endif()
+
+if(ENABLE_TSAN)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        add_compile_options(-fsanitize=thread -fno-omit-frame-pointer)
+        add_link_options(-fsanitize=thread)
     endif()
 endif()
 

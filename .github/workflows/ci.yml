@@ -84,6 +84,27 @@ jobs:
           cd build-sanitizers
           ctest --output-on-failure
 
+      - name: Configure CMake with ThreadSanitizer (TSan)
+        env:
+          CC: "ccache gcc"
+          CXX: "ccache g++"
+        run: |
+          cmake -B build-tsan \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DENABLE_TSAN=ON \
+            -DPLATFORM=LINUX
+
+      - name: Build with ThreadSanitizer (TSan)
+        run: |
+          cmake --build build-tsan --config Debug -j$(nproc)
+
+      - name: Run Tests with ThreadSanitizer (TSan)
+        env:
+          TSAN_OPTIONS: "halt_on_error=1 history_size=7"
+        run: |
+          cd build-tsan
+          ctest --output-on-failure
+
   cross-compile-windows:
     name: Windows Cross-Compilation (MinGW-w64 on Linux)
     runs-on: ubuntu-latest

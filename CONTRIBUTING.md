@@ -161,17 +161,18 @@ NaikAVPlayer is a high-performance C++ application. The following rules keep the
 We maintain a strict quality target of **100% code coverage** on all core playback, demuxing, and decoding files.
 
 ### Running Tests Locally
-1. Configure the build with testing enabled:
+1. Configure the build with Address/Undefined sanitizers enabled:
    ```bash
    mkdir build && cd build
    cmake -DENABLE_COVERAGE=ON -DENABLE_SANITIZERS=ON ..
-   ```
-2. Build the project targets:
-   ```bash
    cmake --build .
+   ctest --output-on-failure
    ```
-3. Run the test suite:
+2. Or configure the build with ThreadSanitizer enabled to detect data races (note: TSan and ASan are mutually exclusive):
    ```bash
+   mkdir build-tsan && cd build-tsan
+   cmake -DENABLE_COVERAGE=ON -DENABLE_TSAN=ON ..
+   cmake --build .
    ctest --output-on-failure
    ```
    *Note: CMake automatically generates a dummy test video if `assets/hd_test_video_with_audio.mp4` is missing.*
@@ -179,9 +180,10 @@ We maintain a strict quality target of **100% code coverage** on all core playba
 ### Code Coverage
 - If you add files or logic in `AudioDecoder.cpp`, `VideoDecoder.cpp`, `Demuxer.cpp`, `PlayerController.cpp`, or `ThreadSafeQueue.hpp`, you **must** write corresponding tests in `tests/tests.cpp` to maintain coverage.
 
-### Memory Leak Verification
-- Keep the Address/Undefined Behavior Sanitizers active during development.
+### Memory & Thread Safety Verification
+- Keep the Address/Undefined Behavior Sanitizers active during development to ensure zero memory leaks.
 - If a known external dependency has a leak, add it to `tests/lsan.supp` with comments instead of bypassing testing.
+- Utilize ThreadSanitizer (`ENABLE_TSAN=ON`) regularly when working on multi-threaded code changes to catch potential data races and deadlocks.
 
 ---
 

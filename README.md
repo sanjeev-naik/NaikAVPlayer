@@ -4,7 +4,7 @@ A native, multi-threaded C++ media engine and video player built for extreme per
 
 ![NaikAVPlayer Screenshot](assets/screenshot.png)
 
-Built on top of barebones **FFmpeg**, **SDL2**, and **Dear ImGui**, **NaikAVPlayer** implements container parsing, frame rescaling, and sub-frame clock synchronization directly on raw texture planes with no external wrapper overhead.
+Built on top of barebones **FFmpeg**, **SDL3**, and **Dear ImGui**, **NaikAVPlayer** implements container parsing, frame rescaling, and sub-frame clock synchronization directly on raw texture planes with no external wrapper overhead.
 
 ---
 
@@ -58,7 +58,7 @@ NaikAVPlayer follows the classic multi-threaded media player design: a demuxer t
 - The bounded queues use two condition variables (`m_cond_push`/`m_cond_pop`) so a full queue naturally stalls the producer (applying backpressure) without CPU spinning, and `abort()` cleanly wakes every blocked thread for shutdown.
 
 #### GPU-Mapped Planar YUV Uploads
-Instead of performing costly YUV-to-RGB color space conversions on the CPU, the video decoder pipeline extracts raw YUV 4:2:0 planar frame data directly. The main thread maps this data onto a hardware-accelerated SDL2 streaming texture (`SDL_PIXELFORMAT_IYUV`) using `SDL_UpdateYUVTexture`. This uploads the raw plane segments directly to GPU-mapped texture memory, allowing the graphics hardware to handle color space conversion and scaling efficiently.
+Instead of performing costly YUV-to-RGB color space conversions on the CPU, the video decoder pipeline extracts raw YUV 4:2:0 planar frame data directly. The main thread maps this data onto a hardware-accelerated SDL3 streaming texture (`SDL_PIXELFORMAT_IYUV`) using `SDL_UpdateYUVTexture`. This uploads the raw plane segments directly to GPU-mapped texture memory, allowing the graphics hardware to handle color space conversion and scaling efficiently.
 
 #### Dynamic Hardware Decoder Fallback
 To achieve optimal playback performance without sacrificing robustness, the video decoder pipeline employs a dynamic hardware-to-software fallback. At initialization, it queries and tries to open native hardware decoders (such as `h264_d3d11va`, `h264_dxva2`, `h264_qsv`, or `h264_cuvid` on Windows; `h264_vaapi`, `h264_v4l2m2m` on Linux). If a hardware decoder fails during initialization or encounters a fatal decoding or surface mapping error at runtime (e.g. running on driverless or virtualized headless environments), the decoder intercepts the failure, releases the hardware context, configures the software `h264` decoder, and resubmits the video packet. This guarantees a seamless transition with zero playback disruption or application crashes.
@@ -116,7 +116,7 @@ The player playback engine is governed by a strict state machine to synchronize 
 
 - **C++17** (compiled with GCC/MinGW)
 - **FFmpeg 8.x (avcodec, avformat, avutil, swscale, swresample)** (automatically downloaded LGPL-shared binaries)
-- **SDL2** (automatically fetched and dynamically compiled)
+- **SDL3** (automatically fetched and dynamically compiled)
 - **Dear ImGui** (automatically fetched and statically compiled)
 - **nativefiledialog-extended (NFD)** (fetched and compiled dynamically for cross-platform native file dialogs — zlib license)
 - **Noto Sans Font** (bundled open-source SIL OFL 1.1 font files)
@@ -140,10 +140,17 @@ Thanks to its barebones FFmpeg demuxer and decoder integration, **NaikAVPlayer**
 
 The project is natively cross-platform and compiles under **Windows** (via MinGW-w64 GCC) and **Linux** (via GCC).
 
-The build system supports a custom `PLATFORM` configuration variable:
-- **`AUTO`** (default): Automatically detects the host operating system.
-- **`WINDOWS`**: Explicitly configures the project to build for Windows (links Win32 subsystems, fetches and copies FFmpeg DLLs).
-- **`LINUX`**: Explicitly configures the project to build for Linux (links `pthread` and `dl`).
+The build system supports the following CMake configuration options:
+
+#### Platform Configuration
+- **`-DPLATFORM=AUTO`** (default): Automatically detects the host operating system.
+- **`-DPLATFORM=WINDOWS`**: Explicitly configures the project to build for Windows (links Win32 subsystems, fetches and copies FFmpeg DLLs).
+- **`-DPLATFORM=LINUX`**: Explicitly configures the project to build for Linux (links `pthread` and `dl`).
+
+#### Quality & Diagnostics Configuration
+- **`-DENABLE_SANITIZERS=ON`** / **`OFF`** (default): Enables AddressSanitizer (ASan) and UndefinedBehaviorSanitizer (UBSan) to monitor memory safety and undefined behavior.
+- **`-DENABLE_TSAN=ON`** / **`OFF`** (default): Enables ThreadSanitizer (TSan) to capture data races and thread synchronization issues. *(Note: Must be run with ASan/UBSan disabled, as they are mutually exclusive)*.
+- **`-DTREAT_WARNINGS_AS_ERRORS=ON`** (default) / **`OFF`**: Configures compilers to treat warnings as build-blocking errors.
 
 ### Prerequisites
 
@@ -156,7 +163,7 @@ The project features a **fully automated setup** for Windows: CMake will automat
 Install the development libraries via your package manager (e.g. `apt` on Ubuntu):
 ```bash
 sudo apt-get update
-sudo apt-get install -y libsdl2-dev libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libswresample-dev
+sudo apt-get install -y libsdl3-dev libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libswresample-dev
 ```
 
 For the native file dialog to compile and work, ensure the GTK3 development library is installed:
@@ -210,7 +217,7 @@ Build the primary player binary and the test suite:
 ```bash
 cmake --build build
 ```
-*Note: On Windows, a post-build recipe automatically copies the required FFmpeg shared DLLs, the SDL2 DLL, and the bundled assets directory directly into the compilation target folder so you can run the binaries immediately.*
+*Note: On Windows, a post-build recipe automatically copies the required FFmpeg shared DLLs, the SDL3 DLL, and the bundled assets directory directly into the compilation target folder so you can run the binaries immediately.*
 
 ---
 
@@ -301,14 +308,10 @@ ctest --test-dir build --output-on-failure
 ```
 
 #### 2. Running with Address and Undefined Behavior Sanitizers (ASan/UBSan)
-To catch memory leaks, out-of-bounds access, and undefined behavior, build with sanitizers enabled:
+To catch memory leaks, out-of-bounds access, and undefined behavior, build with Address/Undefined sanitizers enabled:
 ```bash
-# Configure with Sanitizers
-cmake -B build \
-  -DCMAKE_BUILD_TYPE=Debug \
-  -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
-  -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
-  -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+# Configure with ASan/UBSan
+cmake -B build -DCMAKE_BUILD_TYPE=Debug -DENABLE_SANITIZERS=ON
 
 # Build
 cmake --build build
@@ -317,7 +320,20 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-#### 3. Native Direct Execution
+#### 3. Running with ThreadSanitizer (TSan)
+To catch concurrency-related bugs, data races, and deadlocks in multi-threaded code, build with ThreadSanitizer (TSan) enabled (note: ASan/UBSan and TSan are mutually exclusive):
+```bash
+# Configure with ThreadSanitizer
+cmake -B build -DCMAKE_BUILD_TYPE=Debug -DENABLE_TSAN=ON
+
+# Build
+cmake --build build
+
+# Run tests with TSan instrumentation
+ctest --test-dir build --output-on-failure
+```
+
+#### 4. Native Direct Execution
 Alternatively, run the compiled test executable directly using the automatically generated test video:
 ```powershell
 # Windows
@@ -356,9 +372,10 @@ The pipeline executes entirely on a Linux runner (`ubuntu-latest`) and performs 
 - **C++ Compiler Warnings Check:** Compiles both targets with compiler warnings treated as errors (`-Werror`) for strict code quality.
 - **Native Linux Build & Test:** Compiles the player and runs the test suite natively under Linux using GCC.
 - **Sanitizers:** Re-compiles and runs the native test suite under AddressSanitizer (ASan) and UndefinedBehaviorSanitizer (UBSan) to check for memory safety and undefined behavior.
+- **ThreadSanitizer (TSan):** Re-compiles and runs the native test suite under ThreadSanitizer (TSan) to detect concurrency bugs, data races, and deadlocks.
 - **Static Analysis:** Performs static analysis using `cppcheck` on all C++ source files.
 - **Windows Cross-Compilation:** Cross-compiles the application for Windows using the MinGW-w64 GCC toolchain (`x86_64-w64-mingw32-gcc`/`g++`).
-- **Compiler Caching (`ccache`):** Employs `ccache` to cache compilation units globally, significantly reducing compile times for upstream dependencies (SDL2, ImGui, NFD) on subsequent workflow runs.
+- **Compiler Caching (`ccache`):** Employs `ccache` to cache compilation units globally, significantly reducing compile times for upstream dependencies (SDL3, ImGui, NFD) on subsequent workflow runs.
 
 ---
 
@@ -366,7 +383,7 @@ The pipeline executes entirely on a Linux runner (`ubuntu-latest`) and performs 
 
 NaikAVPlayer is published under the **MIT License**. It links dynamically and statically to the following libraries and assets:
 - **FFmpeg** (Licensed under LGPL v3.0, ensuring full legal compliance with the application's permissive MIT license)
-- **SDL2** (Licensed under the Zlib License)
+- **SDL3** (Licensed under the Zlib License)
 - **Dear ImGui** (Licensed under the MIT License)
 - **nativefiledialog-extended (NFD)** (Licensed under the Zlib License — Copyright © 2014-2020 Michael Labbé, Copyright © 2020-2024 btzy)
 - **Noto Sans Font** (Licensed under the SIL Open Font License 1.1)
