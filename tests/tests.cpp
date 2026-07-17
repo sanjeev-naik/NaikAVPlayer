@@ -5,6 +5,7 @@
 #include <cmath>
 #include <vector>
 #include <cstdlib>
+#include <atomic>
 
 #define SDL_MAIN_HANDLED
 #include <SDL3/SDL.h>
@@ -19,39 +20,39 @@ class Demuxer;
 // -------------------------------------------------------------
 // FFmpeg & SDL Mocking Interceptors
 // -------------------------------------------------------------
-static bool force_alloc_fail = false;
-static bool force_open_fail = false;
-static bool force_frame_alloc_fail = false;
-static bool force_malloc_fail = false;
-static bool force_image_fill_fail = false;
-static bool force_swr_init_fail = false;
-static bool force_swr_convert_fail = false;
-static bool force_seek_fail = false;
-static bool force_find_stream_info_fail = false;
-static bool force_copy_params_fail = false;
-static bool force_sdl_audio_fail = false;
-static bool force_send_packet_fail = false;
-static bool force_receive_frame_fail = false;
-static bool force_no_pts = false;
-static bool force_no_streams = false;
-static bool force_no_duration = false;
-static bool force_packet_alloc_fail = false;
-static bool force_read_error = false;
-static bool force_video_eof = false;
-static bool force_video_error = false;
-static bool force_sws_context_fail = false;
-static bool force_read_eof = false;
+static std::atomic<bool> force_alloc_fail{false};
+static std::atomic<bool> force_open_fail{false};
+static std::atomic<bool> force_frame_alloc_fail{false};
+static std::atomic<bool> force_malloc_fail{false};
+static std::atomic<bool> force_image_fill_fail{false};
+static std::atomic<bool> force_swr_init_fail{false};
+static std::atomic<bool> force_swr_convert_fail{false};
+static std::atomic<bool> force_seek_fail{false};
+static std::atomic<bool> force_find_stream_info_fail{false};
+static std::atomic<bool> force_copy_params_fail{false};
+static std::atomic<bool> force_sdl_audio_fail{false};
+static std::atomic<bool> force_send_packet_fail{false};
+static std::atomic<bool> force_receive_frame_fail{false};
+static std::atomic<bool> force_no_pts{false};
+static std::atomic<bool> force_no_streams{false};
+static std::atomic<bool> force_no_duration{false};
+static std::atomic<bool> force_packet_alloc_fail{false};
+static std::atomic<bool> force_read_error{false};
+static std::atomic<bool> force_video_eof{false};
+static std::atomic<bool> force_video_error{false};
+static std::atomic<bool> force_sws_context_fail{false};
+static std::atomic<bool> force_read_eof{false};
 
-static bool force_zero_channels = false;
-static bool force_sdl_init_fail = false;
-static bool open_finished = false;
-static int packet_alloc_count = 0;
+static std::atomic<bool> force_zero_channels{false};
+static std::atomic<bool> force_sdl_init_fail{false};
+static std::atomic<bool> open_finished{false};
+static std::atomic<int> packet_alloc_count{0};
 
 #include <functional>
-static bool force_hw_transfer_fail = false;
-static bool force_receive_eagain = false;
-static bool mock_send_packet_success = false;
-static bool mock_hw_transfer_nv12 = false;
+static std::atomic<bool> force_hw_transfer_fail{false};
+static std::atomic<bool> force_receive_eagain{false};
+static std::atomic<bool> mock_send_packet_success{false};
+static std::atomic<bool> mock_hw_transfer_nv12{false};
 static std::function<void()> on_mock_read_frame = nullptr;
 struct AVCodec;
 static const struct AVCodec* global_saved_codec = nullptr;
