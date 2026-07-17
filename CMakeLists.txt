@@ -480,12 +480,13 @@ endforeach()
     )
 endif()
 
-# Enable CTest and register test suite
-# include(CTest) (rather than a bare enable_testing()) generates
-# DartConfiguration.tcl in the build directory, which `ctest -T Test`
-# (used in CI) requires; without it ctest logs "Cannot find file:
-# .../DartConfiguration.tcl" before falling back to defaults.
 include(CTest)
+
+# Generate CTestCustom.cmake to prevent CTest from truncating test output logs in Test.xml
+file(WRITE "${CMAKE_BINARY_DIR}/CTestCustom.cmake" "
+set(CTEST_CUSTOM_MAXIMUM_PASSED_TEST_OUTPUT_SIZE 262144)
+set(CTEST_CUSTOM_MAXIMUM_FAILED_TEST_OUTPUT_SIZE 262144)
+")
 
 set(TEST_VIDEO_PATH "${CMAKE_SOURCE_DIR}/assets/hd_test_video_with_audio.mp4")
 

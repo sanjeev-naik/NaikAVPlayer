@@ -13,8 +13,8 @@ def parse_ctest_xml(xml_path):
         return []
 
     tests = []
-    # Find all Test elements
-    for test_elem in root.findall(".//Test"):
+    # Find all Test elements under Testing
+    for test_elem in root.findall(".//Testing/Test"):
         name = test_elem.find("Name").text if test_elem.find("Name") is not None else "Unknown"
         status = test_elem.attrib.get("Status", "unknown")
         
@@ -32,7 +32,31 @@ def parse_ctest_xml(xml_path):
         if meas_elem is not None:
             val_elem = meas_elem.find("Value")
             if val_elem is not None and val_elem.text:
-                output = val_elem.text
+                raw_text = val_elem.text
+                if val_elem.attrib.get("encoding") == "base64":
+                    try:
+                        import base64
+                        decoded_data = base64.b64decode(raw_text)
+                        
+                        # Try to decompress if compression attribute is present or data looks compressed
+                        compression = val_elem.attrib.get("compression")
+                        if compression == "gzip" or compression == "zlib":
+                            try:
+                                import zlib
+                                # CTest writes a zlib deflate stream under compression='gzip'
+                                decoded_data = zlib.decompress(decoded_data)
+                            except Exception:
+                                try:
+                                    import gzip
+                                    decoded_data = gzip.decompress(decoded_data)
+                                except Exception:
+                                    pass
+                        output = decoded_data.decode("utf-8", errors="ignore")
+                    except Exception as e:
+                        print(f"Error decoding log: {e}")
+                        output = raw_text
+                else:
+                    output = raw_text
 
         tests.append({
             "name": name,
@@ -155,13 +179,14 @@ def generate_excel_report(output_file):
                 c1 = ws.cell(row=row_idx, column=1, value=test["name"])
                 c2 = ws.cell(row=row_idx, column=2, value=test["status"])
                 c3 = ws.cell(row=row_idx, column=3, value=test["duration"])
-                c4 = ws.cell(row=row_idx, column=4, value=test["output"][:1000]) # Cap output text in cell
+                c4 = ws.cell(row=row_idx, column=4, value=test["output"][:30000]) # Cap output text in cell
                 
                 for c in [c1, c2, c3, c4]:
                     c.font = font_regular
                     c.border = thin_border
                 
                 c3.alignment = Alignment(horizontal="right")
+                c4.alignment = Alignment(wrap_text=True)
                 
                 # Highlight status
                 if test["status"].lower() == "passed":
@@ -238,7 +263,7 @@ def generate_excel_report(output_file):
                     status_class = "passed" if test["status"].lower() == "passed" else "failed"
                     # Escape HTML characters in output logs
                     safe_output = test["output"].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-                    f.write(f'  <tr><td>{test["name"]}</td><td class="{status_class}">{test["status"]}</td><td style="text-align: right;">{test["duration"]:.3f}</td><td><pre style="margin:0;">{safe_output[:1000]}</pre></td></tr>\n')
+                    f.write(f'  <tr><td>{test["name"]}</td><td class="{status_class}">{test["status"]}</td><td style="text-align: right;">{test["duration"]:.3f}</td><td><pre style="margin:0;">{safe_output[:30000]}</pre></td></tr>\n')
                 f.write('</table><br>\n')
             f.write("</body>\n</html>\n")
         print(f"HTML Excel report generated successfully at: {output_file}")

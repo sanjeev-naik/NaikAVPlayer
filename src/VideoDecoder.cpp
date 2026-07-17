@@ -564,6 +564,12 @@ bool VideoDecoder::reopenHardwareDecoder() {
 
   // Free the old context first to ensure complete teardown of old threads and buffers
   avcodec_free_context(&m_codecCtx);
+  if (m_decodedFrame) {
+    av_frame_unref(m_decodedFrame);
+  }
+  if (m_yuvFrame) {
+    av_frame_unref(m_yuvFrame);
+  }
 
   AVCodecContext *ctx = avcodec_alloc_context3(codec);
   if (!ctx)
@@ -594,6 +600,12 @@ bool VideoDecoder::fallbackToSoftware() {
 
   if (m_codecCtx) {
     avcodec_free_context(&m_codecCtx);
+  }
+  if (m_decodedFrame) {
+    av_frame_unref(m_decodedFrame);
+  }
+  if (m_yuvFrame) {
+    av_frame_unref(m_yuvFrame);
   }
 
   const AVCodec *softwareCodec = avcodec_find_decoder(codecId);
