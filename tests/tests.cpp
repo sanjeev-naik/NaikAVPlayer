@@ -771,13 +771,23 @@ int real_main(int argc, char* argv[]) {
             controller.m_demuxer->m_audioStreamIdx = (controller.m_demuxer->m_formatCtx->nb_streams > 1) ? 1 : 0;
             controller.m_demuxer->m_audioTimeBase = {1, 44100};
             controller.m_demuxer->seek(10.0);
-            controller.m_demuxer->performSeek();
+            while (controller.m_demuxer->m_seekRequested.load()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            {
+                std::lock_guard<std::mutex> seekLock(controller.m_demuxer->m_seekMutex);
+            }
 
             // Force No-Stream seeking branch
             controller.m_demuxer->m_videoStreamIdx = -1;
             controller.m_demuxer->m_audioStreamIdx = -1;
             controller.m_demuxer->seek(10.0);
-            controller.m_demuxer->performSeek();
+            while (controller.m_demuxer->m_seekRequested.load()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            {
+                std::lock_guard<std::mutex> seekLock(controller.m_demuxer->m_seekMutex);
+            }
         }
 
         // -------------------------------------------------------------
@@ -789,7 +799,12 @@ int real_main(int argc, char* argv[]) {
             controller.m_demuxer->m_audioStreamIdx = savedAudioIdx;
             controller.m_demuxer->m_eof = false;
             controller.m_demuxer->seek(0.0);
-            controller.m_demuxer->performSeek();
+            while (controller.m_demuxer->m_seekRequested.load()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            {
+                std::lock_guard<std::mutex> seekLock(controller.m_demuxer->m_seekMutex);
+            }
         }
         controller.m_hasAudio = false;
         controller.m_hasVideo = true;
