@@ -1,0 +1,7 @@
+# ThreadSanitizer suppressions for external libraries
+
+# Suppress data races from external PulseAudio client libraries
+called_from_lib:libpulsecommon
+called_from_lib:libpulse
+race:pa_mutex_lock
+race:PULSEAUDIO_Init

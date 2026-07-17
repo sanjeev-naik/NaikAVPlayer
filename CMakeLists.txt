@@ -67,6 +67,20 @@ endif()
 
 if(ENABLE_SANITIZERS)
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        include(CMakePushCheckState)
+        include(CheckCXXSourceCompiles)
+        cmake_push_check_state()
+        set(CMAKE_REQUIRED_LINK_OPTIONS "-fsanitize=address,undefined")
+        set(CMAKE_REQUIRED_FLAGS "-fsanitize=address,undefined")
+        check_cxx_source_compiles("int main() { return 0; }" COMPILER_SUPPORTS_SANITIZERS)
+        cmake_pop_check_state()
+
+        if(NOT COMPILER_SUPPORTS_SANITIZERS)
+            message(FATAL_ERROR "ENABLE_SANITIZERS is ON, but the compiler/linker does not support or cannot find the required sanitizer libraries (e.g., -lasan or -lubsan).\n"
+                                "If you are on Windows using MinGW, please make sure you have the necessary sanitizer packages installed, or disable sanitizers by running:\n"
+                                "  cmake -B build -DENABLE_SANITIZERS=OFF")
+        endif()
+
         add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer)
         add_link_options(-fsanitize=address,undefined)
     endif()
@@ -74,6 +88,20 @@ endif()
 
 if(ENABLE_TSAN)
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        include(CMakePushCheckState)
+        include(CheckCXXSourceCompiles)
+        cmake_push_check_state()
+        set(CMAKE_REQUIRED_LINK_OPTIONS "-fsanitize=thread")
+        set(CMAKE_REQUIRED_FLAGS "-fsanitize=thread")
+        check_cxx_source_compiles("int main() { return 0; }" COMPILER_SUPPORTS_TSAN)
+        cmake_pop_check_state()
+
+        if(NOT COMPILER_SUPPORTS_TSAN)
+            message(FATAL_ERROR "ENABLE_TSAN is ON, but the compiler/linker does not support or cannot find the required ThreadSanitizer libraries.\n"
+                                "Please disable ThreadSanitizer by running:\n"
+                                "  cmake -B build -DENABLE_TSAN=OFF")
+        endif()
+
         add_compile_options(-fsanitize=thread -fno-omit-frame-pointer)
         add_link_options(-fsanitize=thread)
     endif()

@@ -15,6 +15,10 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
+      - name: Install Python Dependencies
+        run: |
+          python3 -m pip install openpyxl
+
       - name: Install System Dependencies
         run: |
           sudo apt-get update
@@ -52,7 +56,7 @@ jobs:
       - name: Run Tests (Native Linux)
         run: |
           cd build-linux
-          ctest --output-on-failure
+          ctest -T Test --output-on-failure
 
       - name: Run Static Analysis (cppcheck)
         run: |
@@ -82,7 +86,7 @@ jobs:
           LSAN_OPTIONS: suppressions=${{ github.workspace }}/tests/lsan.supp
         run: |
           cd build-sanitizers
-          ctest --output-on-failure
+          ctest -T Test --output-on-failure
 
       - name: Configure CMake with ThreadSanitizer (TSan)
         env:
@@ -100,10 +104,22 @@ jobs:
 
       - name: Run Tests with ThreadSanitizer (TSan)
         env:
-          TSAN_OPTIONS: "halt_on_error=1 history_size=7"
+          TSAN_OPTIONS: "halt_on_error=1 history_size=7 suppressions=${{ github.workspace }}/tests/tsan.supp"
         run: |
           cd build-tsan
-          ctest --output-on-failure
+          ctest -T Test --output-on-failure
+
+      - name: Generate XLS Test Report
+        if: always()
+        run: |
+          python3 tests/generate_xls_report.py test_report.xlsx
+
+      - name: Upload Test Report Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-execution-report
+          path: test_report.xlsx
 
   cross-compile-windows:
     name: Windows Cross-Compilation (MinGW-w64 on Linux)
