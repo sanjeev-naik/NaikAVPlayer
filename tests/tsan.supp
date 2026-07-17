@@ -18,3 +18,5 @@ race:PULSEAUDIO_Init
 # to the fetched SDL3 dependency, not application code.
 race:SDL_InitAudio
 race:SDL_GetCurrentAudioDriver_REAL
+
+

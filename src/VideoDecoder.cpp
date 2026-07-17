@@ -562,6 +562,9 @@ bool VideoDecoder::reopenHardwareDecoder() {
   if (!codec)
     return false;
 
+  // Free the old context first to ensure complete teardown of old threads and buffers
+  avcodec_free_context(&m_codecCtx);
+
   AVCodecContext *ctx = avcodec_alloc_context3(codec);
   if (!ctx)
     return false;
@@ -580,20 +583,18 @@ bool VideoDecoder::reopenHardwareDecoder() {
     return false;
   }
 
-  // Only release the old session once the new one is confirmed open, so a
-  // failed reopen leaves the existing (still working) context in place.
-  avcodec_free_context(&m_codecCtx);
   m_codecCtx = ctx;
   m_consecutiveEagainCount = 0; // Reset consecutive EAGAIN count on reopen
   return true;
 }
 
 bool VideoDecoder::fallbackToSoftware() {
-  if (!m_codecCtx)
-    return false;
+  // Use m_codecParams->codec_id as fallback source in case m_codecCtx was already freed by reopenHardwareDecoder
+  AVCodecID codecId = m_codecParams ? m_codecParams->codec_id : AV_CODEC_ID_H264;
 
-  AVCodecID codecId = m_codecCtx->codec_id;
-  avcodec_free_context(&m_codecCtx);
+  if (m_codecCtx) {
+    avcodec_free_context(&m_codecCtx);
+  }
 
   const AVCodec *softwareCodec = avcodec_find_decoder(codecId);
   if (!softwareCodec) {
