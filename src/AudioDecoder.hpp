@@ -12,7 +12,7 @@ extern "C" {
 #include <libavutil/version.h>
 }
 
-#include <SDL2/SDL.h>
+#include <SDL3/SDL.h>
 
 class AudioDecoder {
 private:
@@ -24,7 +24,7 @@ private:
     AVRational m_timeBase;
     int64_t m_startTime;
     
-    SDL_AudioDeviceID m_audioDevice;
+    SDL_AudioStream* m_audioStream;
     
     // Audio Clock synchronization variables
     double m_clock; // Current audio clock (in seconds)
@@ -42,7 +42,7 @@ private:
     std::atomic<float> m_volume;
     
     AVFrame* m_decodedFrame;
-
+ 
     // Output specs (SDL Audio configuration)
     int m_outSampleRate;
     AVSampleFormat m_outSampleFmt;
@@ -52,10 +52,10 @@ private:
 #else
     uint64_t m_outChannelLayout;
 #endif
-
+ 
     void decodeAndResample();
-    static void sdlAudioCallback(void* userdata, Uint8* stream, int len);
-
+    static void sdlAudioStreamCallback(void* userdata, SDL_AudioStream* stream, int additional_amount, int total_amount);
+ 
 public:
     AudioDecoder(AVCodecParameters* codecParams, 
                  AVRational timeBase, 

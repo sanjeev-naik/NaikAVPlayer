@@ -13,7 +13,7 @@ AudioDecoder::AudioDecoder(AVCodecParameters* codecParams,
       m_queue(queue),
       m_timeBase(timeBase),
       m_startTime(startTime),
-      m_audioDevice(0),
+      m_audioStream(nullptr),
       m_clock(0.0),
       m_clockMutex(),
       m_audioBuffer(),
@@ -132,20 +132,15 @@ bool AudioDecoder::init() {
         return false;
     }
 
-    // Configure SDL audio spec
-    SDL_AudioSpec wantedSpec;
-    SDL_memset(&wantedSpec, 0, sizeof(wantedSpec));
+    // Configure SDL3 audio spec
+    SDL_AudioSpec wantedSpec = {};
     wantedSpec.freq = m_outSampleRate;
-    wantedSpec.format = AUDIO_S16SYS; // Signed 16-bit native endian
+    wantedSpec.format = SDL_AUDIO_S16; // Signed 16-bit native endian
     wantedSpec.channels = m_outChannels;
-    wantedSpec.samples = 1024;
-    wantedSpec.callback = sdlAudioCallback;
-    wantedSpec.userdata = this;
 
-    SDL_AudioSpec obtainedSpec;
-    m_audioDevice = SDL_OpenAudioDevice(nullptr, 0, &wantedSpec, &obtainedSpec, 0);
-    if (m_audioDevice == 0) {
-        std::cerr << "Error: Could not open SDL audio device: " << SDL_GetError() << std::endl;
+    m_audioStream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &wantedSpec, sdlAudioStreamCallback, this);
+    if (!m_audioStream) {
+        std::cerr << "Error: Could not open SDL audio stream: " << SDL_GetError() << std::endl;
         return false;
     }
 
@@ -156,38 +151,46 @@ bool AudioDecoder::init() {
 }
 
 void AudioDecoder::start() {
-    if (m_audioDevice > 0) {
-        SDL_PauseAudioDevice(m_audioDevice, 0); // Start audio thread
+    if (m_audioStream) {
+        SDL_ResumeAudioStreamDevice(m_audioStream);
         m_paused = false;
     }
 }
 
 void AudioDecoder::pause() {
-    if (m_audioDevice > 0) {
-        SDL_PauseAudioDevice(m_audioDevice, 1);
+    if (m_audioStream) {
+        SDL_PauseAudioStreamDevice(m_audioStream);
         m_paused = true;
     }
 }
 
 void AudioDecoder::resume() {
-    if (m_audioDevice > 0) {
-        SDL_PauseAudioDevice(m_audioDevice, 0);
+    if (m_audioStream) {
+        SDL_ResumeAudioStreamDevice(m_audioStream);
         m_paused = false;
     }
 }
 
 void AudioDecoder::stop() {
-    if (m_audioDevice > 0) {
-        SDL_CloseAudioDevice(m_audioDevice);
-        m_audioDevice = 0;
+    if (m_audioStream) {
+        SDL_DestroyAudioStream(m_audioStream);
+        m_audioStream = nullptr;
     }
 }
 
 void AudioDecoder::flush() {
     m_flushRequested = true;
+    if (m_audioStream) {
+        SDL_ClearAudioStream(m_audioStream);
+    }
 }
 
 double AudioDecoder::getAudioClock() {
+    int queuedBytes = 0;
+    if (m_audioStream) {
+        queuedBytes = SDL_GetAudioStreamQueued(m_audioStream);
+    }
+
     std::lock_guard<std::mutex> lock(m_clockMutex);
     
     // Calculate precise current clock position
@@ -197,6 +200,12 @@ double AudioDecoder::getAudioClock() {
     // Sample size: 2 channels * 2 bytes (16-bit) = 4 bytes per stereo sample frame
     const int sampleSize = m_outChannels * 2;
     size_t playedBytes = m_audioBufferIndex;
+    
+    if (static_cast<size_t>(queuedBytes) < playedBytes) {
+        playedBytes -= queuedBytes;
+    } else {
+        playedBytes = 0;
+    }
     
     double offsetTime = static_cast<double>(playedBytes) / (m_outSampleRate * sampleSize);
     
@@ -334,48 +343,67 @@ void AudioDecoder::setVolume(float volume) {
     m_volume = std::clamp(volume, 0.0f, 1.0f);
 }
 
-void AudioDecoder::sdlAudioCallback(void* userdata, Uint8* stream, int len) {
+void AudioDecoder::sdlAudioStreamCallback(void* userdata, SDL_AudioStream* stream, int additional_amount, int total_amount) {
     AudioDecoder* self = static_cast<AudioDecoder*>(userdata);
+    (void)stream;
+    (void)total_amount;
     
-    // Fill the audio playback device buffer
-    while (len > 0) {
-        if (self->m_audioBufferIndex >= self->m_audioBufferSize) {
-            // Buffer is consumed, decode next frames
-            self->decodeAndResample();
-            if (self->m_audioBufferSize == 0) {
-                // If queues are starved or file ended, output silence
-                std::memset(stream, 0, len);
-                break;
+    int len = additional_amount;
+    if (len <= 0) {
+        len = 4096;
+    }
+    
+    std::vector<uint8_t> tempBuffer(len);
+    uint8_t* destPtr = tempBuffer.data();
+    int bytesWritten = 0;
+    
+    {
+        std::lock_guard<std::mutex> lock(self->m_audioMutex);
+        while (len > 0) {
+            if (self->m_audioBufferIndex >= self->m_audioBufferSize) {
+                // Buffer is consumed, decode next frames
+                self->decodeAndResample();
+                if (self->m_audioBufferSize == 0) {
+                    // If queues are starved or file ended, output silence
+                    std::memset(destPtr, 0, len);
+                    bytesWritten += len;
+                    break;
+                }
             }
-        }
 
-        int bytesToCopy = std::min(len, static_cast<int>(self->m_audioBufferSize - self->m_audioBufferIndex));
-        
-        // Software volume scaling copy
-        const int16_t* src = reinterpret_cast<const int16_t*>(self->m_audioBuffer.data() + self->m_audioBufferIndex);
-        int16_t* dest = reinterpret_cast<int16_t*>(stream);
-        float volume = self->m_volume;
+            int bytesToCopy = std::min(len, static_cast<int>(self->m_audioBufferSize - self->m_audioBufferIndex));
+            
+            // Software volume scaling copy
+            const int16_t* src = reinterpret_cast<const int16_t*>(self->m_audioBuffer.data() + self->m_audioBufferIndex);
+            int16_t* dest = reinterpret_cast<int16_t*>(destPtr);
+            float volume = self->m_volume;
 
-        if (volume >= 0.99f) {
-            // Perfect bypass copy (faster)
-            std::memcpy(dest, src, bytesToCopy);
-        } else if (volume <= 0.01f) {
-            // Perfect bypass for mute (faster, zero overhead)
-            std::memset(dest, 0, bytesToCopy);
-        } else {
-            int samplesToCopy = bytesToCopy / 2; // 16-bit = 2 bytes per sample
-            // Scale amplitude line-by-line
-            for (int i = 0; i < samplesToCopy; ++i) {
-                float val = src[i] * volume;
-                // Clip if any overflows (not typical for attenuation, but safe practice)
-                if (val > 32767.0f) val = 32767.0f;
-                if (val < -32768.0f) val = -32768.0f;
-                dest[i] = static_cast<int16_t>(val);
+            if (volume >= 0.99f) {
+                // Perfect bypass copy (faster)
+                std::memcpy(dest, src, bytesToCopy);
+            } else if (volume <= 0.01f) {
+                // Perfect bypass for mute (faster, zero overhead)
+                std::memset(dest, 0, bytesToCopy);
+            } else {
+                int samplesToCopy = bytesToCopy / 2; // 16-bit = 2 bytes per sample
+                // Scale amplitude line-by-line
+                for (int i = 0; i < samplesToCopy; ++i) {
+                    float val = src[i] * volume;
+                    // Clip if any overflows (not typical for attenuation, but safe practice)
+                    if (val > 32767.0f) val = 32767.0f;
+                    if (val < -32768.0f) val = -32768.0f;
+                    dest[i] = static_cast<int16_t>(val);
+                }
             }
-        }
 
-        stream += bytesToCopy;
-        len -= bytesToCopy;
-        self->m_audioBufferIndex += bytesToCopy;
+            destPtr += bytesToCopy;
+            len -= bytesToCopy;
+            bytesWritten += bytesToCopy;
+            self->m_audioBufferIndex += bytesToCopy;
+        }
+    }
+    
+    if (bytesWritten > 0) {
+        SDL_PutAudioStreamData(stream, tempBuffer.data(), bytesWritten);
     }
 }

@@ -68,19 +68,18 @@ if(ENABLE_SANITIZERS)
 endif()
 
 # -------------------------------------------------------------
-# Fetch SDL2
+# Fetch SDL3
 # -------------------------------------------------------------
 include(FetchContent)
 
-# Optimize SDL2 build time: build shared only, disable unused subsystems
+# Optimize SDL3 build time: build shared only, disable unused subsystems
 set(SDL_SHARED ON CACHE BOOL "" FORCE)
 set(SDL_STATIC OFF CACHE BOOL "" FORCE)
-set(SDL_TEST OFF CACHE BOOL "" FORCE)
+set(SDL_TESTS OFF CACHE BOOL "" FORCE)
 
 # Enable only required subsystems for NaikAVPlayer
 set(SDL_VIDEO ON CACHE BOOL "" FORCE)
 set(SDL_AUDIO ON CACHE BOOL "" FORCE)
-set(SDL_TIMERS ON CACHE BOOL "" FORCE)
 set(SDL_EVENTS ON CACHE BOOL "" FORCE)
 set(SDL_THREADS ON CACHE BOOL "" FORCE)
 set(SDL_RENDER ON CACHE BOOL "" FORCE)
@@ -94,14 +93,14 @@ set(SDL_HIDAPI OFF CACHE BOOL "" FORCE)
 set(SDL_LOCALE OFF CACHE BOOL "" FORCE)
 set(SDL_MISC OFF CACHE BOOL "" FORCE)
 
-message(STATUS "Fetching SDL2...")
+message(STATUS "Fetching SDL3...")
 FetchContent_Declare(
-    SDL2
+    SDL3
     GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
-    GIT_TAG release-2.32.10
+    GIT_TAG release-3.2.0
     GIT_SHALLOW TRUE
 )
-FetchContent_MakeAvailable(SDL2)
+FetchContent_MakeAvailable(SDL3)
 
 # -------------------------------------------------------------
 # Fetch Dear ImGui
@@ -110,7 +109,7 @@ message(STATUS "Fetching Dear ImGui...")
 FetchContent_Declare(
     imgui
     GIT_REPOSITORY https://github.com/ocornut/imgui.git
-    GIT_TAG v1.90.4
+    GIT_TAG v1.91.9
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(imgui)
@@ -122,12 +121,12 @@ add_library(imgui STATIC
     ${imgui_SOURCE_DIR}/imgui_widgets.cpp
     ${imgui_SOURCE_DIR}/imgui_tables.cpp
     ${imgui_SOURCE_DIR}/imgui_demo.cpp
-    ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl2.cpp
-    ${imgui_SOURCE_DIR}/backends/imgui_impl_sdlrenderer2.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_sdlrenderer3.cpp
 )
 
 # ImGui needs SDL headers
-target_link_libraries(imgui PRIVATE SDL2::SDL2)
+target_link_libraries(imgui PRIVATE SDL3::SDL3-shared)
 target_include_directories(imgui PUBLIC
     ${imgui_SOURCE_DIR}
     ${imgui_SOURCE_DIR}/backends
@@ -227,7 +226,7 @@ add_executable(NaikAVPlayer
 # Link libraries to our executable
 target_link_libraries(NaikAVPlayer PRIVATE
     imgui
-    SDL2::SDL2
+    SDL3::SDL3-shared
     avcodec
     avformat
     avutil
@@ -260,9 +259,9 @@ if(TARGET_PLATFORM_WINDOWS)
 
     add_custom_command(TARGET NaikAVPlayer POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy
-            $<TARGET_FILE:SDL2::SDL2>
+            $<TARGET_FILE:SDL3::SDL3-shared>
             $<TARGET_FILE_DIR:NaikAVPlayer>
-        COMMENT "Copying SDL2.dll to output directory..."
+        COMMENT "Copying SDL3.dll to output directory..."
     )
 endif()
 
@@ -300,7 +299,7 @@ else()
 endif()
 
 target_link_libraries(NaikAVPlayer_tests PRIVATE
-    SDL2::SDL2
+    SDL3::SDL3-shared
     avcodec
     avformat
     avutil
@@ -326,9 +325,9 @@ if(TARGET_PLATFORM_WINDOWS)
 
     add_custom_command(TARGET NaikAVPlayer_tests POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy
-            $<TARGET_FILE:SDL2::SDL2>
+            $<TARGET_FILE:SDL3::SDL3-shared>
             $<TARGET_FILE_DIR:NaikAVPlayer_tests>
-        COMMENT "Copying SDL2.dll to tests output directory..."
+        COMMENT "Copying SDL3.dll to tests output directory..."
     )
 endif()
 
