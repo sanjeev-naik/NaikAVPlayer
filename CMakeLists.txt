@@ -51,6 +51,11 @@ endif()
 # -------------------------------------------------------------
 option(TREAT_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ON)
 option(ENABLE_SANITIZERS "Enable Address and Undefined Behavior Sanitizers" OFF)
+option(ENABLE_TSAN "Enable ThreadSanitizer" OFF)
+
+if(ENABLE_SANITIZERS AND ENABLE_TSAN)
+    message(FATAL_ERROR "Address/Undefined Sanitizers and ThreadSanitizer are mutually exclusive. Please enable only one.")
+endif()
 
 set(PROJECT_WARNING_FLAGS "")
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
@@ -62,8 +67,43 @@ endif()
 
 if(ENABLE_SANITIZERS)
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        include(CMakePushCheckState)
+        include(CheckCXXSourceCompiles)
+        cmake_push_check_state()
+        set(CMAKE_REQUIRED_LINK_OPTIONS "-fsanitize=address,undefined")
+        set(CMAKE_REQUIRED_FLAGS "-fsanitize=address,undefined")
+        check_cxx_source_compiles("int main() { return 0; }" COMPILER_SUPPORTS_SANITIZERS)
+        cmake_pop_check_state()
+
+        if(NOT COMPILER_SUPPORTS_SANITIZERS)
+            message(FATAL_ERROR "ENABLE_SANITIZERS is ON, but the compiler/linker does not support or cannot find the required sanitizer libraries (e.g., -lasan or -lubsan).\n"
+                                "If you are on Windows using MinGW, please make sure you have the necessary sanitizer packages installed, or disable sanitizers by running:\n"
+                                "  cmake -B build -DENABLE_SANITIZERS=OFF")
+        endif()
+
         add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer)
         add_link_options(-fsanitize=address,undefined)
+    endif()
+endif()
+
+if(ENABLE_TSAN)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        include(CMakePushCheckState)
+        include(CheckCXXSourceCompiles)
+        cmake_push_check_state()
+        set(CMAKE_REQUIRED_LINK_OPTIONS "-fsanitize=thread")
+        set(CMAKE_REQUIRED_FLAGS "-fsanitize=thread")
+        check_cxx_source_compiles("int main() { return 0; }" COMPILER_SUPPORTS_TSAN)
+        cmake_pop_check_state()
+
+        if(NOT COMPILER_SUPPORTS_TSAN)
+            message(FATAL_ERROR "ENABLE_TSAN is ON, but the compiler/linker does not support or cannot find the required ThreadSanitizer libraries.\n"
+                                "Please disable ThreadSanitizer by running:\n"
+                                "  cmake -B build -DENABLE_TSAN=OFF")
+        endif()
+
+        add_compile_options(-fsanitize=thread -fno-omit-frame-pointer)
+        add_link_options(-fsanitize=thread)
     endif()
 endif()
 
@@ -281,7 +321,13 @@ add_executable(NaikAVPlayer_tests
 
 option(ENABLE_COVERAGE "Enable code coverage instrumentation" ON)
 
-if(ENABLE_COVERAGE)
+# GCC's gcov (--coverage) counters are incremented non-atomically, so any
+# instrumented function reached concurrently from multiple threads (e.g.
+# std::atomic<bool>::load, used by VideoDecoder::isSeeking()/Demuxer's
+# worker thread) trips ThreadSanitizer on the counter itself rather than on
+# real application state. Coverage and TSan are therefore mutually
+# exclusive here, same as ENABLE_SANITIZERS/ENABLE_TSAN above.
+if(ENABLE_COVERAGE AND NOT ENABLE_TSAN)
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         # Enable GCC/Clang code coverage flags for tests
         target_compile_options(NaikAVPlayer_tests PRIVATE --coverage -O0 -g)
@@ -434,8 +480,13 @@ endforeach()
     )
 endif()
 
-# Enable CTest and register test suite
-enable_testing()
+include(CTest)
+
+# Generate CTestCustom.cmake to prevent CTest from truncating test output logs in Test.xml
+file(WRITE "${CMAKE_BINARY_DIR}/CTestCustom.cmake" "
+set(CTEST_CUSTOM_MAXIMUM_PASSED_TEST_OUTPUT_SIZE 262144)
+set(CTEST_CUSTOM_MAXIMUM_FAILED_TEST_OUTPUT_SIZE 262144)
+")
 
 set(TEST_VIDEO_PATH "${CMAKE_SOURCE_DIR}/assets/hd_test_video_with_audio.mp4")
 

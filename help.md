@@ -8,7 +8,7 @@ This guide describes how to build, compile, install, run, and uninstall the nati
 
 The project is natively cross-platform:
 - **CMake (version 3.16+)**: Cross-platform build generation suite.
-- **SDL2, Dear ImGui & nativefiledialog-extended**: Fetched and compiled from source automatically during configure.
+- **SDL3, Dear ImGui & nativefiledialog-extended**: Fetched and compiled from source automatically during configure.
 
 ### Windows
 - **MinGW-w64 (GCC)**.
@@ -69,7 +69,7 @@ Build the binaries:
 ```bash
 cmake --build build
 ```
-*Note: On Windows, a post-build script automatically copies all necessary DLLs (like `SDL2.dll` and FFmpeg shared `.dll`s) from `thirdparty/ffmpeg/bin` directly to the `build/` directory so you can run it immediately.*
+*Note: On Windows, a post-build script automatically copies all necessary DLLs (like `SDL3.dll` and FFmpeg shared `.dll`s) from `thirdparty/ffmpeg/bin` directly to the `build/` directory so you can run it immediately.*
 
 ### Step C: Install Application (Linux)
 To install the binaries, assets, desktop entry, and icon onto the system:
@@ -172,6 +172,7 @@ The project includes an automated GitHub Actions pipeline (configured in [.githu
 - **C++ Compiler Warnings Check**: Builds the application targets with compiler warnings treated as errors (`-Werror`) for strict compliance.
 - **Native Linux Build & Test**: Compiles the codebase using GCC on an Ubuntu runner and executes the test suite.
 - **Sanitizers Verification**: Compiles and runs the native Linux test suite under AddressSanitizer (ASan) and UndefinedBehaviorSanitizer (UBSan) to detect memory management bugs and undefined behavior.
+- **ThreadSanitizer (TSan) Verification**: Compiles and runs the native Linux test suite under ThreadSanitizer (TSan) to detect data races and thread synchronization issues.
 - **Static Analysis**: Performs static analysis checks on all source and test C++ files using `cppcheck`.
 - **Windows Cross-Compilation**: Cross-compiles Windows executables on the Linux runner using the MinGW-w64 GCC cross-compiler (`x86_64-w64-mingw32-gcc`/`g++`).
-- **Compiler Caching (`ccache`)**: Speeds up verification times by caching compiled object units globally on GitHub Actions. It bypasses recompiling large upstream dependencies like SDL2 and Dear ImGui, cutting down build times significantly.
+- **Compiler Caching (`ccache`)**: Speeds up verification times by caching compiled object units globally on GitHub Actions. It bypasses recompiling large upstream dependencies like SDL3 and Dear ImGui, cutting down build times significantly.

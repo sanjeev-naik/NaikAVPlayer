@@ -22,8 +22,8 @@ private:
     std::string m_filename;
     AVFormatContext* m_formatCtx;
     
-    int m_videoStreamIdx;
-    int m_audioStreamIdx;
+    std::atomic<int> m_videoStreamIdx;
+    std::atomic<int> m_audioStreamIdx;
     
     AVCodecParameters* m_videoCodecParams;
     AVCodecParameters* m_audioCodecParams;

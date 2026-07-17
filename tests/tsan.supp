@@ -1,0 +1,26 @@
+# ThreadSanitizer suppressions for external libraries
+
+# Suppress data races from external PulseAudio client libraries
+# NOTE: "libpulse" alone is a substring of "libpulsecommon-16.1.so" as well as
+# "libpulse.so.0", so TSan reports it as ambiguously matching both libraries
+# and aborts at startup ("called_from_lib suppression 'libpulse' is matched
+# against 2 libraries"). Use "libpulse.so" so it only matches the actual
+# libpulse shared object and not libpulsecommon.
+called_from_lib:libpulsecommon
+called_from_lib:libpulse.so
+race:pa_mutex_lock
+race:PULSEAUDIO_Init
+
+# SDL3's PulseAudio backend has a startup-time race: the PulseAudio sink-
+# enumeration callback (invoked on PulseAudio's own mainloop thread) reads
+# SDL's current_audio global via SDL_GetCurrentAudioDriver_REAL while
+# SDL_InitAudio on the calling thread is still writing it. This is internal
+# to the fetched SDL3 dependency, not application code.
+race:SDL_InitAudio
+race:SDL_GetCurrentAudioDriver_REAL
+# Suppress data races from uninstrumented FFmpeg libraries (libavcodec, libavformat, etc.)
+called_from_lib:libavcodec
+called_from_lib:libavformat
+called_from_lib:libavutil
+called_from_lib:libswscale
+called_from_lib:libswresample
