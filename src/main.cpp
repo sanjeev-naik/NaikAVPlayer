@@ -86,8 +86,9 @@ std::string openNativeFileDialog(SDL_Window *window) {
   return "";
 }
 
-static SDL_Colorspace getSDLColorspace(const AVFrame* frame) {
-  if (!frame) return SDL_COLORSPACE_UNKNOWN;
+static SDL_Colorspace getSDLColorspace(const AVFrame *frame) {
+  if (!frame)
+    return SDL_COLORSPACE_UNKNOWN;
 
   AVColorSpace spc = frame->colorspace;
   AVColorRange rng = frame->color_range;
@@ -109,18 +110,27 @@ static SDL_Colorspace getSDLColorspace(const AVFrame* frame) {
     } else {
       return SDL_COLORSPACE_BT2020_LIMITED;
     }
-  } else if (spc == AVCOL_SPC_BT470BG || spc == AVCOL_SPC_SMPTE170M || spc == AVCOL_SPC_SMPTE240M) {
+  } else if (spc == AVCOL_SPC_BT470BG || spc == AVCOL_SPC_SMPTE170M ||
+             spc == AVCOL_SPC_SMPTE240M) {
     if (rng == AVCOL_RANGE_JPEG) {
       return SDL_COLORSPACE_BT601_FULL;
     } else {
       return SDL_COLORSPACE_BT601_LIMITED;
     }
   } else {
-    // Default/fallback
-    if (rng == AVCOL_RANGE_JPEG) {
-      return SDL_COLORSPACE_BT601_FULL;
+    // Default/fallback: BT.709 for HD (>= 720p), BT.601 for SD
+    if (frame->width >= 1280 || frame->height >= 720) {
+      if (rng == AVCOL_RANGE_JPEG) {
+        return SDL_COLORSPACE_BT709_FULL;
+      } else {
+        return SDL_COLORSPACE_BT709_LIMITED;
+      }
     } else {
-      return SDL_COLORSPACE_BT601_LIMITED;
+      if (rng == AVCOL_RANGE_JPEG) {
+        return SDL_COLORSPACE_BT601_FULL;
+      } else {
+        return SDL_COLORSPACE_BT601_LIMITED;
+      }
     }
   }
 }
@@ -366,7 +376,8 @@ int main(int argc, char *argv[]) {
 
         SDL_Colorspace colorspace = getSDLColorspace(currentFrame.frame);
 
-        // Re-create video display texture if dimensions, pixel format, or colorspace changed
+        // Re-create video display texture if dimensions, pixel format, or
+        // colorspace changed
         if (!videoTexture || texWidth != currentFrame.width ||
             texHeight != currentFrame.height || texFormat != targetFormat ||
             texColorspace != colorspace) {
@@ -379,11 +390,16 @@ int main(int argc, char *argv[]) {
           texColorspace = colorspace;
 
           SDL_PropertiesID props = SDL_CreateProperties();
-          SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_FORMAT_NUMBER, texFormat);
-          SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_ACCESS_NUMBER, SDL_TEXTUREACCESS_STREAMING);
-          SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_WIDTH_NUMBER, texWidth);
-          SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_HEIGHT_NUMBER, texHeight);
-          SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_COLORSPACE_NUMBER, texColorspace);
+          SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_FORMAT_NUMBER,
+                                texFormat);
+          SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_ACCESS_NUMBER,
+                                SDL_TEXTUREACCESS_STREAMING);
+          SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_WIDTH_NUMBER,
+                                texWidth);
+          SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_HEIGHT_NUMBER,
+                                texHeight);
+          SDL_SetNumberProperty(
+              props, SDL_PROP_TEXTURE_CREATE_COLORSPACE_NUMBER, texColorspace);
           videoTexture = SDL_CreateTextureWithProperties(renderer, props);
           SDL_DestroyProperties(props);
 
