@@ -181,22 +181,6 @@ jobs:
           path: ubsan_report.xlsx
           if-no-files-found: warn
 
-      - name: Upload Linux Executable (Release)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: NaikAVPlayer-linux-release
-          path: build-linux/NaikAVPlayer
-          if-no-files-found: warn
-
-      - name: Upload Linux Executable (Debug - Sanitizers)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: NaikAVPlayer-linux-debug-sanitizers
-          path: build-sanitizers/NaikAVPlayer
-          if-no-files-found: warn
-
   cross-compile-windows:
     name: Windows Cross-Compilation (MinGW-w64 on Linux)
     runs-on: ubuntu-latest
@@ -244,11 +228,3 @@ jobs:
           ls -la build-windows/NaikAVPlayer.exe 2>/dev/null || echo "Windows Executable not found"
           echo "Files in workspace:"
           find . -maxdepth 3 -not -path '*/.*' -not -path './build*' -not -path './thirdparty*'
-
-      - name: Upload Windows Executable
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: NaikAVPlayer-windows-release
-          path: build-windows/NaikAVPlayer.exe
-          if-no-files-found: warn
