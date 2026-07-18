@@ -80,9 +80,15 @@ public:
 
     void init();
     
-    void toggleDiagnostics() { m_showDiagnostics = !m_showDiagnostics; }
+    void toggleDiagnostics() {
+        m_showDiagnostics = !m_showDiagnostics;
+        m_controller.getPipelineMetrics().setProfilingEnabled(m_showDiagnostics);
+    }
     bool isDiagnosticsVisible() const { return m_showDiagnostics; }
-    void setDiagnosticsVisible(bool visible) { m_showDiagnostics = visible; }
+    void setDiagnosticsVisible(bool visible) {
+        m_showDiagnostics = visible;
+        m_controller.getPipelineMetrics().setProfilingEnabled(visible);
+    }
     
     void registerVideoFrameRendered(double currentSystemTime);
     

@@ -167,7 +167,7 @@ public:
     size_t getVideoFrameQueueSize() const { return m_decodedFrameQueue.size(); }
     size_t getVideoFrameQueueCapacity() const { return m_decodedFrameQueue.capacity(); }
     size_t getAudioFrameQueueSize() const;
-    size_t getAudioFrameQueueCapacity() const { return 48000; } // target scale for visual (48k samples ~ 1 sec)
+    static size_t getAudioFrameQueueCapacity() { return 48000; } // target scale for visual (48k samples ~ 1 sec)
 
     // Timing setters/getters
     void setVideoRenderTimeUs(uint64_t us) { m_videoRenderTimeUs.store(us); }

@@ -568,12 +568,12 @@ void PlayerUI::drawTitleBar(int windowWidth, int windowHeight) {
   if (m_showDiagnostics) {
     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.53f, 0.90f, 0.80f));
     if (ImGui::Button("Hide Info", ImVec2(btnWidth, 28.0f))) {
-      m_showDiagnostics = false;
+      setDiagnosticsVisible(false);
     }
     ImGui::PopStyleColor();
   } else {
     if (ImGui::Button("Show Info", ImVec2(btnWidth, 28.0f))) {
-      m_showDiagnostics = true;
+      setDiagnosticsVisible(true);
     }
   }
 

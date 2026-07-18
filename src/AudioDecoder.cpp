@@ -223,7 +223,7 @@ void AudioDecoder::decodeAndResample() {
     struct TimeTracker {
         std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
         std::atomic<uint64_t>* tracker;
-        TimeTracker(std::atomic<uint64_t>* t) : tracker(t) {}
+        explicit TimeTracker(std::atomic<uint64_t>* t) : tracker(t) {}
         ~TimeTracker() {
             if (tracker) {
                 auto end = std::chrono::steady_clock::now();

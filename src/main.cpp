@@ -229,6 +229,7 @@ int main(int argc, char *argv[]) {
 
   if (metricsEnabled) {
     controller.getPipelineMetrics().setProfilingEnabled(true);
+    playerUI.setDiagnosticsVisible(true);
   }
 
   if (!mediaPath.empty()) {

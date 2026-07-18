@@ -44,16 +44,16 @@ NaikAVPlayer follows the classic multi-threaded media player design: a demuxer t
 │             ├────────────►│  Video Queue     │──► Video      │ Decoded Frame      │──► Main/Render Loop
 │   Demuxer   │             │ (AVPacket* [100])│    Decoder    │ Queue              │    (SDL YUV Texture)
 │  (thread)   │             └──────────────────┘    (thread)   │ (DecodedFrame [8]) │
-│             │                                                └────────────────────┘
-│             │   packets   ┌──────────────────┐
-│             ├────────────►│  Audio Queue     │──► AudioDecoder (decoded on-demand)
-└─────────────┘             │ (AVPacket* [150])│    (SDL callback thread)
-                            └──────────────────┘
+│             │                                                └─────────┬──────────┘
+│             │   packets   ┌──────────────────┐                         │
+│             ├────────────►│  Audio Queue     │──► AudioDecoder         │ A/V Sync
+│             │             │ (AVPacket* [150])│    (SDL3 Audio Stream   │ (Master Clock)
+└─────────────┘             └──────────────────┘     callback thread)◄───┘
 ```
 
 - **Demuxer thread**: Reads raw packets via `av_read_frame` and routes them into bounded `ThreadSafeQueue<AVPacket*>` instances (video capacity: 100 packets, audio capacity: 150 packets).
 - **Video decoder thread**: Dedicated background thread that pops packets from the video queue, decodes them (via hardware or software fallback), converts the frames, and pushes them into the bounded `m_decodedFrameQueue` (capacity: 8 frames).
-- **Audio decoding**: Run sample-accurately inside the SDL audio callback thread. It pulls packets from the audio queue, decodes them to PCM, and feeds the output buffer.
+- **Audio decoding**: Run sample-accurately inside the SDL3 Audio Stream callback thread. It pulls packets from the audio queue, decodes them to PCM, and feeds the output stream buffer.
 - **Main / Render thread**: Peeks and pops decoded frames from `m_decodedFrameQueue` whose PTS is less than or equal to the current master clock time, updates the SDL YUV texture on the GPU, and renders the UI.
 - The bounded queues use two condition variables (`m_cond_push`/`m_cond_pop`) so a full queue naturally stalls the producer (applying backpressure) without CPU spinning, and `abort()` cleanly wakes every blocked thread for shutdown.
 
@@ -131,7 +131,17 @@ The engine tracks 9 distinct performance metrics:
 
 ### Architecture & Gating
 - **MetricRing**: A header-only, cacheline-aligned (`alignas(64)`) lock-free SPSC (Single Producer Single Consumer) ring buffer of `std::atomic<float>` elements. Memory order relaxed is used for data elements, and acquire/release semantics coordinate head updates.
-- **Profiling Activation**: Gated time-series metrics (`M4`, `M5`, `M6`, `M7`, `M9`) are disabled by default. Launching the application with the `--metrics` command line flag parses and enables profiling (`setProfilingEnabled(true)`). Gauge metrics (`M1`-`M3`) and frames dropped counters (`M8`) operate always-on without branching gating overhead.
+- **Profiling Gating & CLI Option**: Gated time-series profiling metrics (`M4`, `M5`, `M6`, `M7`, `M9`) are disabled by default to eliminate profiling branch overhead on the hot path. Profiling can be activated in two ways:
+  - **At Launch:** Start the application with the `--metrics` command-line flag. This enables time-series collection (`setProfilingEnabled(true)`) and automatically displays the **Diagnostics HUD** on startup.
+  - **Dynamically at Runtime:** Press the **`D`** key or click the **"Show Info" / "Hide Info"** button located at the top-right corner of the player window. Toggling the HUD automatically starts/stops the background profiling in sync with the overlay visibility, ensuring real-time telemetry is instantly available while preserving CPU cycles when the HUD is closed.
+
+### Diagnostics HUD & Visualization
+When metrics/profiling is active, the Diagnostics HUD renders real-time telemetry:
+* **System Info & Metadata:** Shows player playback states (`PLAYING`, `PAUSED`, `ENDED`), source/playback resolutions, pixel formats, and indicates if hardware-accelerated decoding is active (green) or has dynamically fallen back to software decoding (yellow).
+* **Pipeline Queue Depths:** Renders real-time visual progress bars tracking packet and frame queues. Queue colors dynamically shift (Green/Yellow/Red) based on the buffer safety window (e.g., flagging packet starvation under 5 packets, or audio frame queue buffer under 50ms).
+* **Decode & Render Timings:** Displays time spent (in milliseconds) on Video Decode, Audio Decode, Video Render, Present/VSync, and Frame Pacing. Budgets are auto-computed relative to the stream's frame rate (e.g., a `1000 / FPS` ms frame-time budget) with progress bars warning in yellow (>50% budget) or red (>90% budget) if frames risk missing their presentation intervals.
+* **Rolling Sync Graph:** An animated, rolling visual graph that plots the precise millisecond drift/offset of video (cyan) and audio (magenta) clocks relative to the master sync reference. The graph dynamically auto-scales its Y-axis range based on actual drift values, providing visual feedback of low-latency A/V synchronization.
+* **FPS Gauges:** Shows the current GUI refresh rate (ImGui loop FPS) alongside the video decoder's actual playback frame rate.
 
 ---
 
@@ -300,6 +310,7 @@ NaikAVPlayer
 - **`Left Arrow`** ($\leftarrow$): Seek backward by 10 seconds.
 - **`Right Arrow`** ($\rightarrow$): Seek forward by 10 seconds.
 - **`L`**: Toggle Loop Mode on/off.
+- **`D`**: Toggle Diagnostics HUD and background metrics profiling.
 - **`Escape`**: Close and exit the player.
 
 ---

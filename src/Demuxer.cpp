@@ -221,10 +221,10 @@ void Demuxer::threadLoop() {
 
         int ret;
         if (m_profilingEnabled.load(std::memory_order_relaxed)) {
-            auto start = std::chrono::steady_clock::now();
+            auto startTime = std::chrono::steady_clock::now();
             ret = av_read_frame(m_formatCtx, packet);
             auto end = std::chrono::steady_clock::now();
-            float us = static_cast<float>(std::chrono::duration_cast<std::chrono::microseconds>(end - start).count());
+            float us = static_cast<float>(std::chrono::duration_cast<std::chrono::microseconds>(end - startTime).count());
             m_demuxTimeRing.record(us);
         } else {
             ret = av_read_frame(m_formatCtx, packet);
