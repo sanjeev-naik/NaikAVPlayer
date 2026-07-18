@@ -88,6 +88,10 @@ private:
     std::atomic<uint64_t> m_catchupEpoch;
     std::mutex m_catchupMutex;   // serializes catch-up begin/retarget/finish
 
+    std::atomic<ResolutionOption> m_resolutionOption;
+
+    void loadSettings();
+    void saveSettings();
     void videoThreadLoop();
     void instantSeek(double seconds);
     void finishCatchup(double resumePts);
@@ -137,4 +141,9 @@ public:
     bool isLoopEnabled() const { return m_loopEnabled; }
     bool hasSeeked() const { return m_seeked.load(); }
     void clearSeeked() { m_seeked.store(false); }
+
+    ResolutionOption getResolutionOption() const { return m_resolutionOption.load(); }
+    void setResolutionOption(ResolutionOption option);
+    int getPlaybackWidth() const;
+    int getPlaybackHeight() const;
 };

@@ -3,6 +3,7 @@
 #include <cmath>
 #include <iostream>
 #include <algorithm>
+#include <fstream>
 
 bool g_videoThreadEnabled = true;
 
@@ -30,7 +31,10 @@ PlayerController::PlayerController()
       m_catchupTarget(0.0),
       m_catchupPos(0.0),
       m_resumeAfterCatchup(false),
-      m_catchupEpoch(0) {}
+      m_catchupEpoch(0),
+      m_resolutionOption(ResolutionOption::ORIGINAL) {
+    loadSettings();
+}
 
 PlayerController::~PlayerController() {
     stop();
@@ -554,7 +558,7 @@ void PlayerController::videoThreadLoop() {
             if (m_videoDecoder && !m_seeking.load()) {
                 decoded = m_videoDecoder->decodeNextFrame();
                 if (decoded) {
-                    converted = m_videoDecoder->convertFrame();
+                    converted = m_videoDecoder->convertFrame(m_resolutionOption.load());
                     if (converted) {
                         srcFrame = m_videoDecoder->getYUVFrame();
                         if (srcFrame && srcFrame->data[0]) {
@@ -654,4 +658,49 @@ void PlayerController::finishCatchup(double resumePts) {
 
     std::cout << "Seek catch-up reached " << resumePts
               << "s, resuming real-time playback" << std::endl;
+}
+
+void PlayerController::loadSettings() {
+    m_resolutionOption.store(ResolutionOption::ORIGINAL);
+    std::ifstream f("player_settings.txt");
+    if (f.is_open()) {
+        int optVal = 0;
+        if (f >> optVal) {
+            if (optVal >= 0 && optVal < static_cast<int>(ResolutionOption::COUNT)) {
+                m_resolutionOption.store(static_cast<ResolutionOption>(optVal));
+                std::cout << "Loaded settings: ResolutionOption=" << optVal << std::endl;
+            }
+        }
+    }
+}
+
+void PlayerController::saveSettings() {
+    std::ofstream f("player_settings.txt");
+    if (f.is_open()) {
+        f << static_cast<int>(m_resolutionOption.load());
+        std::cout << "Saved settings: ResolutionOption=" << static_cast<int>(m_resolutionOption.load()) << std::endl;
+    }
+}
+
+void PlayerController::setResolutionOption(ResolutionOption option) {
+    m_resolutionOption.store(option);
+    saveSettings();
+}
+
+int PlayerController::getPlaybackWidth() const {
+    int nativeW = getVideoWidth();
+    int nativeH = getVideoHeight();
+    int targetW = nativeW;
+    int targetH = nativeH;
+    getTargetDimensions(m_resolutionOption.load(), nativeW, nativeH, targetW, targetH);
+    return targetW;
+}
+
+int PlayerController::getPlaybackHeight() const {
+    int nativeW = getVideoWidth();
+    int nativeH = getVideoHeight();
+    int targetW = nativeW;
+    int targetH = nativeH;
+    getTargetDimensions(m_resolutionOption.load(), nativeW, nativeH, targetW, targetH);
+    return targetH;
 }
