@@ -25,7 +25,7 @@ public:
 
     // Push an item. Blocks if the queue has reached max size.
     // Returns false if the queue was aborted.
-    bool push(T value) {
+    bool push(const T& value) {
         std::unique_lock<std::mutex> lock(m_mutex);
         m_cond_push.wait(lock, [this]() { 
             return m_queue.size() < m_maxSize || m_aborted; 

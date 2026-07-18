@@ -86,7 +86,7 @@ std::string openNativeFileDialog(SDL_Window *window) {
   return "";
 }
 
-static SDL_Colorspace getSDLColorspace(AVFrame* frame) {
+static SDL_Colorspace getSDLColorspace(const AVFrame* frame) {
   if (!frame) return SDL_COLORSPACE_UNKNOWN;
 
   AVColorSpace spc = frame->colorspace;
