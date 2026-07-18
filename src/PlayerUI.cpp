@@ -724,9 +724,43 @@ void PlayerUI::drawControlsBar(int windowWidth, int windowHeight) {
     ImGui::SetTooltip(loopEnabled ? "Loop: On" : "Loop: Off");
   }
 
-  // Right Group: Volume and Mute
+  // Right Group: Resolution, Volume and Mute
   float volumeGroupWidth = 144.0f;
-  ImGui::SameLine(barWidth - volumeGroupWidth - 20.0f);
+  float resolutionGroupWidth = 120.0f;
+  ImGui::SameLine(barWidth - volumeGroupWidth - resolutionGroupWidth - 28.0f);
+
+  // Resolution Dropdown
+  const char* resolutionNames[] = {
+      "Original",
+      "360p",
+      "480p",
+      "720p",
+      "1080p",
+      "1440p",
+      "4K"
+  };
+  ResolutionOption currentOpt = m_controller.getResolutionOption();
+  int currentItem = static_cast<int>(currentOpt);
+
+  ImGui::PushItemWidth(resolutionGroupWidth);
+  if (ImGui::BeginCombo("##resolution", resolutionNames[currentItem])) {
+      for (int i = 0; i < static_cast<int>(ResolutionOption::COUNT); i++) {
+          bool isSelected = (currentItem == i);
+          if (ImGui::Selectable(resolutionNames[i], isSelected)) {
+              m_controller.setResolutionOption(static_cast<ResolutionOption>(i));
+          }
+          if (isSelected) {
+              ImGui::SetItemDefaultFocus();
+          }
+      }
+      ImGui::EndCombo();
+  }
+  ImGui::PopItemWidth();
+  if (ImGui::IsItemHovered()) {
+      ImGui::SetTooltip("Select Output Playback Resolution");
+  }
+
+  ImGui::SameLine(0.0f, 8.0f);
 
   // Mute button
   if (m_isMuted) {
@@ -827,11 +861,17 @@ void PlayerUI::drawDiagnosticsHUD(int windowWidth, int windowHeight) {
   ImGui::Spacing();
 
   if (m_controller.hasVideo()) {
-    ImGui::Text("Resolution: ");
+    ImGui::Text("Native Res: ");
     ImGui::SameLine();
     ImGui::TextColored(ImVec4(0.95f, 0.95f, 0.95f, 1.00f), "%dx%d",
                        m_controller.getVideoWidth(),
                        m_controller.getVideoHeight());
+    ImGui::Spacing();
+    ImGui::Text("Playback Res: ");
+    ImGui::SameLine();
+    ImGui::TextColored(ImVec4(0.95f, 0.95f, 0.95f, 1.00f), "%dx%d",
+                       m_controller.getPlaybackWidth(),
+                       m_controller.getPlaybackHeight());
     ImGui::Spacing();
     ImGui::Text("Pixel Format: ");
     ImGui::SameLine();

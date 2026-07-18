@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <algorithm>
 #include "ThreadSafeQueue.hpp"
 
 extern "C" {
@@ -8,6 +9,51 @@ extern "C" {
 #include <libswscale/swscale.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/pixdesc.h>
+}
+
+
+enum class ResolutionOption {
+    ORIGINAL = 0,
+    R_360P,   // 640x360
+    R_480P,   // 854x480
+    R_720P,   // 1280x720
+    R_1080P,  // 1920x1080
+    R_1440P,  // 2560x1440
+    R_4K,     // 3840x2160
+    COUNT
+};
+
+inline void getTargetDimensions(ResolutionOption option, int nativeW, int nativeH, int& targetW, int& targetH) {
+    if (option == ResolutionOption::ORIGINAL || nativeW <= 0 || nativeH <= 0) {
+        targetW = nativeW;
+        targetH = nativeH;
+        return;
+    }
+    
+    int boxW = 0;
+    int boxH = 0;
+    switch (option) {
+        case ResolutionOption::R_360P:  boxW = 640;  boxH = 360;  break;
+        case ResolutionOption::R_480P:  boxW = 854;  boxH = 480;  break;
+        case ResolutionOption::R_720P:  boxW = 1280; boxH = 720;  break;
+        case ResolutionOption::R_1080P: boxW = 1920; boxH = 1080; break;
+        case ResolutionOption::R_1440P: boxW = 2560; boxH = 1440; break;
+        case ResolutionOption::R_4K:    boxW = 3840; boxH = 2160; break;
+        default:
+            targetW = nativeW;
+            targetH = nativeH;
+            return;
+    }
+    
+    double scale = std::min(static_cast<double>(boxW) / nativeW, static_cast<double>(boxH) / nativeH);
+    targetW = static_cast<int>(nativeW * scale);
+    targetH = static_cast<int>(nativeH * scale);
+    
+    // YUV formats require width and height to be even
+    targetW = (targetW / 2) * 2;
+    targetH = (targetH / 2) * 2;
+    if (targetW < 2) targetW = 2;
+    if (targetH < 2) targetH = 2;
 }
 
 class VideoDecoder {
@@ -55,7 +101,7 @@ public:
     bool decodeNextFrame();
     
     void flush();
-    bool convertFrame();
+    bool convertFrame(ResolutionOption option = ResolutionOption::ORIGINAL);
 
     // Getters
     AVFrame* getYUVFrame() const { return m_yuvFrame; }

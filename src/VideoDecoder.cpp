@@ -326,7 +326,7 @@ bool VideoDecoder::decodeNextFrame() {
   }
 }
 
-bool VideoDecoder::convertFrame() {
+bool VideoDecoder::convertFrame(ResolutionOption option) {
   if (!m_codecCtx || !m_decodedFrame || m_decodedFrame->width <= 0 ||
       m_decodedFrame->height <= 0) {
     return false;
@@ -358,7 +358,17 @@ bool VideoDecoder::convertFrame() {
     srcFrame = tempCpuFrame;
   }
 
-  bool useNative = (srcFrame->format == AV_PIX_FMT_YUV420P ||
+  // Calculate the aspect-ratio preserved target dimensions
+  int nativeW = srcFrame->width;
+  int nativeH = srcFrame->height;
+  int targetW = nativeW;
+  int targetH = nativeH;
+  getTargetDimensions(option, nativeW, nativeH, targetW, targetH);
+
+  bool isTargetOriginal = (targetW == nativeW && targetH == nativeH);
+
+  bool useNative = isTargetOriginal &&
+                   (srcFrame->format == AV_PIX_FMT_YUV420P ||
                     srcFrame->format == AV_PIX_FMT_YUVJ420P ||
                     srcFrame->format == AV_PIX_FMT_NV12 ||
                     srcFrame->format == AV_PIX_FMT_NV21);
@@ -400,17 +410,15 @@ bool VideoDecoder::convertFrame() {
     return true;
   }
 
-  // Fallback path: use sws_scale to convert to YUV420P
-  // Check if the source frame's dimensions or format changed dynamically
+  // Fallback / scaling path: use sws_scale to convert and resize to YUV420P
+  // Check if the source frame's dimensions/format changed, or if output target size changed
   if (srcFrame->width != m_allocatedWidth ||
       srcFrame->height != m_allocatedHeight ||
-      srcFrame->format != m_allocatedFormat) {
-
-    std::cout << "Dynamic resolution or format change detected in fallback: "
-              << m_allocatedWidth << "x" << m_allocatedHeight << " (fmt "
-              << m_allocatedFormat << ") -> " << srcFrame->width << "x"
-              << srcFrame->height << " (fmt " << srcFrame->format << ")"
-              << std::endl;
+      srcFrame->format != m_allocatedFormat ||
+      m_yuvFrame->width != targetW ||
+      m_yuvFrame->height != targetH ||
+      m_yuvFrame->data[0] != m_yuvBuffer ||
+      m_yuvFrame->format != AV_PIX_FMT_YUV420P) {
 
     // Free old scaling context
     if (m_swsCtx) {
@@ -418,9 +426,10 @@ bool VideoDecoder::convertFrame() {
       m_swsCtx = nullptr;
     }
 
-    // Only recreate YUV buffer if dimensions actually changed
-    if (srcFrame->width != m_allocatedWidth ||
-        srcFrame->height != m_allocatedHeight) {
+    // Reallocate YUV buffer if target dimensions or buffer location changed
+    if (m_yuvFrame->width != targetW ||
+        m_yuvFrame->height != targetH ||
+        m_yuvFrame->data[0] != m_yuvBuffer) {
       if (m_yuvBuffer) {
         av_free(m_yuvBuffer);
         m_yuvBuffer = nullptr;
@@ -428,7 +437,7 @@ bool VideoDecoder::convertFrame() {
 
       // Reallocate YUV buffer for the new dimensions
       m_yuvBufferSize = av_image_get_buffer_size(
-          AV_PIX_FMT_YUV420P, srcFrame->width, srcFrame->height, 1);
+          AV_PIX_FMT_YUV420P, targetW, targetH, 1);
       m_yuvBuffer = static_cast<uint8_t *>(av_malloc(m_yuvBufferSize));
       if (!m_yuvBuffer) {
         std::cerr
@@ -439,22 +448,27 @@ bool VideoDecoder::convertFrame() {
         }
         return false;
       }
+    }
 
-      // Associate the new buffer with the YUV frame
-      int ret = av_image_fill_arrays(m_yuvFrame->data, m_yuvFrame->linesize,
-                                     m_yuvBuffer, AV_PIX_FMT_YUV420P,
-                                     srcFrame->width, srcFrame->height, 1);
-      if (ret < 0) {
-        std::cerr
-            << "Error: Could not associate YUV buffer on resolution change"
-            << std::endl;
-        av_free(m_yuvBuffer);
-        m_yuvBuffer = nullptr;
-        if (tempCpuFrame) {
-          av_frame_free(&tempCpuFrame);
-        }
-        return false;
+    av_frame_unref(m_yuvFrame);
+    m_yuvFrame->format = AV_PIX_FMT_YUV420P;
+    m_yuvFrame->width = targetW;
+    m_yuvFrame->height = targetH;
+
+    // Associate the new buffer with the YUV frame
+    int ret = av_image_fill_arrays(m_yuvFrame->data, m_yuvFrame->linesize,
+                                   m_yuvBuffer, AV_PIX_FMT_YUV420P,
+                                   targetW, targetH, 1);
+    if (ret < 0) {
+      std::cerr
+          << "Error: Could not associate YUV buffer on resolution change"
+          << std::endl;
+      av_free(m_yuvBuffer);
+      m_yuvBuffer = nullptr;
+      if (tempCpuFrame) {
+        av_frame_free(&tempCpuFrame);
       }
+      return false;
     }
 
     m_allocatedWidth = srcFrame->width;
@@ -463,14 +477,15 @@ bool VideoDecoder::convertFrame() {
   }
 
   if (!m_swsCtx) {
+    // SWS_BICUBIC for high quality scaling
     m_swsCtx =
-        sws_getContext(m_allocatedWidth, m_allocatedHeight,
+        sws_getContext(srcFrame->width, srcFrame->height,
                        static_cast<AVPixelFormat>(srcFrame->format),
-                       m_allocatedWidth, m_allocatedHeight, AV_PIX_FMT_YUV420P,
-                       SWS_BILINEAR, nullptr, nullptr, nullptr);
+                       targetW, targetH, AV_PIX_FMT_YUV420P,
+                       SWS_BICUBIC, nullptr, nullptr, nullptr);
     if (!m_swsCtx) {
       std::cerr
-          << "Error: Could not allocate scaling context on resolution change"
+          << "Error: Could not allocate scaling context"
           << std::endl;
       if (tempCpuFrame) {
         av_frame_free(&tempCpuFrame);
@@ -479,21 +494,15 @@ bool VideoDecoder::convertFrame() {
     }
   }
 
-  // Ensure m_yuvFrame points to our allocated m_yuvBuffer and is set to
-  // AV_PIX_FMT_YUV420P
-  if (m_yuvFrame->data[0] != m_yuvBuffer ||
-      m_yuvFrame->format != AV_PIX_FMT_YUV420P) {
-    av_frame_unref(m_yuvFrame);
-    m_yuvFrame->format = AV_PIX_FMT_YUV420P;
-    m_yuvFrame->width = m_allocatedWidth;
-    m_yuvFrame->height = m_allocatedHeight;
-    av_image_fill_arrays(m_yuvFrame->data, m_yuvFrame->linesize, m_yuvBuffer,
-                         AV_PIX_FMT_YUV420P, m_allocatedWidth,
-                         m_allocatedHeight, 1);
-  }
+  // Preserve colorspace properties on the output frame
+  m_yuvFrame->color_range = srcFrame->color_range;
+  m_yuvFrame->colorspace = srcFrame->colorspace;
+  m_yuvFrame->color_primaries = srcFrame->color_primaries;
+  m_yuvFrame->color_trc = srcFrame->color_trc;
 
-  sws_scale(m_swsCtx, srcFrame->data, srcFrame->linesize, 0, m_allocatedHeight,
+  sws_scale(m_swsCtx, srcFrame->data, srcFrame->linesize, 0, srcFrame->height,
             m_yuvFrame->data, m_yuvFrame->linesize);
+
   if (tempCpuFrame) {
     av_frame_free(&tempCpuFrame);
   }

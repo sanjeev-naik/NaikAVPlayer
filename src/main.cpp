@@ -86,6 +86,45 @@ std::string openNativeFileDialog(SDL_Window *window) {
   return "";
 }
 
+static SDL_Colorspace getSDLColorspace(AVFrame* frame) {
+  if (!frame) return SDL_COLORSPACE_UNKNOWN;
+
+  AVColorSpace spc = frame->colorspace;
+  AVColorRange rng = frame->color_range;
+
+  // YUVJ420P is legacy and always full range
+  if (frame->format == AV_PIX_FMT_YUVJ420P) {
+    rng = AVCOL_RANGE_JPEG;
+  }
+
+  if (spc == AVCOL_SPC_BT709) {
+    if (rng == AVCOL_RANGE_JPEG) {
+      return SDL_COLORSPACE_BT709_FULL;
+    } else {
+      return SDL_COLORSPACE_BT709_LIMITED;
+    }
+  } else if (spc == AVCOL_SPC_BT2020_NCL || spc == AVCOL_SPC_BT2020_CL) {
+    if (rng == AVCOL_RANGE_JPEG) {
+      return SDL_COLORSPACE_BT2020_FULL;
+    } else {
+      return SDL_COLORSPACE_BT2020_LIMITED;
+    }
+  } else if (spc == AVCOL_SPC_BT470BG || spc == AVCOL_SPC_SMPTE170M || spc == AVCOL_SPC_SMPTE240M) {
+    if (rng == AVCOL_RANGE_JPEG) {
+      return SDL_COLORSPACE_BT601_FULL;
+    } else {
+      return SDL_COLORSPACE_BT601_LIMITED;
+    }
+  } else {
+    // Default/fallback
+    if (rng == AVCOL_RANGE_JPEG) {
+      return SDL_COLORSPACE_BT601_FULL;
+    } else {
+      return SDL_COLORSPACE_BT601_LIMITED;
+    }
+  }
+}
+
 int main(int argc, char *argv[]) {
   SDL_SetMainReady();
 
@@ -179,6 +218,7 @@ int main(int argc, char *argv[]) {
   int texWidth = 0;
   int texHeight = 0;
   SDL_PixelFormat texFormat = SDL_PIXELFORMAT_UNKNOWN;
+  SDL_Colorspace texColorspace = SDL_COLORSPACE_UNKNOWN;
   DecodedFrame currentFrame;
 
   bool quit = false;
@@ -324,18 +364,29 @@ int main(int argc, char *argv[]) {
           targetFormat = SDL_PIXELFORMAT_NV21;
         }
 
-        // Re-create video display texture if dimensions or pixel format changed
+        SDL_Colorspace colorspace = getSDLColorspace(currentFrame.frame);
+
+        // Re-create video display texture if dimensions, pixel format, or colorspace changed
         if (!videoTexture || texWidth != currentFrame.width ||
-            texHeight != currentFrame.height || texFormat != targetFormat) {
+            texHeight != currentFrame.height || texFormat != targetFormat ||
+            texColorspace != colorspace) {
           if (videoTexture) {
             SDL_DestroyTexture(videoTexture);
           }
           texWidth = currentFrame.width;
           texHeight = currentFrame.height;
           texFormat = targetFormat;
-          videoTexture = SDL_CreateTexture(renderer, texFormat,
-                                           SDL_TEXTUREACCESS_STREAMING,
-                                           texWidth, texHeight);
+          texColorspace = colorspace;
+
+          SDL_PropertiesID props = SDL_CreateProperties();
+          SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_FORMAT_NUMBER, texFormat);
+          SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_ACCESS_NUMBER, SDL_TEXTUREACCESS_STREAMING);
+          SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_WIDTH_NUMBER, texWidth);
+          SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_HEIGHT_NUMBER, texHeight);
+          SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_COLORSPACE_NUMBER, texColorspace);
+          videoTexture = SDL_CreateTextureWithProperties(renderer, props);
+          SDL_DestroyProperties(props);
+
           if (videoTexture) {
             SDL_SetTextureScaleMode(videoTexture, SDL_SCALEMODE_LINEAR);
           }
@@ -367,6 +418,7 @@ int main(int argc, char *argv[]) {
         texWidth = 0;
         texHeight = 0;
         texFormat = SDL_PIXELFORMAT_UNKNOWN;
+        texColorspace = SDL_COLORSPACE_UNKNOWN;
       }
       if (currentFrame.frame) {
         av_frame_free(&currentFrame.frame);
