@@ -75,10 +75,14 @@ def generate_excel_report(output_file):
     except ImportError:
         has_openpyxl = False
 
+    search_dir = "."
+    if len(sys.argv) > 2:
+        search_dir = sys.argv[2]
+
     # Find all Test.xml files recursively
-    xml_files = glob.glob("**/Testing/*/Test.xml", recursive=True)
+    xml_files = glob.glob(os.path.join(search_dir, "**/Testing/*/Test.xml"), recursive=True)
     if not xml_files:
-        print("No CTest Test.xml files found in the workspace.")
+        print(f"No CTest Test.xml files found in the search path: {search_dir}")
         return False
 
     if has_openpyxl:

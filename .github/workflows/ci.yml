@@ -64,7 +64,9 @@ jobs:
             --inline-suppr \
             --std=c++17 \
             --error-exitcode=1 \
-            src/ tests/
+            --xml \
+            --xml-version=2 \
+            src/ tests/ 2> cppcheck_report.xml
 
       - name: Configure CMake with Sanitizers (ASan/UBSan)
         env:
@@ -114,12 +116,86 @@ jobs:
         run: |
           python3 tests/generate_xls_report.py test_report.xlsx
 
+      - name: Generate Cppcheck XLS Report
+        if: always()
+        run: |
+          if [ -f "cppcheck_report.xml" ]; then
+            python3 tests/generate_cppcheck_report.py cppcheck_report.xml cppcheck_report.xlsx
+          else
+            echo "::warning:: Cppcheck XML report was not found. Excel report will not be generated."
+          fi
+
+      - name: Generate ASan & UBSan XLS Reports
+        if: always()
+        run: |
+          if [ -d "build-sanitizers" ]; then
+            python3 tests/generate_xls_report.py asan_report.xlsx build-sanitizers
+            python3 tests/generate_xls_report.py ubsan_report.xlsx build-sanitizers
+          else
+            echo "::warning:: build-sanitizers directory not found. ASan & UBSan reports will not be generated."
+          fi
+
+      - name: Diagnostic Logging
+        if: always()
+        run: |
+          echo "=== Diagnostic Log ==="
+          echo "Current working directory: $(pwd)"
+          echo "Generated report locations:"
+          ls -la *.xlsx 2>/dev/null || echo "No .xlsx reports found in root"
+          echo "Executable output locations:"
+          ls -la build-linux/NaikAVPlayer 2>/dev/null || echo "Linux Release Executable not found"
+          ls -la build-sanitizers/NaikAVPlayer 2>/dev/null || echo "Linux Sanitizers Executable not found"
+          ls -la build-tsan/NaikAVPlayer 2>/dev/null || echo "Linux TSan Executable not found"
+          echo "Files in workspace:"
+          find . -maxdepth 3 -not -path '*/.*' -not -path './build*' -not -path './thirdparty*'
+
       - name: Upload Test Report Artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: test-execution-report
           path: test_report.xlsx
+          if-no-files-found: warn
+
+      - name: Upload Cppcheck Report Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cppcheck-report
+          path: cppcheck_report.xlsx
+          if-no-files-found: warn
+
+      - name: Upload ASan Report Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: asan-report
+          path: asan_report.xlsx
+          if-no-files-found: warn
+
+      - name: Upload UBSan Report Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ubsan-report
+          path: ubsan_report.xlsx
+          if-no-files-found: warn
+
+      - name: Upload Linux Executable (Release)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: NaikAVPlayer-linux-release
+          path: build-linux/NaikAVPlayer
+          if-no-files-found: warn
+
+      - name: Upload Linux Executable (Debug - Sanitizers)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: NaikAVPlayer-linux-debug-sanitizers
+          path: build-sanitizers/NaikAVPlayer
+          if-no-files-found: warn
 
   cross-compile-windows:
     name: Windows Cross-Compilation (MinGW-w64 on Linux)
@@ -158,3 +234,21 @@ jobs:
       - name: Build (Cross-Compile for Windows)
         run: |
           cmake --build build-windows --config Release -j$(nproc)
+
+      - name: Diagnostic Logging
+        if: always()
+        run: |
+          echo "=== Diagnostic Log ==="
+          echo "Current working directory: $(pwd)"
+          echo "Executable output locations:"
+          ls -la build-windows/NaikAVPlayer.exe 2>/dev/null || echo "Windows Executable not found"
+          echo "Files in workspace:"
+          find . -maxdepth 3 -not -path '*/.*' -not -path './build*' -not -path './thirdparty*'
+
+      - name: Upload Windows Executable
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: NaikAVPlayer-windows-release
+          path: build-windows/NaikAVPlayer.exe
+          if-no-files-found: warn
