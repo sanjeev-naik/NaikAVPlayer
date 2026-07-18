@@ -215,7 +215,7 @@ bool VideoDecoder::init() {
 
 void VideoDecoder::flush() {
   m_flushRequested = true;
-  m_currentFramePts = 0.0;
+  m_currentFramePts.store(0.0, std::memory_order_relaxed);
   m_seeking = true;
   m_hasDecodeStart = false;
 }
@@ -254,7 +254,7 @@ bool VideoDecoder::decodeNextFrame() {
       avcodec_flush_buffers(m_codecCtx);
     }
     m_flushRequested = false;
-    m_currentFramePts = 0.0;
+    m_currentFramePts.store(0.0, std::memory_order_relaxed);
     // A freshly flushed decoder legitimately needs several packets before it
     // produces a frame again; don't let that look like a stuck hardware
     // decoder and trigger a needless software fallback after a seek.
@@ -279,11 +279,11 @@ bool VideoDecoder::decodeNextFrame() {
       // Compute the Presentation Timestamp (PTS) in seconds relative to the
       // start of the stream
       if (m_decodedFrame->pts != AV_NOPTS_VALUE) {
-        m_currentFramePts =
-            (m_decodedFrame->pts - m_startTime) * av_q2d(m_timeBase);
+        m_currentFramePts.store(
+            (m_decodedFrame->pts - m_startTime) * av_q2d(m_timeBase), std::memory_order_relaxed);
       } else if (m_decodedFrame->pkt_dts != AV_NOPTS_VALUE) {
-        m_currentFramePts =
-            (m_decodedFrame->pkt_dts - m_startTime) * av_q2d(m_timeBase);
+        m_currentFramePts.store(
+            (m_decodedFrame->pkt_dts - m_startTime) * av_q2d(m_timeBase), std::memory_order_relaxed);
       }
       return true;
     }

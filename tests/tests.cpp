@@ -291,12 +291,22 @@ void drive_playback(PlayerController& controller, double seconds) {
     auto startTime = std::chrono::steady_clock::now();
     while (std::chrono::steady_clock::now() - startTime < std::chrono::duration<double>(seconds)) {
         if (controller.hasVideo()) {
-            double timeNow = controller.getCurrentTime();
-            VideoDecoder* decoder = controller.getVideoDecoder();
-            int drops = 0;
-            while (decoder->getCurrentFramePts() < timeNow - 0.010 && drops < 8) {
-                if (!decoder->decodeNextFrame()) break;
-                drops++;
+            if (!controller.m_videoThreadRunning.load()) {
+                double timeNow = controller.getCurrentTime();
+                VideoDecoder* decoder = controller.getVideoDecoder();
+                int drops = 0;
+                while (decoder->getCurrentFramePts() < timeNow - 0.010 && drops < 8) {
+                    if (!decoder->decodeNextFrame()) break;
+                    drops++;
+                }
+            } else {
+                // Background thread is running; pop and discard frames to prevent queue stalling
+                DecodedFrame df;
+                while (controller.m_decodedFrameQueue.try_pop(df)) {
+                    if (df.frame) {
+                        av_frame_free(&df.frame);
+                    }
+                }
             }
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(10));

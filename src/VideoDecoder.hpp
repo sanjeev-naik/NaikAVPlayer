@@ -76,7 +76,7 @@ private:
     int m_allocatedHeight;
     AVPixelFormat m_allocatedFormat;
 
-    double m_currentFramePts;
+    std::atomic<double> m_currentFramePts;
     std::atomic<bool> m_flushRequested;
     bool m_startTimeSaved;
     std::atomic<bool> m_seeking;
@@ -120,7 +120,7 @@ public:
 
     // Getters
     AVFrame* getYUVFrame() const { return m_yuvFrame; }
-    double getCurrentFramePts() const { return m_currentFramePts; }
+    double getCurrentFramePts() const { return m_currentFramePts.load(std::memory_order_relaxed); }
     int getWidth() const { return m_codecCtx ? m_codecCtx->width : 0; }
     int getHeight() const { return m_codecCtx ? m_codecCtx->height : 0; }
     bool isSeeking() const { return m_seeking.load(); }
