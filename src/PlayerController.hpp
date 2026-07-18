@@ -10,6 +10,8 @@
 #include "Demuxer.hpp"
 #include "AudioDecoder.hpp"
 #include "VideoDecoder.hpp"
+#include "PipelineMetrics.hpp"
+#include <chrono>
 
 extern "C" {
 #include <libavutil/frame.h>
@@ -87,6 +89,9 @@ private:
     // never displayed or matched against the catch-up target.
     std::atomic<uint64_t> m_catchupEpoch;
     std::mutex m_catchupMutex;   // serializes catch-up begin/retarget/finish
+    std::unique_ptr<PipelineMetrics> m_metrics;
+    std::chrono::steady_clock::time_point m_seekStartTime;
+    uint64_t m_seekStartEpoch = 0;
 
     std::atomic<ResolutionOption> m_resolutionOption;
 
@@ -97,6 +102,13 @@ private:
     void finishCatchup(double resumePts);
 
     double getSystemTimeInSeconds() const;
+    
+    // Timing instrumentation (in microseconds)
+    std::atomic<uint64_t> m_videoDecodeTimeUs{0};
+    std::atomic<uint64_t> m_audioDecodeTimeUs{0};
+    std::atomic<uint64_t> m_videoRenderTimeUs{0};
+    std::atomic<uint64_t> m_presentTimeUs{0};
+    std::atomic<uint64_t> m_framePacingUs{0};
 
 public:
     PlayerController();
@@ -146,4 +158,28 @@ public:
     void setResolutionOption(ResolutionOption option);
     int getPlaybackWidth() const;
     int getPlaybackHeight() const;
+
+    // Queue depths
+    size_t getVideoPacketQueueSize() const { return m_videoQueue.size(); }
+    size_t getVideoPacketQueueCapacity() const { return m_videoQueue.capacity(); }
+    size_t getAudioPacketQueueSize() const { return m_audioQueue.size(); }
+    size_t getAudioPacketQueueCapacity() const { return m_audioQueue.capacity(); }
+    size_t getVideoFrameQueueSize() const { return m_decodedFrameQueue.size(); }
+    size_t getVideoFrameQueueCapacity() const { return m_decodedFrameQueue.capacity(); }
+    size_t getAudioFrameQueueSize() const;
+    size_t getAudioFrameQueueCapacity() const { return 48000; } // target scale for visual (48k samples ~ 1 sec)
+
+    // Timing setters/getters
+    void setVideoRenderTimeUs(uint64_t us) { m_videoRenderTimeUs.store(us); }
+    void setPresentTimeUs(uint64_t us) { m_presentTimeUs.store(us); }
+    void setFramePacingUs(uint64_t us) { m_framePacingUs.store(us); }
+
+    double getVideoDecodeTimeMs() const { return m_videoDecodeTimeUs.load() / 1000.0; }
+    double getAudioDecodeTimeMs() const { return m_audioDecodeTimeUs.load() / 1000.0; }
+    double getVideoRenderTimeMs() const { return m_videoRenderTimeUs.load() / 1000.0; }
+    double getPresentTimeMs() const { return m_presentTimeUs.load() / 1000.0; }
+    double getFramePacingMs() const { return m_framePacingUs.load() / 1000.0; }
+
+    PipelineMetrics& getPipelineMetrics() { return *m_metrics; }
+    const PipelineMetrics& getPipelineMetrics() const { return *m_metrics; }
 };

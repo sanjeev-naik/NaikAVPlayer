@@ -106,21 +106,14 @@ You can launch the app from your desktop launcher or run:
 NaikAVPlayer
 ```
 
-Or pass a media file path directly as an argument:
-
-**Windows:**
+**Windows (with metrics):**
 ```powershell
-.\build\NaikAVPlayer.exe "C:\Path\To\video.mp4"
+.\build\NaikAVPlayer.exe --metrics "C:\Path\To\video.mp4"
 ```
 
-**Linux (Local Build):**
+**Linux (with metrics):**
 ```bash
-./build/NaikAVPlayer "/home/user/Videos/video.mp4"
-```
-
-**Linux (System-Wide Installed):**
-```bash
-NaikAVPlayer "/home/user/Videos/video.mp4"
+./build/NaikAVPlayer --metrics "/home/user/Videos/video.mp4"
 ```
 
 ---
@@ -176,3 +169,36 @@ The project includes an automated GitHub Actions pipeline (configured in [.githu
 - **Static Analysis**: Performs static analysis checks on all source and test C++ files using `cppcheck`.
 - **Windows Cross-Compilation**: Cross-compiles Windows executables on the Linux runner using the MinGW-w64 GCC cross-compiler (`x86_64-w64-mingw32-gcc`/`g++`).
 - **Compiler Caching (`ccache`)**: Speeds up verification times by caching compiled object units globally on GitHub Actions. It bypasses recompiling large upstream dependencies like SDL3 and Dear ImGui, cutting down build times significantly.
+
+---
+
+## 8. Pipeline Instrumentation & Metrics Summary
+
+This section documents the hook sites, thread ownership, and architectural details for the 9 implemented pipeline metrics.
+
+### Hook Sites & Thread Ownership
+
+| Metric ID | Metric Name | Hook Site (File:Function) | Producing Thread | Type | Gating |
+|---|---|---|---|---|---|
+| **M1** | `video_packet_queue_depth` | `ThreadSafeQueue.hpp:push/pop/try_pop/clear/reset` | Multiple (Demuxer & Video Decoder) | std::atomic<int> (Gauge) | Always-On |
+| **M2** | `audio_packet_queue_depth` | `ThreadSafeQueue.hpp:push/pop/try_pop/clear/reset` | Multiple (Demuxer & Audio Decoder callback) | std::atomic<int> (Gauge) | Always-On |
+| **M3** | `decoded_frame_queue_depth` | `ThreadSafeQueue.hpp:push/pop/try_pop/clear/reset` | Multiple (Video Decoder & Main Render) | std::atomic<int> (Gauge) | Always-On |
+| **M4** | `demux_time_per_packet_us` | `Demuxer.cpp:threadLoop()` | Demuxer thread | MetricRing<256> (SPSC) | gated |
+| **M5** | `decode_time_per_frame_us` | `VideoDecoder.cpp:decodeNextFrame()` | Video Decoder thread | MetricRing<256> (SPSC) | gated |
+| **M6-A** | `convert_time_us` | `VideoDecoder.cpp:convertFrame()` | Video Decoder thread | MetricRing<256> (SPSC) | gated |
+| **M6-B** | `upload_time_us` | `main.cpp:main()` | Main / Render thread | MetricRing<256> (SPSC) | gated |
+| **M7** | `av_clock_offset_ms` | `main.cpp:main()` | Main / Render thread | MetricRing<256> (SPSC) | gated |
+| **M8** | `frames_dropped_count` | `main.cpp:main()` | Main / Render thread | std::atomic<uint64_t> (Counter) | Always-On |
+| **M9** | `seek_latency_ms` | `PlayerController.cpp:seek()` (start) & `finishCatchup()` (end) | Video Decoder thread (write) / Main thread (read) | MetricRing<256> (SPSC) | gated |
+
+### Metric Details & Design Decisions
+
+#### Thread Ownership & Safety
+- **SPSC Ring Verification**: Each `MetricRing` is modified by a single producer thread and snapshot/read by the main render thread, strictly adhering to the SPSC (Single Producer Single Consumer) model.
+  - **Convert Time vs. Upload Time**: Both the hardware CPU copy (`av_hwframe_transfer_data`) and the software color-conversion/scaling path (`sws_scale`) run completely on the background video decoder thread. Thus, `convert_time_us` (Hook-A) is safely recorded on the video decoder thread. Meanwhile, `upload_time_us` (Hook-B) is recorded on the main render thread where `SDL_UpdateYUVTexture` / `SDL_UpdateNVTexture` takes place. This separation ensures both rings are single-producer.
+  - **Seek Latency**: Latency delta is recorded on the transition side (`finishCatchup`) on the video decoder thread, passing the start timestamp from `seek()` safely through catch-up epoch state variables protected under `m_catchupMutex`. This avoids any concurrent write access to the SPSC ring.
+- **Lock-Free Instrumentation**: All hooks employ lock-free std::atomic operations and avoid condition variables or heap allocations on the hot path, preserving near-zero overhead.
+- **Profiling Activation Gate**: Instantiations of time-series ring measurements (`MetricRing::record`) are gated behind the `m_profilingEnabled` relaxed load check. Instantaneous gauges (M1-M3) and the dropped-frame counter (M8) are always-on to avoid unnecessary branching overhead.
+
+#### Omissions or splits
+- No metrics were omitted or split incorrectly. `convert_time_us` and `upload_time_us` were mapped to separate rings as they run on separate threads, fully keeping to the SPSC thread constraints.

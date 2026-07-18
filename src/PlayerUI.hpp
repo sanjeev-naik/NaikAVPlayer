@@ -39,6 +39,13 @@ private:
     float m_savedVolume;
     bool m_showDiagnostics;
     
+    struct ClockOffsetSample {
+        double timeStamp;
+        float audioOffsetMs;
+        float videoOffsetMs;
+    };
+    std::deque<ClockOffsetSample> m_offsetHistory;
+    
     // Auto-hide controls timing
     double m_lastMouseMoveTime;
     bool m_controlsVisible;
@@ -72,6 +79,10 @@ public:
     ~PlayerUI();
 
     void init();
+    
+    void toggleDiagnostics() { m_showDiagnostics = !m_showDiagnostics; }
+    bool isDiagnosticsVisible() const { return m_showDiagnostics; }
+    void setDiagnosticsVisible(bool visible) { m_showDiagnostics = visible; }
     
     void registerVideoFrameRendered(double currentSystemTime);
     

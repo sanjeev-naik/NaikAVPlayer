@@ -6,7 +6,8 @@
 AudioDecoder::AudioDecoder(AVCodecParameters* codecParams, 
                            AVRational timeBase, 
                            int64_t startTime,
-                           ThreadSafeQueue<AVPacket*>& queue)
+                           ThreadSafeQueue<AVPacket*>& queue,
+                           std::atomic<uint64_t>* decodeTimeTracker)
     : m_codecParams(codecParams),
       m_codecCtx(nullptr),
       m_swrCtx(nullptr),
@@ -24,6 +25,7 @@ AudioDecoder::AudioDecoder(AVCodecParameters* codecParams,
       m_startTimeSaved(false),
       m_volume(1.0f),
       m_decodedFrame(nullptr),
+      m_decodeTimeTracker(decodeTimeTracker),
       m_outSampleRate(48000),
       m_outSampleFmt(AV_SAMPLE_FMT_S16),
       m_outChannels(2),
@@ -218,6 +220,19 @@ void AudioDecoder::setClock(double seconds) {
 }
 
 void AudioDecoder::decodeAndResample() {
+    struct TimeTracker {
+        std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+        std::atomic<uint64_t>* tracker;
+        TimeTracker(std::atomic<uint64_t>* t) : tracker(t) {}
+        ~TimeTracker() {
+            if (tracker) {
+                auto end = std::chrono::steady_clock::now();
+                uint64_t diff = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+                tracker->store(diff);
+            }
+        }
+    } tracker_guard(m_decodeTimeTracker);
+
     if (m_flushRequested) {
         avcodec_flush_buffers(m_codecCtx);
         if (m_swrCtx) {
@@ -406,4 +421,8 @@ void AudioDecoder::sdlAudioStreamCallback(void* userdata, SDL_AudioStream* strea
     if (bytesWritten > 0) {
         SDL_PutAudioStreamData(stream, tempBuffer.data(), bytesWritten);
     }
+}
+
+int AudioDecoder::getAudioStreamQueuedBytes() const {
+    return m_audioStream ? SDL_GetAudioStreamQueued(m_audioStream) : 0;
 }

@@ -17,7 +17,7 @@ Built on top of barebones **FFmpeg**, **SDL3**, and **Dear ImGui**, **NaikAVPlay
 - 🔁 **Loop Playback Mode:** Toggle continuous replay (via the Loop control button or the `L` hotkey) to automatically seek back to the start on reaching end-of-file instead of stopping — ideal for kiosks, demos, and long-running validation.
 - 📂 **Flexible Media Loading:** Supports drag-and-drop file ingestion directly onto the player window, or custom local file system parsing.
 - 🗂️ **Native File Picker:** Cross-platform native OS file dialog powered by **nativefiledialog-extended (NFD)** — uses the Win32 File Explorer on Windows and GTK3/Portal on Linux.
-- 📊 **Diagnostics HUD:** Real-time HUD diagnostics overlay displaying player states, playback clock offsets, media metadata, resolution metrics, and a security note warning for decoder maintenance.
+- 📊 **Diagnostics HUD & Pipeline Profiler:** Real-time HUD diagnostics overlay displaying player states, playback clock offsets, media metadata, and a lock-free pipeline profiler with time-series metrics.
 - 🎨 **Modern Glassmorphic GUI with Vector Icons:** Floating dock and cinematic header layouts with a frosted translucent obsidian design, circular progress grabs, interactive welcome onboarding cards, toggleable HUD sidebars, and **programmatically-rendered vector control icons** (Play, Pause, Stop, Seek, Volume, Loop, Browse) featuring neon cyan hover highlights and accessibility tooltips.
 - 🔤 **Bundled Open-Source Typography:** Integrated with **Noto Sans** fonts (SIL Open Font License 1.1) scanned dynamically from relative and installed system paths, avoiding system-dependent proprietary lookups.
 
@@ -109,6 +109,29 @@ The player playback engine is governed by a strict state machine to synchronize 
 * **`PAUSED`:** Playback is frozen. The audio device is paused to hold the current clock position.
 * **`ENDED`:** Reached when the demuxer hits EOF and all packet queues are fully drained. The audio device is paused. Seeking back (e.g., `seek(0.0)`) or playing transitions the engine back to active states. If **Loop Mode** is enabled, this transition is bypassed entirely — reaching EOF while `PLAYING` instead calls `seek(0.0)` directly, reusing the same flush/clock-reset pipeline as a manual seek, and playback continues without ever entering `ENDED`.
 * **`ERROR_STATE`:** Entered if demuxing or stream initialization fails, prompting safe release of resources.
+
+---
+
+## Pipeline Instrumentation
+
+To evaluate runtime execution without introducing synchronization overhead or memory allocation, NaikAVPlayer integrates a lock-free pipeline instrumentation framework.
+
+### Captured Metrics
+The engine tracks 9 distinct performance metrics:
+- **`video_packet_queue_depth` (M1)**: Instantaneous gauge of the video packet queue size (always-on).
+- **`audio_packet_queue_depth` (M2)**: Instantaneous gauge of the audio packet queue size (always-on).
+- **`decoded_frame_queue_depth` (M3)**: Instantaneous gauge of the decoded frame queue size (always-on).
+- **`demux_time_per_packet_us` (M4)**: SPSC ring recording time spent in `av_read_frame` (gated).
+- **`decode_time_per_frame_us` (M5)**: SPSC ring recording active video decoding time (gated).
+- **`convert_time_us` (M6-A)**: SPSC ring recording software scaling or hardware GPU-to-CPU data transfer times (gated).
+- **`upload_time_us` (M6-B)**: SPSC ring recording texture upload times on the main render thread (gated).
+- **`av_clock_offset_ms` (M7)**: SPSC ring recording video-to-audio clock synchronization offsets (gated).
+- **`frames_dropped_count` (M8)**: Counter of stale frames dropped to keep pace with master clock (always-on).
+- **`seek_latency_ms` (M9)**: SPSC ring recording seek catch-up latency from seek entry to landing (gated).
+
+### Architecture & Gating
+- **MetricRing**: A header-only, cacheline-aligned (`alignas(64)`) lock-free SPSC (Single Producer Single Consumer) ring buffer of `std::atomic<float>` elements. Memory order relaxed is used for data elements, and acquire/release semantics coordinate head updates.
+- **Profiling Activation**: Gated time-series metrics (`M4`, `M5`, `M6`, `M7`, `M9`) are disabled by default. Launching the application with the `--metrics` command line flag parses and enables profiling (`setProfilingEnabled(true)`). Gauge metrics (`M1`-`M3`) and frames dropped counters (`M8`) operate always-on without branching gating overhead.
 
 ---
 
@@ -262,21 +285,14 @@ You can launch **NaikAVPlayer** from your desktop environment applications menu 
 NaikAVPlayer
 ```
 
-Or pass a media file path directly as an argument:
-
-**Windows:**
+**Windows (with metrics):**
 ```powershell
-.\build\NaikAVPlayer.exe "C:\Path\To\video.mp4"
+.\build\NaikAVPlayer.exe --metrics "C:\Path\To\video.mp4"
 ```
 
-**Linux (Local Build):**
+**Linux (with metrics):**
 ```bash
-./build/NaikAVPlayer "/home/user/Videos/video.mp4"
-```
-
-**Linux (System-Wide Installed):**
-```bash
-NaikAVPlayer "/home/user/Videos/video.mp4"
+./build/NaikAVPlayer --metrics "/home/user/Videos/video.mp4"
 ```
 
 ### Keyboard Shortcuts

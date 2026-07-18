@@ -32,7 +32,11 @@ PlayerController::PlayerController()
       m_catchupPos(0.0),
       m_resumeAfterCatchup(false),
       m_catchupEpoch(0),
+      m_metrics(std::make_unique<PipelineMetrics>()),
       m_resolutionOption(ResolutionOption::ORIGINAL) {
+    m_videoQueue.attachDepthMirror(&m_metrics->m_videoPacketQueueDepth);
+    m_audioQueue.attachDepthMirror(&m_metrics->m_audioPacketQueueDepth);
+    m_decodedFrameQueue.attachDepthMirror(&m_metrics->m_decodedFrameQueueDepth);
     loadSettings();
 }
 
@@ -56,7 +60,9 @@ bool PlayerController::openFile(const std::string& filename) {
     m_decodedFrameQueue.reset(); // Clear aborted state set by stop()
 
     // Create and open the demuxer
-    m_demuxer = std::make_unique<Demuxer>(filename, m_videoQueue, m_audioQueue);
+    m_demuxer = std::make_unique<Demuxer>(
+        filename, m_videoQueue, m_audioQueue,
+        m_metrics->m_demuxTimePerPacketUs, m_metrics->m_profilingEnabled);
     if (!m_demuxer->open()) {
         m_state = PlayerState::ERROR_STATE;
         return false;
@@ -68,7 +74,10 @@ bool PlayerController::openFile(const std::string& filename) {
             m_demuxer->getVideoCodecParams(),
             m_demuxer->getVideoTimeBase(),
             m_demuxer->getVideoStartTime(),
-            m_videoQueue
+            m_videoQueue,
+            m_metrics->m_decodeTimePerFrameUs,
+            m_metrics->m_convertTimeUs,
+            m_metrics->m_profilingEnabled
         );
         m_hasVideo = m_videoDecoder->init();
     }
@@ -79,7 +88,8 @@ bool PlayerController::openFile(const std::string& filename) {
             m_demuxer->getAudioCodecParams(),
             m_demuxer->getAudioTimeBase(),
             m_demuxer->getAudioStartTime(),
-            m_audioQueue
+            m_audioQueue,
+            &m_audioDecodeTimeUs
         );
         m_hasAudio = m_audioDecoder->init();
         if (m_hasAudio) {
@@ -236,7 +246,11 @@ void PlayerController::seek(double seconds) {
     }
     m_seeking.store(false);
     m_catchupMode.store(SeekCatchupMode::LANDING);
-    m_catchupEpoch.fetch_add(1);
+    uint64_t activeEpoch = m_catchupEpoch.fetch_add(1) + 1;
+    if (m_metrics->m_profilingEnabled.load(std::memory_order_relaxed)) {
+        m_seekStartTime = std::chrono::steady_clock::now();
+        m_seekStartEpoch = activeEpoch;
+    }
 }
 
 void PlayerController::instantSeek(double seconds) {
@@ -639,7 +653,15 @@ void PlayerController::finishCatchup(double resumePts) {
         return;
     }
 
+    uint64_t currentEpoch = m_catchupEpoch.load(std::memory_order_relaxed);
     m_catchupMode.store(SeekCatchupMode::NONE);
+    if (m_metrics->m_profilingEnabled.load(std::memory_order_relaxed)) {
+        if (m_seekStartEpoch == currentEpoch) {
+            auto end = std::chrono::steady_clock::now();
+            float ms = static_cast<float>(std::chrono::duration<double, std::milli>(end - m_seekStartTime).count());
+            m_metrics->recordSeekLatency(ms);
+        }
+    }
     if (m_demuxer) {
         m_demuxer->setCatchup(SeekCatchupMode::NONE, 0.0);
     }
@@ -703,4 +725,12 @@ int PlayerController::getPlaybackHeight() const {
     int targetH = nativeH;
     getTargetDimensions(m_resolutionOption.load(), nativeW, nativeH, targetW, targetH);
     return targetH;
+}
+
+size_t PlayerController::getAudioFrameQueueSize() const {
+    if (m_hasAudio && m_audioDecoder) {
+        // Sample size is 4 bytes (2 channels * 16-bit). Return number of samples queued.
+        return m_audioDecoder->getAudioStreamQueuedBytes() / 4;
+    }
+    return 0;
 }

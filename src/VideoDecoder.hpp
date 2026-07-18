@@ -3,6 +3,8 @@
 #include <atomic>
 #include <algorithm>
 #include "ThreadSafeQueue.hpp"
+#include "MetricRing.hpp"
+#include <chrono>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -80,6 +82,11 @@ private:
     std::atomic<bool> m_seeking;
     int m_consecutiveEagainCount;
     int m_hardwareRecoveryAttempts;
+    MetricRing<256>& m_decodeTimeRing;
+    MetricRing<256>& m_convertTimeRing;
+    std::atomic<bool>& m_profilingEnabled;
+    std::chrono::steady_clock::time_point m_decodeStart;
+    bool m_hasDecodeStart = false;
 
     static bool isHardwareDecoder(const AVCodec* codec) noexcept;
     static bool isHardwarePixelFormat(AVPixelFormat fmt);
@@ -91,7 +98,15 @@ public:
     VideoDecoder(AVCodecParameters* codecParams, 
                  AVRational timeBase, 
                  int64_t startTime,
-                 ThreadSafeQueue<AVPacket*>& queue);
+                 ThreadSafeQueue<AVPacket*>& queue,
+                 MetricRing<256>& decodeTimeRing,
+                 MetricRing<256>& convertTimeRing,
+                 std::atomic<bool>& profilingEnabled);
+    VideoDecoder(AVCodecParameters* codecParams, 
+                 AVRational timeBase, 
+                 int64_t startTime,
+                 ThreadSafeQueue<AVPacket*>& queue,
+                 std::atomic<uint64_t>* decodeTimeTracker = nullptr);
     ~VideoDecoder();
 
     bool init();
@@ -113,3 +128,5 @@ public:
     std::string getPixelFormatName() const;
     bool isHardware() const { return m_codecCtx ? isHardwareDecoder(m_codecCtx->codec) : false; }
 };
+
+extern bool g_disableHardwareDecoders;

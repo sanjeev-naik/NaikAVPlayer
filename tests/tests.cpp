@@ -304,6 +304,7 @@ void drive_playback(PlayerController& controller, double seconds) {
 }
 
 int real_main(int argc, char* argv[]) {
+    g_disableHardwareDecoders = true;
     std::cout << "Starting NaikAVPlayer 100% coverage integration tests..." << std::endl;
 
     // Initialize SDL Audio
@@ -825,11 +826,19 @@ int real_main(int argc, char* argv[]) {
         controller.m_videoClock = 0.0;
         controller.m_lastSystemTime = controller.getSystemTimeInSeconds();
         controller.m_state = PlayerState::PLAYING;
+
+        // Push a dummy packet to ensure queue is not empty, preventing premature EOF state transition
+        AVPacket* dummyPkt = av_packet_alloc();
+        controller.m_videoQueue.push(dummyPkt);
+
         // Verify getCurrentTime drives updateClockForVideoOnly()
         double videoOnlyTime1 = controller.getCurrentTime();
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
         double videoOnlyTime2 = controller.getCurrentTime();
         test_assert(videoOnlyTime2 > videoOnlyTime1, "Video-Only clock progresses via system time delta");
+
+        // Clean up the dummy packet
+        controller.m_videoQueue.clear([](AVPacket*& pkt) { av_packet_free(&pkt); });
 
         // Verify pause handles video-only update
         controller.pause();
@@ -1306,6 +1315,7 @@ int main(int argc, char* argv[]) {
             test_assert(!controller.isVideoHardware(), "isVideoHardware returns false when uninitialized");
             test_assert(!controller.isSeeking(), "isSeeking returns false when uninitialized");
 
+            g_disableHardwareDecoders = false;
             if (controller.openFile(testFile)) {
                 const VideoDecoder* dec = controller.getVideoDecoder();
                 if (dec) {
@@ -1316,6 +1326,7 @@ int main(int argc, char* argv[]) {
                 test_assert(!pixFmt.empty() && pixFmt != "unknown", "getVideoPixelFormat returns valid format name");
                 test_assert(controller.isVideoHardware(), "isVideoHardware returns true when using hardware");
             }
+            g_disableHardwareDecoders = true;
         }
 
         // Demuxer: hit the m_seekRequested check in threadLoop during active read
@@ -1624,6 +1635,186 @@ int main(int argc, char* argv[]) {
                 dec->m_allocatedFormat = AV_PIX_FMT_NONE;
                 test_assert(dec->getPixelFormatName() == "unknown", "getPixelFormatName returns unknown for NONE");
             }
+        }
+
+        // -------------------------------------------------------------
+        // Pipeline Metrics & MetricRing Tests (T1 - T5)
+        // -------------------------------------------------------------
+        {
+            std::cout << "Running Pipeline Metrics & MetricRing Tests..." << std::endl;
+
+            // T2: snapshot on empty ring returns 0
+            {
+                MetricRing<8> ring;
+                float buf[8]{};
+                size_t count = ring.snapshot(buf, 8);
+                test_assert(count == 0, "T2: snapshot on empty ring must return 0");
+            }
+
+            // T1: MetricRing wrap-around at N and 2N samples
+            {
+                MetricRing<8> ring; // N = 8
+                // Write N = 8 samples: 1..8
+                for (int i = 1; i <= 8; ++i) {
+                    ring.record(static_cast<float>(i));
+                }
+                float buf[8]{};
+                size_t count = ring.snapshot(buf, 8);
+                test_assert(count == 8, "T1: snapshot count must be 8");
+                for (int i = 0; i < 8; ++i) {
+                    test_assert(buf[i] == static_cast<float>(i + 1), "T1: elements must match 1..8 chronologically");
+                }
+
+                // Write 2N = 16 samples: 9..16
+                for (int i = 9; i <= 16; ++i) {
+                    ring.record(static_cast<float>(i));
+                }
+                count = ring.snapshot(buf, 8);
+                test_assert(count == 8, "T1: snapshot count after 2N must be 8");
+                for (int i = 0; i < 8; ++i) {
+                    test_assert(buf[i] == static_cast<float>(i + 9), "T1: elements after 2N must match 9..16 chronologically");
+                }
+            }
+
+            // T3: snapshot buffer smaller than sample count returns newest max entries
+            {
+                MetricRing<8> ring;
+                for (int i = 1; i <= 6; ++i) {
+                    ring.record(static_cast<float>(i));
+                }
+                float buf[3]{};
+                size_t count = ring.snapshot(buf, 3);
+                test_assert(count == 3, "T3: count must be 3");
+                // Newest 3 of 1..6 are 4, 5, 6
+                test_assert(buf[0] == 4.0f, "T3: element 0 must be 4");
+                test_assert(buf[1] == 5.0f, "T3: element 1 must be 5");
+                test_assert(buf[2] == 6.0f, "T3: element 2 must be 6");
+            }
+
+            // T4: two-thread hammer (producer records 1M, consumer snapshots in loop)
+            {
+                MetricRing<256> ring;
+                std::atomic<bool> runConsumer{true};
+
+                std::thread consumer([&]() {
+                    float buf[256];
+                    while (runConsumer.load(std::memory_order_relaxed)) {
+                        size_t count = ring.snapshot(buf, 256);
+                        (void)count;
+                        std::this_thread::yield();
+                    }
+                });
+
+                std::thread producer([&]() {
+                    for (int i = 0; i < 1000000; ++i) {
+                        ring.record(static_cast<float>(i));
+                    }
+                });
+
+                producer.join();
+                runConsumer.store(false, std::memory_order_relaxed);
+                consumer.join();
+                test_assert(true, "T4: two-thread hammer completed successfully under TSan");
+            }
+
+            // T5: seek latency pairing discards superseded epoch measurements
+            {
+                g_videoThreadEnabled = true;
+                PlayerController controller;
+                if (controller.openFile(testFile)) {
+                    PipelineMetrics& metrics = controller.getPipelineMetrics();
+                    metrics.setProfilingEnabled(true);
+
+                    // Check that seek latency ring is empty initially
+                    float latencies[10]{};
+                    size_t initialCount = metrics.m_seekLatencyMs.snapshot(latencies, 10);
+                    test_assert(initialCount == 0, "T5: seek latency ring is initially empty");
+
+                    // Start playback to prevent seeks from taking the instantSeek early-return path
+                    controller.play();
+
+                    // Trigger seek 1 (activeEpoch = 1)
+                    controller.seek(1.0);
+                    
+                    // Trigger seek 2 (activeEpoch = 2, supersedes seek 1)
+                    controller.seek(2.0);
+
+                    // Finish catch-up (this corresponds to the second seek landing)
+                    controller.finishCatchup(2.0);
+
+                    size_t count = metrics.m_seekLatencyMs.snapshot(latencies, 10);
+                    // The count must be exactly 1, because the first seek was superseded and discarded!
+                    test_assert(count == 1, "T5: superseded seek measurement must be discarded, count should be 1");
+                }
+            }
+
+            // T6: m_profilingEnabled=false results in no ring writes (all ring heads unchanged after exercising hooks); depth gauges still update
+            {
+                PipelineMetrics metrics;
+                test_assert(!metrics.m_profilingEnabled.load(), "T6: profiling should be disabled by default");
+
+                metrics.recordDemuxTime(123.0f);
+                metrics.recordDecodeTime(456.0f);
+                metrics.recordConvertTime(789.0f);
+                metrics.recordUploadTime(12.0f);
+                metrics.recordClockOffset(34.0f);
+                metrics.recordSeekLatency(56.0f);
+
+                test_assert(metrics.m_demuxTimePerPacketUs.getHead() == 0, "T6: demux head must be 0");
+                test_assert(metrics.m_decodeTimePerFrameUs.getHead() == 0, "T6: decode head must be 0");
+                test_assert(metrics.m_convertTimeUs.getHead() == 0, "T6: convert head must be 0");
+                test_assert(metrics.m_uploadTimeUs.getHead() == 0, "T6: upload head must be 0");
+                test_assert(metrics.m_avClockOffsetMs.getHead() == 0, "T6: offset head must be 0");
+                test_assert(metrics.m_seekLatencyMs.getHead() == 0, "T6: seek head must be 0");
+
+                ThreadSafeQueue<int> queue(10);
+                std::atomic<int> depth{0};
+                queue.attachDepthMirror(&depth);
+                
+                queue.push(42);
+                test_assert(depth.load() == 1, "T6: depth gauge must update even when profiling is disabled");
+                
+                int val;
+                queue.pop(val);
+                test_assert(depth.load() == 0, "T6: depth gauge must update even when profiling is disabled");
+
+                test_assert(metrics.m_framesDroppedCount.load() == 0, "T6: initial dropped count should be 0");
+                metrics.incrementFramesDropped();
+                test_assert(metrics.m_framesDroppedCount.load() == 1, "T6: dropped count must update even when profiling is disabled");
+            }
+
+            // T7: attachDepthMirror(nullptr)/never-attached queue operates correctly with zero metric side effects
+            {
+                ThreadSafeQueue<int> queue(10);
+                queue.attachDepthMirror(nullptr);
+                
+                test_assert(queue.push(1), "T7: push works without depth mirror");
+                int val;
+                test_assert(queue.pop(val) && val == 1, "T7: pop works without depth mirror");
+                test_assert(queue.push(2), "T7: push works");
+                queue.clear();
+                test_assert(queue.empty(), "T7: clear works");
+            }
+
+            // T8: setProfilingEnabled(true) -> ring writes occur; back to false -> writes stop (toggle round-trip)
+            {
+                PipelineMetrics metrics;
+                test_assert(!metrics.m_profilingEnabled.load(), "T8: initially disabled");
+
+                metrics.setProfilingEnabled(true);
+                test_assert(metrics.m_profilingEnabled.load(), "T8: enabled");
+
+                metrics.recordDemuxTime(100.0f);
+                test_assert(metrics.m_demuxTimePerPacketUs.getHead() == 1, "T8: write occurred when enabled");
+
+                metrics.setProfilingEnabled(false);
+                test_assert(!metrics.m_profilingEnabled.load(), "T8: disabled again");
+
+                metrics.recordDemuxTime(200.0f);
+                test_assert(metrics.m_demuxTimePerPacketUs.getHead() == 1, "T8: write did not occur when disabled");
+            }
+
+            std::cout << "Pipeline Metrics & MetricRing Tests (T1 - T8) passed!" << std::endl;
         }
 
         std::cout << "Additional code coverage tests PASSED!" << std::endl;

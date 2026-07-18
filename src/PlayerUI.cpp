@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <imgui.h>
 #include <iostream>
 
@@ -138,6 +139,34 @@ void PlayerUI::draw(int windowWidth, int windowHeight,
   PlayerState state = m_controller.getState();
   bool isPlaying = (state == PlayerState::PLAYING);
   bool imguiWantsMouse = ImGui::GetIO().WantCaptureMouse;
+
+  // Add clock offset samples at 10 Hz (every 100ms)
+  if (m_showDiagnostics && state == PlayerState::PLAYING &&
+      !m_controller.isSeeking() && !m_controller.isCatchingUp()) {
+    static double lastSampleTime = 0.0;
+    if (currentSystemTime - lastSampleTime >= 0.1) {
+      lastSampleTime = currentSystemTime;
+
+      double masterClock = m_controller.getCurrentTime();
+      float audioOffset = 0.0f;
+      float videoOffset = 0.0f;
+
+      if (m_controller.hasAudio()) {
+        audioOffset = static_cast<float>((m_controller.getAudioClock() - masterClock) * 1000.0);
+      }
+      if (m_controller.hasVideo()) {
+        videoOffset = static_cast<float>((m_controller.getVideoClock() - masterClock) * 1000.0);
+      }
+
+      ClockOffsetSample sample = {currentSystemTime, audioOffset, videoOffset};
+      m_offsetHistory.push_back(sample);
+
+      // Keep last 20 seconds of history (200 samples at 10 Hz)
+      while (m_offsetHistory.size() > 200) {
+        m_offsetHistory.pop_front();
+      }
+    }
+  }
 
   // Keep controls visible if playback is paused or user is interacting with the
   // GUI
@@ -800,20 +829,21 @@ void PlayerUI::drawControlsBar(int windowWidth, int windowHeight) {
 }
 
 void PlayerUI::drawDiagnosticsHUD(int windowWidth, int windowHeight) {
-  (void)windowHeight;
   if (!m_showDiagnostics)
     return;
 
   // Floating stats card on the top right
-  float cardWidth = 300.0f;
-  float cardHeight = 420.0f;
+  float cardWidth = 340.0f;
+  float cardHeight = windowHeight - 80.0f;
+  if (cardHeight < 650.0f) cardHeight = 650.0f;
+  if (cardHeight > 1050.0f) cardHeight = 1050.0f;
 
   ImGui::SetNextWindowPos(ImVec2(windowWidth - cardWidth - 20.0f, 60.0f));
   ImGui::SetNextWindowSize(ImVec2(cardWidth, cardHeight));
 
   ImGui::Begin("Diagnostics HUD", nullptr,
-               ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
-                   ImGuiWindowFlags_NoResize |
+               ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                   ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoMove |
                    ImGuiWindowFlags_NoSavedSettings);
 
   if (m_hudFont)
@@ -926,6 +956,210 @@ void PlayerUI::drawDiagnosticsHUD(int windowWidth, int windowHeight) {
 
   ImGui::Spacing();
   ImGui::Separator();
+  ImGui::TextColored(ImVec4(0.00f, 0.83f, 0.88f, 1.00f), "Pipeline Queue Depths");
+  ImGui::Spacing();
+
+  // Helper lambda for rendering queue progress bars
+  auto drawQueueDepth = [](const char* label, size_t size, size_t capacity, const char* extraInfo) {
+    float fraction = capacity > 0 ? static_cast<float>(size) / capacity : 0.0f;
+    ImVec4 color = ImVec4(0.0f, 0.83f, 0.4f, 1.0f); // Green
+    
+    // Customize health indicators based on label type
+    if (std::strcmp(label, "Video Frame Q") == 0) {
+      if (size == 0) color = ImVec4(1.0f, 0.2f, 0.2f, 1.0f); // Red
+      else if (size <= 2) color = ImVec4(0.9f, 0.7f, 0.0f, 1.0f); // Yellow
+    } else if (std::strcmp(label, "Audio Frame Q") == 0) {
+      float ms = (size * 1000.0f) / 48000.0f;
+      if (ms < 50.0f) color = ImVec4(1.0f, 0.2f, 0.2f, 1.0f); // Red
+      else if (ms < 150.0f) color = ImVec4(0.9f, 0.7f, 0.0f, 1.0f); // Yellow
+    } else { // Packets Q
+      if (size < 5) color = ImVec4(1.0f, 0.2f, 0.2f, 1.0f); // Red
+      else if (size < 20) color = ImVec4(0.9f, 0.7f, 0.0f, 1.0f); // Yellow
+    }
+
+    ImGui::Text("%s: %d/%d", label, static_cast<int>(size), static_cast<int>(capacity));
+    if (extraInfo) {
+      ImGui::SameLine();
+      ImGui::TextDisabled(" (%s)", extraInfo);
+    }
+    ImGui::PushStyleColor(ImGuiCol_PlotHistogram, color);
+    char pctBuf[32];
+    std::snprintf(pctBuf, sizeof(pctBuf), "%.1f%%", fraction * 100.0f);
+    ImGui::ProgressBar(fraction, ImVec2(-1, 14), pctBuf);
+    ImGui::PopStyleColor();
+    ImGui::Spacing();
+  };
+
+  if (m_controller.hasVideo()) {
+    drawQueueDepth("Video Packet Q", m_controller.getVideoPacketQueueSize(), m_controller.getVideoPacketQueueCapacity(), nullptr);
+    drawQueueDepth("Video Frame Q", m_controller.getVideoFrameQueueSize(), m_controller.getVideoFrameQueueCapacity(), nullptr);
+  }
+  if (m_controller.hasAudio()) {
+    drawQueueDepth("Audio Packet Q", m_controller.getAudioPacketQueueSize(), m_controller.getAudioPacketQueueCapacity(), nullptr);
+    
+    size_t audioFrmSize = m_controller.getAudioFrameQueueSize();
+    float queuedMs = (audioFrmSize * 1000.0f) / 48000.0f;
+    char audioInfo[32];
+    std::snprintf(audioInfo, sizeof(audioInfo), "%.0f ms buf", queuedMs);
+    drawQueueDepth("Audio Frame Q", audioFrmSize, m_controller.getAudioFrameQueueCapacity(), audioInfo);
+  }
+
+  // Subtitle Queue: hardcoded to disabled since it's not supported by core
+  ImGui::Text("Subtitle Q: N/A");
+  ImGui::SameLine();
+  ImGui::TextDisabled(" (Disabled)");
+  ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(0.3f, 0.3f, 0.3f, 1.0f));
+  ImGui::ProgressBar(0.0f, ImVec2(-1, 14), "0.0%");
+  ImGui::PopStyleColor();
+
+  ImGui::Spacing();
+  ImGui::Separator();
+  ImGui::TextColored(ImVec4(0.00f, 0.83f, 0.88f, 1.00f), "Decode & Render Timings");
+  ImGui::Spacing();
+
+  // Helper lambda for rendering timing budget progress bars
+  auto drawTimingBar = [](const char* label, double timeMs, double budgetMs) {
+    float fraction = budgetMs > 0.0 ? static_cast<float>(timeMs / budgetMs) : 0.0f;
+    ImVec4 color = ImVec4(0.0f, 0.83f, 0.4f, 1.0f); // Green
+    if (fraction > 0.9f) {
+      color = ImVec4(1.0f, 0.2f, 0.2f, 1.0f); // Red
+    } else if (fraction > 0.5f) {
+      color = ImVec4(0.9f, 0.7f, 0.0f, 1.0f); // Yellow
+    }
+    ImGui::Text("%s: %.2f ms", label, timeMs);
+    ImGui::SameLine();
+    ImGui::TextDisabled(" (%.1f%% budget)", fraction * 100.0f);
+    ImGui::PushStyleColor(ImGuiCol_PlotHistogram, color);
+    ImGui::ProgressBar(std::min(fraction, 1.0f), ImVec2(-1, 14), "");
+    ImGui::PopStyleColor();
+    ImGui::Spacing();
+  };
+
+  double targetBudget = (m_videoFPS > 1.0) ? (1000.0 / m_videoFPS) : 33.33;
+
+  if (m_controller.hasVideo()) {
+    drawTimingBar("Video Decode", m_controller.getVideoDecodeTimeMs(), targetBudget);
+  }
+  if (m_controller.hasAudio()) {
+    drawTimingBar("Audio Decode", m_controller.getAudioDecodeTimeMs(), targetBudget);
+  }
+  if (m_controller.hasVideo()) {
+    drawTimingBar("Video Render", m_controller.getVideoRenderTimeMs(), targetBudget);
+  }
+  drawTimingBar("Present/VSync", m_controller.getPresentTimeMs(), targetBudget);
+  if (m_controller.hasVideo()) {
+    drawTimingBar("Frame Pacing", m_controller.getFramePacingMs(), targetBudget);
+  }
+
+  ImGui::Spacing();
+  ImGui::Separator();
+
+  // Draw Rolling Sync Graph
+  {
+    ImGui::TextColored(ImVec4(0.00f, 0.83f, 0.88f, 1.00f), "Clock Synchronization");
+    ImGui::Spacing();
+
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+    ImVec2 pos = ImGui::GetCursorScreenPos();
+    float width = ImGui::GetContentRegionAvail().x;
+    float height = 110.0f;
+
+    // Draw background
+    drawList->AddRectFilled(pos, ImVec2(pos.x + width, pos.y + height), IM_COL32(20, 20, 22, 255), 4.0f);
+    drawList->AddRect(pos, ImVec2(pos.x + width, pos.y + height), IM_COL32(60, 60, 65, 255), 4.0f);
+
+    if (m_offsetHistory.empty()) {
+      // Draw centered waiting message
+      const char* msg = "Waiting for playback data...";
+      ImVec2 textSize = ImGui::CalcTextSize(msg);
+      drawList->AddText(ImVec2(pos.x + (width - textSize.x) * 0.5f, pos.y + (height - textSize.y) * 0.5f),
+                        IM_COL32(150, 150, 155, 180), msg);
+      
+      // Draw Y axis labels with standard baseline
+      drawList->AddText(ImVec2(pos.x + 5, pos.y + 2), IM_COL32(100, 100, 105, 120), "+50ms");
+      drawList->AddText(ImVec2(pos.x + 5, pos.y + height - 15), IM_COL32(100, 100, 105, 120), "-50ms");
+      drawList->AddText(ImVec2(pos.x + 5, pos.y + height * 0.5f - 6), IM_COL32(100, 100, 105, 120), "0ms");
+      drawList->AddLine(ImVec2(pos.x, pos.y + height * 0.5f), ImVec2(pos.x + width, pos.y + height * 0.5f), IM_COL32(100, 100, 105, 80), 1.0f);
+
+      ImGui::Dummy(ImVec2(width, height));
+      ImGui::Spacing();
+    } else {
+      // Determine auto-scaling Y limits
+      float maxVal = 50.0f; // minimum scale of ±50ms
+      for (const auto& sample : m_offsetHistory) {
+        float a = std::abs(sample.audioOffsetMs);
+        float v = std::abs(sample.videoOffsetMs);
+        if (a > maxVal) maxVal = a;
+        if (v > maxVal) maxVal = v;
+      }
+      // Round maxVal up for visual padding
+      maxVal = std::ceil(maxVal / 10.0f) * 10.0f;
+
+      // Draw grid lines
+      float centerY = pos.y + height * 0.5f;
+      // 0ms baseline
+      drawList->AddLine(ImVec2(pos.x, centerY), ImVec2(pos.x + width, centerY), IM_COL32(100, 100, 105, 120), 1.0f);
+
+      // Top/bottom grid lines
+      float gridY1 = centerY - height * 0.25f;
+      float gridY2 = centerY + height * 0.25f;
+      drawList->AddLine(ImVec2(pos.x, gridY1), ImVec2(pos.x + width, gridY1), IM_COL32(60, 60, 65, 80), 1.0f);
+      drawList->AddLine(ImVec2(pos.x, gridY2), ImVec2(pos.x + width, gridY2), IM_COL32(60, 60, 65, 80), 1.0f);
+
+      // Draw Y axis labels
+      char labelBuf[32];
+      std::snprintf(labelBuf, sizeof(labelBuf), "+%.0fms", maxVal);
+      drawList->AddText(ImVec2(pos.x + 5, pos.y + 2), IM_COL32(200, 200, 205, 200), labelBuf);
+      std::snprintf(labelBuf, sizeof(labelBuf), "-%.0fms", maxVal);
+      drawList->AddText(ImVec2(pos.x + 5, pos.y + height - 15), IM_COL32(200, 200, 205, 200), labelBuf);
+      drawList->AddText(ImVec2(pos.x + 5, centerY - 6), IM_COL32(150, 150, 155, 180), "0ms");
+
+      // Plot offset curves
+      int numSamples = m_offsetHistory.size();
+      if (numSamples > 1) {
+        for (int i = 0; i < numSamples - 1; ++i) {
+          float x1 = pos.x + (static_cast<float>(i) / 199.0f) * width;
+          float x2 = pos.x + (static_cast<float>(i + 1) / 199.0f) * width;
+
+          // Clip coordinates to grid boundaries
+          x1 = std::clamp(x1, pos.x, pos.x + width);
+          x2 = std::clamp(x2, pos.x, pos.x + width);
+
+          if (m_controller.hasAudio()) {
+            float ay1 = centerY - (m_offsetHistory[i].audioOffsetMs / maxVal) * height * 0.5f;
+            float ay2 = centerY - (m_offsetHistory[i+1].audioOffsetMs / maxVal) * height * 0.5f;
+            ay1 = std::clamp(ay1, pos.y, pos.y + height);
+            ay2 = std::clamp(ay2, pos.y, pos.y + height);
+            drawList->AddLine(ImVec2(x1, ay1), ImVec2(x2, ay2), IM_COL32(236, 72, 153, 255), 1.5f); // Pink/Magenta
+          }
+
+          if (m_controller.hasVideo()) {
+            float vy1 = centerY - (m_offsetHistory[i].videoOffsetMs / maxVal) * height * 0.5f;
+            float vy2 = centerY - (m_offsetHistory[i+1].videoOffsetMs / maxVal) * height * 0.5f;
+            vy1 = std::clamp(vy1, pos.y, pos.y + height);
+            vy2 = std::clamp(vy2, pos.y, pos.y + height);
+            drawList->AddLine(ImVec2(x1, vy1), ImVec2(x2, vy2), IM_COL32(6, 182, 212, 255), 1.5f); // Cyan
+          }
+        }
+      }
+
+      // Advance cursor past the graph drawing area
+      ImGui::Dummy(ImVec2(width, height));
+      ImGui::Spacing();
+    }
+
+    // Legends below graph
+    if (m_controller.hasVideo()) {
+      ImGui::TextColored(ImVec4(0.02f, 0.71f, 0.83f, 1.0f), "Video Offset (Cyan)");
+      if (m_controller.hasAudio()) ImGui::SameLine(180.0f);
+    }
+    if (m_controller.hasAudio()) {
+      ImGui::TextColored(ImVec4(0.92f, 0.28f, 0.60f, 1.0f), "Audio Offset (Magenta)");
+    }
+  }
+
+  ImGui::Spacing();
+  ImGui::Separator();
   ImGui::Spacing();
 
   ImGui::Text("GUI Render FPS: ");
@@ -938,16 +1172,6 @@ void PlayerUI::drawDiagnosticsHUD(int windowWidth, int windowHeight) {
     ImGui::SameLine();
     ImGui::TextColored(ImVec4(0.0f, 0.83f, 0.4f, 1.0f), "%.1f", m_videoFPS);
   }
-
-  ImGui::Spacing();
-  ImGui::Separator();
-  ImGui::Spacing();
-
-  ImGui::TextDisabled("Security Note:");
-  ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.9f, 0.7f, 0.2f, 0.85f));
-  ImGui::TextWrapped("Keep external FFmpeg decoders updated to mitigate "
-                     "potential media parsing exploits.");
-  ImGui::PopStyleColor();
 
   if (m_hudFont)
     ImGui::PopFont();
