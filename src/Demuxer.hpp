@@ -5,6 +5,7 @@
 #include <atomic>
 #include <mutex>
 #include "ThreadSafeQueue.hpp"
+#include "MetricRing.hpp"
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -49,6 +50,8 @@ private:
     // target are dropped and video read-ahead past the target is throttled.
     std::atomic<SeekCatchupMode> m_catchupMode;
     std::atomic<double> m_catchupTarget;
+    MetricRing<256>& m_demuxTimeRing;
+    std::atomic<bool>& m_profilingEnabled;
 
     void threadLoop();
     void performSeek();
@@ -56,6 +59,11 @@ private:
     void throttleCatchupReadahead(double videoPtsSec);
 
 public:
+    Demuxer(const std::string& filename, 
+            ThreadSafeQueue<AVPacket*>& videoQueue, 
+            ThreadSafeQueue<AVPacket*>& audioQueue,
+            MetricRing<256>& demuxTimeRing,
+            std::atomic<bool>& profilingEnabled);
     Demuxer(const std::string& filename, 
             ThreadSafeQueue<AVPacket*>& videoQueue, 
             ThreadSafeQueue<AVPacket*>& audioQueue);

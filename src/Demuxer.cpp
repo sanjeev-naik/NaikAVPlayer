@@ -6,7 +6,9 @@
 
 Demuxer::Demuxer(const std::string& filename, 
                  ThreadSafeQueue<AVPacket*>& videoQueue, 
-                 ThreadSafeQueue<AVPacket*>& audioQueue)
+                 ThreadSafeQueue<AVPacket*>& audioQueue,
+                 MetricRing<256>& demuxTimeRing,
+                 std::atomic<bool>& profilingEnabled)
     : m_filename(filename),
       m_formatCtx(nullptr),
       m_videoStreamIdx(-1),
@@ -25,7 +27,18 @@ Demuxer::Demuxer(const std::string& filename,
       m_seekTargetTime(0.0),
       m_eof(false),
       m_catchupMode(SeekCatchupMode::NONE),
-      m_catchupTarget(0.0) {
+      m_catchupTarget(0.0),
+      m_demuxTimeRing(demuxTimeRing),
+      m_profilingEnabled(profilingEnabled) {
+}
+
+static MetricRing<256> g_dummyDemuxRing;
+static std::atomic<bool> g_dummyDemuxerProfilingEnabled{false};
+
+Demuxer::Demuxer(const std::string& filename, 
+                 ThreadSafeQueue<AVPacket*>& videoQueue, 
+                 ThreadSafeQueue<AVPacket*>& audioQueue)
+    : Demuxer(filename, videoQueue, audioQueue, g_dummyDemuxRing, g_dummyDemuxerProfilingEnabled) {
 }
 
 Demuxer::~Demuxer() {
@@ -206,7 +219,16 @@ void Demuxer::threadLoop() {
             continue;
         }
 
-        int ret = av_read_frame(m_formatCtx, packet);
+        int ret;
+        if (m_profilingEnabled.load(std::memory_order_relaxed)) {
+            auto startTime = std::chrono::steady_clock::now();
+            ret = av_read_frame(m_formatCtx, packet);
+            auto end = std::chrono::steady_clock::now();
+            float us = static_cast<float>(std::chrono::duration_cast<std::chrono::microseconds>(end - startTime).count());
+            m_demuxTimeRing.record(us);
+        } else {
+            ret = av_read_frame(m_formatCtx, packet);
+        }
         if (ret >= 0) {
             if (m_seekRequested.load()) {
                 av_packet_free(&packet);

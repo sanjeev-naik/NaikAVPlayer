@@ -215,10 +215,25 @@ int main(int argc, char *argv[]) {
   // Enable drag and drop events
   SDL_SetEventEnabled(SDL_EVENT_DROP_FILE, true);
 
-  // If a file was passed as a command-line argument, load it immediately
-  if (argc > 1) {
-    std::string filename = argv[1];
-    if (controller.openFile(filename)) {
+  // Parse command line arguments
+  bool metricsEnabled = false;
+  std::string mediaPath = "";
+  for (int i = 1; i < argc; ++i) {
+    std::string arg = argv[i];
+    if (arg == "--metrics") {
+      metricsEnabled = true;
+    } else if (mediaPath.empty()) {
+      mediaPath = arg;
+    }
+  }
+
+  if (metricsEnabled) {
+    controller.getPipelineMetrics().setProfilingEnabled(true);
+    playerUI.setDiagnosticsVisible(true);
+  }
+
+  if (!mediaPath.empty()) {
+    if (controller.openFile(mediaPath)) {
       controller.play();
     }
   }
@@ -303,6 +318,9 @@ int main(int argc, char *argv[]) {
         case SDLK_L:
           controller.setLoopEnabled(!controller.isLoopEnabled());
           break;
+        case SDLK_D:
+          playerUI.toggleDiagnostics();
+          break;
         default:
           break;
         }
@@ -351,6 +369,7 @@ int main(int argc, char *argv[]) {
         if (controller.getDecodedFrameQueue().pop(poppedFrame)) {
           if (hasTarget && targetFrame.frame) {
             av_frame_free(&targetFrame.frame);
+            controller.getPipelineMetrics().m_framesDroppedCount.fetch_add(1, std::memory_order_relaxed);
           }
           targetFrame = poppedFrame;
           hasTarget = true;
@@ -409,6 +428,23 @@ int main(int argc, char *argv[]) {
         }
 
         if (shouldUpdateTexture) {
+          if (controller.getPipelineMetrics().m_profilingEnabled.load(std::memory_order_relaxed)) {
+            float offsetMs = static_cast<float>((currentFrame.pts - timeNow) * 1000.0);
+            controller.getPipelineMetrics().m_avClockOffsetMs.record(offsetMs);
+          }
+          // Frame pacing: time elapsed since the last texture update
+          static auto lastFrameTime = std::chrono::steady_clock::now();
+          auto now = std::chrono::steady_clock::now();
+          if (controller.getState() == PlayerState::PLAYING) {
+            uint64_t pacingUs = std::chrono::duration_cast<std::chrono::microseconds>(now - lastFrameTime).count();
+            // cap pacing to a reasonable value (e.g. 1 second) to prevent huge values after pausing/seeking
+            if (pacingUs < 1000000) {
+              controller.setFramePacingUs(pacingUs);
+            }
+          }
+          lastFrameTime = now;
+
+          auto renderStart = std::chrono::steady_clock::now();
           // Copy raw plane segments directly to GPU-mapped texture memory
           if (texFormat == SDL_PIXELFORMAT_NV12 ||
               texFormat == SDL_PIXELFORMAT_NV21) {
@@ -423,6 +459,13 @@ int main(int argc, char *argv[]) {
                 currentFrame.frame->linesize[1], currentFrame.frame->data[2],
                 currentFrame.frame->linesize[2]);
           }
+          auto renderEnd = std::chrono::steady_clock::now();
+          uint64_t renderUs = std::chrono::duration_cast<std::chrono::microseconds>(renderEnd - renderStart).count();
+          controller.setVideoRenderTimeUs(renderUs);
+          if (controller.getPipelineMetrics().m_profilingEnabled.load(std::memory_order_relaxed)) {
+            controller.getPipelineMetrics().m_uploadTimeUs.record(static_cast<float>(renderUs));
+          }
+
           playerUI.registerVideoFrameRendered(currentSecs);
         }
       }
@@ -482,12 +525,22 @@ int main(int argc, char *argv[]) {
     // this thread is what causes the slowdown/freeze while minimized
     // and the multi-second catch-up after restoring (see comment above
     // windowMinimized's declaration).
+    auto presentStart = std::chrono::steady_clock::now();
     if (!windowMinimized) {
       SDL_RenderPresent(renderer);
     }
+    auto presentEnd = std::chrono::steady_clock::now();
+    uint64_t presentUs = std::chrono::duration_cast<std::chrono::microseconds>(presentEnd - presentStart).count();
+    controller.setPresentTimeUs(presentUs);
 
-    // Sleep to avoid pegging CPU when idle/VSync limits
-    SDL_Delay(5);
+    // Sleep to avoid pegging CPU when minimized or if VSync is disabled.
+    // If VSync is enabled, SDL_RenderPresent blocks and rate-limits naturally,
+    // so we do not sleep to avoid missing refresh boundaries.
+    int vsync = 0;
+    SDL_GetRenderVSync(renderer, &vsync);
+    if (windowMinimized || vsync <= 0) {
+      SDL_Delay(5);
+    }
   }
 
   // 4. Cleanup resources on exit

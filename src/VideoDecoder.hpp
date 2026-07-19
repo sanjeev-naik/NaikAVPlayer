@@ -3,6 +3,8 @@
 #include <atomic>
 #include <algorithm>
 #include "ThreadSafeQueue.hpp"
+#include "MetricRing.hpp"
+#include <chrono>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -74,12 +76,17 @@ private:
     int m_allocatedHeight;
     AVPixelFormat m_allocatedFormat;
 
-    double m_currentFramePts;
+    std::atomic<double> m_currentFramePts;
     std::atomic<bool> m_flushRequested;
     bool m_startTimeSaved;
     std::atomic<bool> m_seeking;
     int m_consecutiveEagainCount;
     int m_hardwareRecoveryAttempts;
+    MetricRing<256>& m_decodeTimeRing;
+    MetricRing<256>& m_convertTimeRing;
+    std::atomic<bool>& m_profilingEnabled;
+    std::chrono::steady_clock::time_point m_decodeStart;
+    bool m_hasDecodeStart = false;
 
     static bool isHardwareDecoder(const AVCodec* codec) noexcept;
     static bool isHardwarePixelFormat(AVPixelFormat fmt);
@@ -91,7 +98,15 @@ public:
     VideoDecoder(AVCodecParameters* codecParams, 
                  AVRational timeBase, 
                  int64_t startTime,
-                 ThreadSafeQueue<AVPacket*>& queue);
+                 ThreadSafeQueue<AVPacket*>& queue,
+                 MetricRing<256>& decodeTimeRing,
+                 MetricRing<256>& convertTimeRing,
+                 std::atomic<bool>& profilingEnabled);
+    VideoDecoder(AVCodecParameters* codecParams, 
+                 AVRational timeBase, 
+                 int64_t startTime,
+                 ThreadSafeQueue<AVPacket*>& queue,
+                 std::atomic<uint64_t>* decodeTimeTracker = nullptr);
     ~VideoDecoder();
 
     bool init();
@@ -105,7 +120,7 @@ public:
 
     // Getters
     AVFrame* getYUVFrame() const { return m_yuvFrame; }
-    double getCurrentFramePts() const { return m_currentFramePts; }
+    double getCurrentFramePts() const { return m_currentFramePts.load(std::memory_order_relaxed); }
     int getWidth() const { return m_codecCtx ? m_codecCtx->width : 0; }
     int getHeight() const { return m_codecCtx ? m_codecCtx->height : 0; }
     bool isSeeking() const { return m_seeking.load(); }
@@ -113,3 +128,5 @@ public:
     std::string getPixelFormatName() const;
     bool isHardware() const { return m_codecCtx ? isHardwareDecoder(m_codecCtx->codec) : false; }
 };
+
+extern bool g_disableHardwareDecoders;

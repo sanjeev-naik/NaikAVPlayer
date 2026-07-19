@@ -42,6 +42,7 @@ private:
     std::atomic<float> m_volume;
     
     AVFrame* m_decodedFrame;
+    std::atomic<uint64_t>* m_decodeTimeTracker;
  
     // Output specs (SDL Audio configuration)
     int m_outSampleRate;
@@ -60,7 +61,8 @@ public:
     AudioDecoder(AVCodecParameters* codecParams, 
                  AVRational timeBase, 
                  int64_t startTime,
-                 ThreadSafeQueue<AVPacket*>& queue);
+                 ThreadSafeQueue<AVPacket*>& queue,
+                 std::atomic<uint64_t>* decodeTimeTracker = nullptr);
     ~AudioDecoder();
 
     bool init();
@@ -78,4 +80,6 @@ public:
 
     // Volume adjustment helper
     void setVolume(float volume); // 0.0 to 1.0
+
+    int getAudioStreamQueuedBytes() const;
 };

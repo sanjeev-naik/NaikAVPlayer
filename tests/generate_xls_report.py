@@ -137,7 +137,8 @@ def generate_excel_report(output_file):
             )
             
             # Write Title and Summary block
-            ws.cell(row=1, column=1, value=f"{sheet_name} Test Execution Report").font = font_title
+            title_text = f"{sheet_name} Execution Report" if sheet_name == "Tests" else f"{sheet_name} Test Execution Report"
+            ws.cell(row=1, column=1, value=title_text).font = font_title
             
             ws.cell(row=3, column=1, value="Metric").font = font_bold
             ws.cell(row=3, column=1).fill = sub_header_fill
@@ -253,7 +254,8 @@ def generate_excel_report(output_file):
                 failed_tests = total_tests - passed_tests
                 success_rate = (passed_tests / total_tests * 100) if total_tests > 0 else 0
                 
-                f.write(f'<div class="title">{title} Test Execution Report</div>\n')
+                report_title = f"{title} Execution Report" if title == "Tests" else f"{title} Test Execution Report"
+                f.write(f'<div class="title">{report_title}</div>\n')
                 f.write('<table>\n')
                 f.write(f'  <tr><td class="metric-header">Total Tests Run</td><td><b>{total_tests}</b></td></tr>\n')
                 f.write(f'  <tr><td class="metric-header">Passed Tests</td><td class="{ "passed" if passed_tests > 0 else "" }">{passed_tests}</td></tr>\n')

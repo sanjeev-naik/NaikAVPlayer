@@ -4,6 +4,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <functional>
+#include <atomic>
 
 template <typename T>
 class ThreadSafeQueue {
@@ -14,6 +15,7 @@ private:
     std::condition_variable m_cond_push;
     size_t m_maxSize;
     bool m_aborted;
+    std::atomic<int>* m_depthTracker = nullptr;
 
 public:
     explicit ThreadSafeQueue(size_t maxSize = 100) 
@@ -36,6 +38,9 @@ public:
         }
 
         m_queue.push(value);
+        if (m_depthTracker) {
+            m_depthTracker->store(static_cast<int>(m_queue.size()), std::memory_order_relaxed);
+        }
         m_cond_pop.notify_one();
         return true;
     }
@@ -54,6 +59,9 @@ public:
 
         value = std::move(m_queue.front());
         m_queue.pop();
+        if (m_depthTracker) {
+            m_depthTracker->store(static_cast<int>(m_queue.size()), std::memory_order_relaxed);
+        }
         m_cond_push.notify_one();
         return true;
     }
@@ -68,6 +76,9 @@ public:
 
         value = std::move(m_queue.front());
         m_queue.pop();
+        if (m_depthTracker) {
+            m_depthTracker->store(static_cast<int>(m_queue.size()), std::memory_order_relaxed);
+        }
         m_cond_push.notify_one();
         return true;
     }
@@ -82,6 +93,19 @@ public:
     size_t size() const {
         std::lock_guard<std::mutex> lock(m_mutex);
         return m_queue.size();
+    }
+
+    // Get max capacity of the queue
+    size_t capacity() const {
+        return m_maxSize;
+    }
+
+    void attachDepthMirror(std::atomic<int>* tracker = nullptr) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_depthTracker = tracker;
+        if (m_depthTracker) {
+            m_depthTracker->store(static_cast<int>(m_queue.size()), std::memory_order_relaxed);
+        }
     }
 
     // Peek the front item without popping.
@@ -112,6 +136,9 @@ public:
         while (!m_queue.empty()) {
             m_queue.pop();
         }
+        if (m_depthTracker) {
+            m_depthTracker->store(0, std::memory_order_relaxed);
+        }
         m_cond_push.notify_all();
     }
 
@@ -124,6 +151,9 @@ public:
             if (cleanupFunc) {
                 cleanupFunc(value);
             }
+        }
+        if (m_depthTracker) {
+            m_depthTracker->store(0, std::memory_order_relaxed);
         }
         m_cond_push.notify_all();
     }

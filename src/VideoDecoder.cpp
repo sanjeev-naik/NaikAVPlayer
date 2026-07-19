@@ -6,14 +6,33 @@
 
 VideoDecoder::VideoDecoder(AVCodecParameters *codecParams, AVRational timeBase,
                            int64_t startTime,
-                           ThreadSafeQueue<AVPacket *> &queue)
+                           ThreadSafeQueue<AVPacket *> &queue,
+                           MetricRing<256> &decodeTimeRing,
+                           MetricRing<256> &convertTimeRing,
+                           std::atomic<bool> &profilingEnabled)
     : m_codecParams(codecParams), m_codecCtx(nullptr), m_swsCtx(nullptr),
       m_queue(queue), m_timeBase(timeBase), m_startTime(startTime),
       m_decodedFrame(nullptr), m_yuvFrame(nullptr), m_yuvBuffer(nullptr),
       m_yuvBufferSize(0), m_allocatedWidth(0), m_allocatedHeight(0),
       m_allocatedFormat(AV_PIX_FMT_NONE), m_currentFramePts(0.0),
       m_flushRequested(false), m_startTimeSaved(false), m_seeking(false),
-      m_consecutiveEagainCount(0), m_hardwareRecoveryAttempts(0) {}
+      m_consecutiveEagainCount(0), m_hardwareRecoveryAttempts(0),
+      m_decodeTimeRing(decodeTimeRing),
+      m_convertTimeRing(convertTimeRing),
+      m_profilingEnabled(profilingEnabled),
+      m_hasDecodeStart(false) {}
+
+static MetricRing<256> g_dummyDecodeRing;
+static MetricRing<256> g_dummyConvertRing;
+static std::atomic<bool> g_dummyVideoDecoderProfilingEnabled{false};
+
+VideoDecoder::VideoDecoder(AVCodecParameters* codecParams, AVRational timeBase,
+                           int64_t startTime, ThreadSafeQueue<AVPacket*>& queue,
+                           std::atomic<uint64_t>* decodeTimeTracker)
+    : VideoDecoder(codecParams, timeBase, startTime, queue,
+                   g_dummyDecodeRing, g_dummyConvertRing, g_dummyVideoDecoderProfilingEnabled) {
+    (void)decodeTimeTracker;
+}
 
 VideoDecoder::~VideoDecoder() {
   if (m_swsCtx) {
@@ -33,11 +52,13 @@ VideoDecoder::~VideoDecoder() {
   }
 }
 
+bool g_disableHardwareDecoders = false;
+
 bool VideoDecoder::init() {
   AVCodecContext *codecCtx = nullptr;
   const AVCodec *codec = nullptr;
 
-  if (m_codecParams->codec_id == AV_CODEC_ID_H264) {
+  if (m_codecParams->codec_id == AV_CODEC_ID_H264 && !g_disableHardwareDecoders) {
     const char *candidates[] = {
 #ifdef _WIN32
         "h264_d3d11va", "h264_dxva2", "h264_qsv", "h264_cuvid",
@@ -194,12 +215,14 @@ bool VideoDecoder::init() {
 
 void VideoDecoder::flush() {
   m_flushRequested = true;
-  m_currentFramePts = 0.0;
+  m_currentFramePts.store(0.0, std::memory_order_relaxed);
   m_seeking = true;
+  m_hasDecodeStart = false;
 }
 
 bool VideoDecoder::decodeNextFrame() {
   if (!m_codecCtx) {
+    m_hasDecodeStart = false;
     return false;
   }
   if (m_flushRequested) {
@@ -231,7 +254,7 @@ bool VideoDecoder::decodeNextFrame() {
       avcodec_flush_buffers(m_codecCtx);
     }
     m_flushRequested = false;
-    m_currentFramePts = 0.0;
+    m_currentFramePts.store(0.0, std::memory_order_relaxed);
     // A freshly flushed decoder legitimately needs several packets before it
     // produces a frame again; don't let that look like a stuck hardware
     // decoder and trigger a needless software fallback after a seek.
@@ -247,19 +270,26 @@ bool VideoDecoder::decodeNextFrame() {
       m_hardwareRecoveryAttempts =
           0; // a real frame proves the session is healthy
       // We have successfully decoded a frame.
+      if (m_hasDecodeStart) {
+        auto end = std::chrono::steady_clock::now();
+        float us = static_cast<float>(std::chrono::duration_cast<std::chrono::microseconds>(end - m_decodeStart).count());
+        m_decodeTimeRing.record(us);
+        m_hasDecodeStart = false;
+      }
       // Compute the Presentation Timestamp (PTS) in seconds relative to the
       // start of the stream
       if (m_decodedFrame->pts != AV_NOPTS_VALUE) {
-        m_currentFramePts =
-            (m_decodedFrame->pts - m_startTime) * av_q2d(m_timeBase);
+        m_currentFramePts.store(
+            (m_decodedFrame->pts - m_startTime) * av_q2d(m_timeBase), std::memory_order_relaxed);
       } else if (m_decodedFrame->pkt_dts != AV_NOPTS_VALUE) {
-        m_currentFramePts =
-            (m_decodedFrame->pkt_dts - m_startTime) * av_q2d(m_timeBase);
+        m_currentFramePts.store(
+            (m_decodedFrame->pkt_dts - m_startTime) * av_q2d(m_timeBase), std::memory_order_relaxed);
       }
       return true;
     }
 
     if (ret == AVERROR_EOF) {
+      m_hasDecodeStart = false;
       return false;
     }
 
@@ -268,6 +298,7 @@ bool VideoDecoder::decodeNextFrame() {
     if (ret == AVERROR(EAGAIN)) {
       if (!packet) {
         if (!m_queue.try_pop(packet)) {
+          m_hasDecodeStart = false;
           return false; // Queue empty/aborted, do not block main thread!
         }
 
@@ -282,11 +313,16 @@ bool VideoDecoder::decodeNextFrame() {
               << std::endl;
           if (!recoverHardwareDecoder()) {
             av_packet_free(&packet);
+            m_hasDecodeStart = false;
             return false;
           }
         }
       }
 
+      if (!m_hasDecodeStart && m_profilingEnabled.load(std::memory_order_relaxed)) {
+        m_decodeStart = std::chrono::steady_clock::now();
+        m_hasDecodeStart = true;
+      }
       ret = avcodec_send_packet(m_codecCtx, packet);
       if (ret == AVERROR(EAGAIN)) {
         // Not a failure: the decoder's internal buffer (or, for async
@@ -305,6 +341,7 @@ bool VideoDecoder::decodeNextFrame() {
       av_packet_free(&packet); // Release packet wrapper
       packet = nullptr;
       if (ret < 0) {
+        m_hasDecodeStart = false;
         return false; // Critical send error
       }
     } else {
@@ -321,12 +358,27 @@ bool VideoDecoder::decodeNextFrame() {
       if (packet) {
         av_packet_free(&packet);
       }
+      m_hasDecodeStart = false;
       return false;
     }
   }
 }
 
 bool VideoDecoder::convertFrame(ResolutionOption option) {
+  struct ConvertTimeTracker {
+      std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+      MetricRing<256>& ring;
+      bool enabled;
+      ConvertTimeTracker(MetricRing<256>& r, bool e) : ring(r), enabled(e) {}
+      ~ConvertTimeTracker() {
+          if (enabled) {
+              auto end = std::chrono::steady_clock::now();
+              float us = static_cast<float>(std::chrono::duration_cast<std::chrono::microseconds>(end - start).count());
+              ring.record(us);
+          }
+      }
+  } tracker_guard(m_convertTimeRing, m_profilingEnabled.load(std::memory_order_relaxed));
+
   if (!m_codecCtx || !m_decodedFrame || m_decodedFrame->width <= 0 ||
       m_decodedFrame->height <= 0) {
     return false;
