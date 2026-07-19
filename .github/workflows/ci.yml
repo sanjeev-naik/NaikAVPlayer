@@ -32,7 +32,8 @@ jobs:
             libsdl2-dev \
             libgtk-3-dev \
             ccache \
-            cppcheck
+            cppcheck \
+            lcov
 
       - name: Setup Compiler Cache (ccache)
         uses: hendrikmuhs/ccache-action@v1
@@ -57,6 +58,19 @@ jobs:
         run: |
           cd build-linux
           ctest -T Test --output-on-failure
+
+      - name: Capture and Filter Coverage
+        run: |
+          lcov --directory build-linux --capture --output-file coverage.info
+          lcov --remove coverage.info '/usr/*' '*/thirdparty/*' '*/tests/*' --output-file coverage.info --ignore-errors unused
+          lcov --list coverage.info --ignore-errors unused
+
+      - name: Upload Coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: coverage.info
+          fail_ci_if_error: false
 
       - name: Run Static Analysis (cppcheck)
         run: |

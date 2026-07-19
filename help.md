@@ -1,38 +1,39 @@
 # NaikAVPlayer Build & Usage Guide
 
-This guide describes how to build, compile, install, run, and uninstall the native C++ video player on Windows and Linux.
+This guide describes how to configure, compile, install, run, and uninstall the native C++ video player on Windows and Linux platforms.
 
 ---
 
 ## 1. Prerequisites & Dependencies
 
-The project is natively cross-platform:
-- **CMake (version 3.16+)**: Cross-platform build generation suite.
-- **SDL3, Dear ImGui & nativefiledialog-extended**: Fetched and compiled from source automatically during configure.
+The project is cross-platform and requires CMake and C++17 compliant compilers.
 
-### Windows
-- **MinGW-w64 (GCC)**.
-- **FFmpeg (Shared release)**: Automatically downloaded and configured in the local `thirdparty/ffmpeg` directory.
+### Windows (Native MinGW-w64)
+- **CMake (version 3.16+)**: Build configuration generation tools.
+- **MinGW-w64 (GCC)**: Native GCC compiler toolchain for Windows.
+- **FFmpeg**: Shared release libraries. Automatically downloaded and configured in `thirdparty/ffmpeg/` during the CMake configuration step.
+- **SDL3, Dear ImGui, nativefiledialog-extended (NFD)**: Automatically downloaded and compiled from source via FetchContent.
 
 ### Linux
-- **GCC**.
-- **FFmpeg development packages**: Must be installed via the system package manager (e.g. `sudo apt-get install libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libswresample-dev`).
-- **GTK3 development package**: Must be installed via the system package manager (`sudo apt-get install libgtk-3-dev`) to compile the native file dialog backend.
+- **GCC**: Compiler supporting C++17.
+- **FFmpeg development headers**: Must be installed via the system package manager (e.g. `libavcodec-dev`, `libavformat-dev`, `libavutil-dev`, `libswscale-dev`, `libswresample-dev`).
+- **GTK3 development libraries**: Must be installed via the system package manager (`libgtk-3-dev`) to compile the native file dialog backend.
+- **SDL3, Dear ImGui, nativefiledialog-extended (NFD)**: Automatically downloaded and compiled from source via FetchContent.
 
 ---
 
 ## 2. Compilation Instructions
 
-The build system supports a custom `PLATFORM` configuration variable:
+The build system supports the `PLATFORM` cache variable to configure platform-specific linking:
 - **`AUTO`** (default): Automatically detects the host operating system.
-- **`WINDOWS`**: Explicitly configures the project to build for Windows.
-- **`LINUX`**: Explicitly configures the project to build for Linux.
+- **`WINDOWS`**: Configures project subsystems and libraries for Windows targets.
+- **`LINUX`**: Configures linking targets for Linux environments.
 
-### Step A: Configure CMake Build Target
+### Step A: Configure the CMake Build Target
 
-Open your terminal in the project root directory and run:
+Execute configuration command from the project root directory:
 
-**Auto-detect (Recommended):**
+**Auto-detect (Default):**
 ```bash
 cmake -B build
 ```
@@ -48,12 +49,12 @@ cmake -B build -DPLATFORM=LINUX
 ```
 
 **Cross-Compile for Windows on Linux:**
-If you are on a Linux machine (e.g. Ubuntu) and want to cross-compile Windows binaries:
+To cross-compile Windows binaries on a Linux host:
 ```bash
-# Install the cross-compiler
+# Install the cross-compiler toolchain
 sudo apt-get install -y mingw-w64
 
-# Configure CMake for Windows target
+# Configure CMake with cross-compiler toolchain settings
 cmake -B build-windows \
   -DPLATFORM=WINDOWS \
   -DCMAKE_SYSTEM_NAME=Windows \
@@ -65,21 +66,20 @@ cmake --build build-windows
 ```
 
 ### Step B: Compile Project
-Build the binaries:
+Build target executables:
 ```bash
 cmake --build build
 ```
-*Note: On Windows, a post-build script automatically copies all necessary DLLs (like `SDL3.dll` and FFmpeg shared `.dll`s) from `thirdparty/ffmpeg/bin` directly to the `build/` directory so you can run it immediately.*
+*(On Windows platforms, a post-build target automatically copies FFmpeg and SDL3 DLLs from the source path directly into the output directory).*
 
 ### Step C: Install Application (Linux)
-To install the binaries, assets, desktop entry, and icon onto the system:
+Install target binaries, desktop launchers, icons, and typography to system paths:
 ```bash
 sudo cmake --install build
 ```
-This registers the application so it can be launched from the applications menu and stores font assets in standard shared directories.
 
 ### Step D: Uninstall Application (Linux)
-To remove all installed files and clean desktop launcher references:
+Remove installed binaries and desktop reference entries:
 ```bash
 sudo cmake --build build --target uninstall
 ```
@@ -88,7 +88,7 @@ sudo cmake --build build --target uninstall
 
 ## 3. Running the Player
 
-Launch the compiled executable or installed application:
+Execute the target binary from the build directory or the installed path.
 
 **Windows (PowerShell):**
 ```powershell
@@ -100,18 +100,31 @@ Launch the compiled executable or installed application:
 ./build/NaikAVPlayer
 ```
 
-**Linux (System-Wide Installed):**
-You can launch the app from your desktop launcher or run:
+**Linux (System Installed):**
 ```bash
 NaikAVPlayer
 ```
 
-**Windows (with metrics):**
+**Provide media file path argument:**
+
+**Windows:**
+```powershell
+.\build\NaikAVPlayer.exe "C:\Path\To\video.mp4"
+```
+
+**Linux:**
+```bash
+./build/NaikAVPlayer "/home/user/Videos/video.mp4"
+```
+
+**Run with telemetry profiling HUD enabled:**
+
+**Windows:**
 ```powershell
 .\build\NaikAVPlayer.exe --metrics "C:\Path\To\video.mp4"
 ```
 
-**Linux (with metrics):**
+**Linux:**
 ```bash
 ./build/NaikAVPlayer --metrics "/home/user/Videos/video.mp4"
 ```
@@ -120,58 +133,57 @@ NaikAVPlayer
 
 ## 4. UI Features & Controls
 
-The player is designed with a premium dark glassmorphism interface.
+The player interface is built with Dear ImGui, rendering a frosted translucency overlay.
 
-### How to Open Media Files:
-1. **Drag-and-Drop**: Drag any video (`.mp4`, `.mkv`, `.avi`, `.webm`, etc.) or audio (`.mp3`, `.wav`) file directly onto the player window. It will open and start playing instantly!
-2. **Native File Dialog**: Click the **"Open Media File"** button on the welcome screen or the **Folder (Browse)** icon button at the bottom-left of the controls bar to open the native OS file picker (Win32 File Explorer on Windows, GTK3/Portal on Linux).
+### Media Ingestion
+1. **Drag-and-Drop**: Dragging supported video or audio formats onto the player window initiates demuxing and starts playback.
+2. **Native File Selector**: Clicking the "Open Media File" button on the onboarding interface or the folder icon on the controls dock launches the system file selector (Win32 File Explorer on Windows, GTK3/Portal on Linux).
 
-### GUI Controls:
-- **Timeline Slider**: Left-click or drag on the bottom progress bar to jump to any segment.
-- **Volume Slider & Toggle**: Adjust the software volume attenuator from 0% to 100%. Click the **Volume/Mute Icon** button next to the volume slider to toggle mute instantly (using a zero-overhead CPU bypass).
-- **Loop Toggle**: Click the **Loop Icon** button (next to Seek Forward) to enable or disable continuous playback. When enabled, the media automatically seeks back to the beginning and keeps playing once it reaches the end, instead of stopping.
+### Controls Interface
+- **Progress bar**: Jump to target time positions by clicking or dragging on the timeline.
+- **Volume controls**: Attenuates output audio samples. Mute/bypass controls use memset/memcpy shortcuts at thresholds (<= 1% and >= 99% volume).
+- **Loop controls**: Continuous playback loop wraps around to 0.0 on end-of-file.
 
-### Keyboard Hotkeys:
-- **Spacebar**: Toggle Play / Pause.
-- **Left Arrow key ($\leftarrow$)**: Seek backward by 10 seconds.
-- **Right Arrow key ($\rightarrow$)**: Seek forward by 10 seconds.
-- **L**: Toggle Loop Mode on/off.
-- **Escape**: Immediately close and exit the player.
+### Keyboard Shortcuts
+- **`Spacebar`**: Toggle Play / Pause.
+- **`Left Arrow`**: Seek backward by 10 seconds.
+- **`Right Arrow`**: Seek forward by 10 seconds.
+- **`L`**: Toggle Loop playback mode.
+- **`D`**: Toggle Diagnostics HUD / telemetry metrics collection.
+- **`Escape`**: Exit application.
 
 ---
 
-## 5. Hardware Decoding & Dynamic Fallback
+## 5. Hardware Decoding & Fallback
 
-NaikAVPlayer natively supports hardware-accelerated H.264 decoding to deliver maximum frame rates and low CPU utilization:
-- **Supported Decoders:** The player queries and attempts to initialize OS-specific hardware codecs (`h264_d3d11va`, `h264_dxva2`, `h264_qsv`, or `h264_cuvid` on Windows; `h264_vaapi` or `h264_v4l2m2m` on Linux).
-- **Dynamic Fallback:** If a hardware decoder fails during initialization or encounters a fatal decoding or surface mapping error at runtime (e.g. running on driverless or virtualized headless environments), the player dynamically and seamlessly switches to the software `h264` decoder. This guarantees compatibility across all environments without manual configuration.
+The player supports hardware-accelerated H.264 video decoding.
+- **Initialization candidates:** The decoder checks and attempts initialization of platform-specific hardware decoders (Windows: `h264_d3d11va`, `h264_dxva2`, `h264_qsv`, `h264_cuvid`; Linux: `h264_v4l2m2m`, `h264_vaapi`, `h264_qsv`, `h264_cuvid`).
+- **Dynamic software fallback:** If hardware initialization fails, or if a runtime error occurs during hardware context extraction, the system automatically allocates the software `h264` codec, resubmits pending packets, and continues playback.
 
 ---
 
 ## 6. Security & Dependency Maintenance
 
-- **Upstream Security**: NaikAVPlayer relies on external decoders (FFmpeg) to parse and process media streams. Because parsing media files carries inherent security risks (e.g. malformed files attempting to exploit decoder bugs), keeping your shared libraries updated is the best defense.
-- **Pinned, Verified Dependencies**: All dependencies are pinned to exact versions for reproducible, supply-chain-verifiable builds: FFmpeg is pinned to a specific month-end BtbN release with SHA256 checksum verification at download time, and SDL3, Dear ImGui, and NFD are pinned to release tags via CMake FetchContent. Builds cannot silently drift to unverified upstream binaries.
-- **Updating the FFmpeg pin**: Run `update_ffmpeg_pin.py --tag <new-month-end-tag>` to derive a fresh verified URL + SHA256 pair, which updates `FFMPEG_ZIP_URL` and `FFMPEG_ZIP_SHA256` in `CMakeLists.txt`. Then delete `thirdparty/ffmpeg` and re-run the CMake configure step to fetch the new pinned version. To update SDL3/ImGui/NFD, bump the corresponding `GIT_TAG` in `CMakeLists.txt`.
+- **Upstream Security**: The application parses untrusted container metadata and packet formats via FFmpeg. To mitigate vulnerability risks, downstream builds should keep upstream dependencies updated.
+- **Dependency Pinning**: Build configurations are pinned to verified, checksum-tested releases. FFmpeg downloads use month-end releases validated with SHA-256 hashes during CMake configuration. SDL3, Dear ImGui, and nativefiledialog-extended are pinned to specific version tags.
+- **Updating dependencies**: Use `update_ffmpeg_pin.py --tag <target-tag>` to generate a new checksum pair for `CMakeLists.txt`. To update SDL3/ImGui/NFD, update the corresponding `GIT_TAG` entries in `CMakeLists.txt`.
 
 ---
 
 ## 7. GitHub Actions CI/CD & Caching
 
-The project includes an automated GitHub Actions pipeline (configured in [.github/workflows/ci.yml](.github/workflows/ci.yml)) that runs on every commit (`push`) and pull request (`pull_request`) to verify code health:
-- **C++ Compiler Warnings Check**: Builds the application targets with compiler warnings treated as errors (`-Werror`) for strict compliance.
-- **Native Linux Build & Test**: Compiles the codebase using GCC on an Ubuntu runner and executes the test suite.
-- **Sanitizers Verification**: Compiles and runs the native Linux test suite under AddressSanitizer (ASan) and UndefinedBehaviorSanitizer (UBSan) to detect memory management bugs and undefined behavior.
-- **ThreadSanitizer (TSan) Verification**: Compiles and runs the native Linux test suite under ThreadSanitizer (TSan) to detect data races and thread synchronization issues.
-- **Static Analysis**: Performs static analysis checks on all source and test C++ files using `cppcheck`.
-- **Windows Cross-Compilation**: Cross-compiles Windows executables on the Linux runner using the MinGW-w64 GCC cross-compiler (`x86_64-w64-mingw32-gcc`/`g++`).
-- **Compiler Caching (`ccache`)**: Speeds up verification times by caching compiled object units globally on GitHub Actions. It bypasses recompiling large upstream dependencies like SDL3 and Dear ImGui, cutting down build times significantly.
+The CI/CD pipeline verifies build stability on every push or pull request:
+- **Warnings as errors:** Builds are compiled with `-Werror` flags to prevent warning compilation.
+- **Native verification:** Native Linux builds run under standard compilation, AddressSanitizer/UndefinedBehaviorSanitizer (ASan/UBSan) instrumentation, and ThreadSanitizer (TSan) data race checking.
+- **Static Analysis**: Runs static code analysis checks using `cppcheck`.
+- **Cross-Compilation**: Verifies Windows target compilation on Linux runners.
+- **Compiler Cache**: Uses `ccache` to persist intermediate object code on runner nodes, speeding up successive dependency compilation steps.
 
 ---
 
 ## 8. Pipeline Instrumentation & Metrics Summary
 
-This section documents the hook sites, thread ownership, and architectural details for the 9 implemented pipeline metrics.
+The execution pipeline tracks 9 metrics using lock-free Single Producer Single Consumer (SPSC) metric rings.
 
 ### Hook Sites & Thread Ownership
 
@@ -191,11 +203,11 @@ This section documents the hook sites, thread ownership, and architectural detai
 ### Metric Details & Design Decisions
 
 #### Thread Ownership & Safety
-- **SPSC Ring Verification**: Each `MetricRing` is modified by a single producer thread and snapshot/read by the main render thread, strictly adhering to the SPSC (Single Producer Single Consumer) model.
-  - **Convert Time vs. Upload Time**: Both the hardware CPU copy (`av_hwframe_transfer_data`) and the software color-conversion/scaling path (`sws_scale`) run completely on the background video decoder thread. Thus, `convert_time_us` (Hook-A) is safely recorded on the video decoder thread. Meanwhile, `upload_time_us` (Hook-B) is recorded on the main render thread where `SDL_UpdateYUVTexture` / `SDL_UpdateNVTexture` takes place. This separation ensures both rings are single-producer.
-  - **Seek Latency**: Latency delta is recorded on the transition side (`finishCatchup`) on the video decoder thread, passing the start timestamp from `seek()` safely through catch-up epoch state variables protected under `m_catchupMutex`. This avoids any concurrent write access to the SPSC ring.
-- **Lock-Free Ring Writes**: All MetricRing::record writes and gauge/counter updates are lock-free std::atomic operations with no condition variables or heap allocations on the hot path. The single exception is M9's start-timestamp handoff, which reuses the pre-existing m_catchupMutex already taken by the seek catch-up state machine — no additional lock is introduced by instrumentation.
-- **Profiling Activation Gate**: Instantiations of time-series ring measurements (`MetricRing::record`) are gated behind the `m_profilingEnabled` relaxed load check. Instantaneous gauges (M1-M3) and the dropped-frame counter (M8) are always-on to avoid unnecessary branching overhead.
+- **SPSC Ring Verification**: Each `MetricRing` is modified by a single producer thread and snapshot/read by the main render thread, adhering to the SPSC model.
+  - **Convert Time vs. Upload Time**: Both the hardware CPU copy (`av_hwframe_transfer_data`) and the software color-conversion/scaling path (`sws_scale`) run on the background video decoder thread. `convert_time_us` is recorded on the video decoder thread. `upload_time_us` is recorded on the main render thread where `SDL_UpdateYUVTexture` / `SDL_UpdateNVTexture` occurs. This separation preserves the single-producer constraint.
+  - **Seek Latency**: Latency delta is recorded on the transition side (`finishCatchup`) on the video decoder thread, passing the start timestamp from `seek()` through catch-up epoch state variables protected under `m_catchupMutex`. This avoids concurrent writes to the SPSC ring.
+- **Lock-Free Ring Writes**: MetricRing writes and gauge/counter updates are lock-free `std::atomic` operations with no condition variables or heap allocations on the hot path. The only lock is the pre-existing `m_catchupMutex` used by the seek catch-up state machine to copy the start timestamp for M9.
+- **Profiling Activation Gate**: Instantiations of time-series ring measurements (`MetricRing::record`) are gated behind the `m_profilingEnabled` relaxed load check. Instantaneous gauges (M1-M3) and the dropped-frame counter (M8) are always-on.
 
 #### Omissions or splits
-- No metrics were omitted or split incorrectly. `convert_time_us` and `upload_time_us` were mapped to separate rings as they run on separate threads, fully keeping to the SPSC thread constraints. In addition to the SPSC ring framework, the diagnostics HUD displays other frame-loop timings (Present/VSync wait, frame pacing, audio callback duration) measured with local steady_clock deltas on their owning threads for real-time visualization.
+- `convert_time_us` and `upload_time_us` are separated into distinct rings as they execute on different threads, satisfying the SPSC thread constraints. Other frame-loop timings displayed on the HUD (Present/VSync wait, frame pacing, audio callback duration) are measured with local steady_clock deltas on their respective threads.
