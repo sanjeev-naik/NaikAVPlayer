@@ -190,6 +190,8 @@ jobs:
             libswscale-dev:arm64 \
             libswresample-dev:arm64 \
             libgtk-3-dev:arm64 \
+            libasound2-dev:arm64 \
+            libxss-dev:arm64 \
             ccache
 
       - name: Setup Compiler Cache (ccache)
