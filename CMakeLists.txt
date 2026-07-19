@@ -28,6 +28,15 @@ else()
     message(FATAL_ERROR "Invalid PLATFORM option specified. Options: WINDOWS, LINUX, AUTO")
 endif()
 
+# Single-config generators default to an empty CMAKE_BUILD_TYPE, which means
+# no optimization flags at all. _FORTIFY_SOURCE requires -O1+ on glibc, and an
+# unoptimized "default" build is never what we want anyway - so default to
+# Release when the user hasn't chosen.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+    set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS "Debug" "Release" "RelWithDebInfo" "MinSizeRel")
+endif()
+
 # -------------------------------------------------------------
 # Compiler & Linker Hardening Options
 # -------------------------------------------------------------
@@ -362,7 +371,10 @@ option(ENABLE_COVERAGE "Enable code coverage instrumentation" ON)
 if(ENABLE_COVERAGE AND NOT ENABLE_TSAN)
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         # Enable GCC/Clang code coverage flags for tests
-        target_compile_options(NaikAVPlayer_tests PRIVATE --coverage -O0 -g)
+        # Tests are always -O0 (coverage accuracy); glibc's _FORTIFY_SOURCE emits a
+        # #warning without optimization, which -Werror escalates. Undefine it here -
+        # this target-level flag comes after the global -D and takes precedence.
+        target_compile_options(NaikAVPlayer_tests PRIVATE --coverage -O0 -g -U_FORTIFY_SOURCE)
         target_link_options(NaikAVPlayer_tests PRIVATE --coverage)
     elseif(MSVC)
         target_compile_options(NaikAVPlayer_tests PRIVATE /Zi /Od)
@@ -372,7 +384,7 @@ else()
     if(MSVC)
         target_compile_options(NaikAVPlayer_tests PRIVATE /Od)
     else()
-        target_compile_options(NaikAVPlayer_tests PRIVATE -O0 -g)
+        target_compile_options(NaikAVPlayer_tests PRIVATE -O0 -g -U_FORTIFY_SOURCE)
     endif()
 endif()
 
