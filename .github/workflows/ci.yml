@@ -26,6 +26,8 @@ jobs:
             ffmpeg \
             libsdl2-dev \
             libgtk-3-dev \
+            libva-dev \
+            libvdpau-dev \
             ccache \
             cppcheck \
             lcov \
@@ -52,7 +54,9 @@ jobs:
             --disable-doc \
             --disable-avdevice \
             --disable-postproc \
-            --disable-avfilter
+            --disable-avfilter \
+            --enable-vaapi \
+            --enable-v4l2-m2m
           make -j$(nproc)
           make install
 
@@ -408,6 +412,8 @@ jobs:
             libgtk-3-dev:arm64 \
             libasound2-dev:arm64 \
             libxss-dev:arm64 \
+            libva-dev:arm64 \
+            libvdpau-dev:arm64 \
             ccache
 
       - name: Cache FFmpeg Build (aarch64)
@@ -437,7 +443,9 @@ jobs:
             --arch=aarch64 \
             --target-os=linux \
             --cc=aarch64-linux-gnu-gcc \
-            --cxx=aarch64-linux-gnu-g++
+            --cxx=aarch64-linux-gnu-g++ \
+            --enable-vaapi \
+            --enable-v4l2-m2m
           make -j$(nproc)
           make install
 

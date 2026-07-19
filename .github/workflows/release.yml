@@ -77,7 +77,7 @@ jobs:
       - name: Install Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev yasm
+          sudo apt-get install -y libgtk-3-dev yasm libva-dev libvdpau-dev
 
       - name: Cache FFmpeg Build
         id: cache-ffmpeg
@@ -100,7 +100,9 @@ jobs:
             --disable-doc \
             --disable-avdevice \
             --disable-postproc \
-            --disable-avfilter
+            --disable-avfilter \
+            --enable-vaapi \
+            --enable-v4l2-m2m
           make -j$(nproc)
           make install
 
@@ -214,6 +216,8 @@ jobs:
             libgtk-3-dev:arm64 \
             libasound2-dev:arm64 \
             libxss-dev:arm64 \
+            libva-dev:arm64 \
+            libvdpau-dev:arm64 \
             ccache
 
       - name: Cache FFmpeg Build (aarch64)
@@ -243,7 +247,9 @@ jobs:
             --arch=aarch64 \
             --target-os=linux \
             --cc=aarch64-linux-gnu-gcc \
-            --cxx=aarch64-linux-gnu-g++
+            --cxx=aarch64-linux-gnu-g++ \
+            --enable-vaapi \
+            --enable-v4l2-m2m
           make -j$(nproc)
           make install
 
