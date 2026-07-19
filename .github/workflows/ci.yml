@@ -322,14 +322,47 @@ jobs:
       - name: Install Cross-Compiler and Dependencies
         run: |
           sudo dpkg --add-architecture arm64
+
+          # Restrict existing amd64 list sources to [arch=amd64]
+          if [ -f /etc/apt/sources.list ]; then
+            sudo sed -i 's/deb http/deb [arch=amd64] http/g' /etc/apt/sources.list
+            sudo sed -i 's/deb mirror/deb [arch=amd64] mirror/g' /etc/apt/sources.list
+          fi
+          if [ -d /etc/apt/sources.list.d ]; then
+            find /etc/apt/sources.list.d/ -type f -name "*.list" -exec sudo sed -i 's/deb http/deb [arch=amd64] http/g' {} +
+          fi
+
+          # Restrict existing amd64 DEB822 sources to Architectures: amd64
+          sudo python3 -c '
+          import glob, os
+          for p in glob.glob("/etc/apt/sources.list.d/*.sources"):
+              with open(p, "r") as f:
+                  content = f.read()
+              blocks = content.split("\n\n")
+              new_blocks = []
+              modified = False
+              for block in blocks:
+                  if "Suites:" in block and "Architectures:" not in block:
+                      lines = block.split("\n")
+                      for i, line in enumerate(lines):
+                          if line.startswith("Suites:"):
+                              lines.insert(i, "Architectures: amd64")
+                              modified = True
+                              break
+                      block = "\n".join(lines)
+                  new_blocks.append(block)
+              if modified:
+                  with open(p, "w") as f:
+                      f.write("\n\n".join(new_blocks))
+          '
+
+          # Add arm64 sources
           sudo tee /etc/apt/sources.list.d/arm64.list <<EOF
           deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ $(lsb_release -cs) main restricted universe multiverse
           deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ $(lsb_release -cs)-updates main restricted universe multiverse
           deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ $(lsb_release -cs)-security main restricted universe multiverse
           EOF
-          sudo sed -i 's/deb http/deb [arch=amd64] http/g' /etc/apt/sources.list
-          sudo sed -i 's/deb mirror/deb [arch=amd64] mirror/g' /etc/apt/sources.list
-          
+
           sudo apt-get update
           sudo apt-get install -y \
             g++-aarch64-linux-gnu \
@@ -383,7 +416,7 @@ jobs:
         run: |
           mkdir -p NaikAVPlayer-linux-aarch64/lib
           cp build-linux-aarch64/NaikAVPlayer NaikAVPlayer-linux-aarch64/
-          find build-linux-aarch64 -name "libSDL3.so*" -exec cp -P {} NaikAVPlayer-linux-x64/lib/ \; # Wait, copy to NaikAVPlayer-linux-aarch64/lib/
+          find build-linux-aarch64 -name "libSDL3.so*" -exec cp -P {} NaikAVPlayer-linux-aarch64/lib/ \; # Wait, copy to NaikAVPlayer-linux-aarch64/lib/
           # Wait, let's fix the above copy destination to: NaikAVPlayer-linux-aarch64/lib/
           # I will correct the template copy below in ReplacementContent:
           # find build-linux-aarch64 -name "libSDL3.so*" -exec cp -P {} NaikAVPlayer-linux-aarch64/lib/ \;
