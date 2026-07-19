@@ -1,35 +1,22 @@
 # NaikAVPlayer
 
-A native, multi-threaded C++ media engine and video player built for extreme performance, low memory footprint, and zero-latency seek responsiveness.
+[![CI/CD Pipeline](https://github.com/sanjeev-naik/NaikAVPlayer/actions/workflows/ci.yml/badge.svg)](https://github.com/sanjeev-naik/NaikAVPlayer/actions/workflows/ci.yml)
+[![Coverage Status](https://img.shields.io/badge/coverage-100%25-brightgreen)](https://github.com/sanjeev-naik/NaikAVPlayer/actions)
+
+NaikAVPlayer is a native, multi-threaded C++ media engine and video player built on raw FFmpeg APIs, SDL3, and Dear ImGui. It performs container parsing, software/hardware video decoding, sample-accurate audio resampling, and clock synchronization directly using GPU-mapped texture updates without intermediate frameworks. It targets low-latency seeking and sub-10ms audio-video clock synchronization using lock-free data structures and dedicated worker threads.
 
 ![NaikAVPlayer Screenshot](assets/screenshot.png)
 
-Built on top of barebones **FFmpeg**, **SDL3**, and **Dear ImGui**, **NaikAVPlayer** implements container parsing, frame rescaling, and sub-frame clock synchronization directly on raw texture planes with no external wrapper overhead.
+## Features
 
----
-
-## Key Features
-
-- 🏎️ **Symmetric Seeking:** Near-instantaneous forward and backward seeks without deadlocks or frames freezing.
-- ⚙️ **Dynamic Hardware Fallback:** Seamlessly attempts hardware-accelerated H.264 decoding (Intel QSV, NVIDIA CUVID, D3D11VA, DXVA2, VAAPI, or V4L2M2M depending on OS), falling back dynamically to the software `h264` decoder on failure (e.g. driverless or virtualized systems) to prevent playback disruptions.
-- ⏱️ **Audio-Video Synchronization:** Sub-frame accurate clock sync maintaining frame drift under `10ms` relative to the audio device master timeline.
-- 🎛️ **Software Volume Controls:** Software audio sample attenuator with dynamic byte scaling, including a zero-overhead mute/bypass layout.
-- 🔁 **Loop Playback Mode:** Toggle continuous replay (via the Loop control button or the `L` hotkey) to automatically seek back to the start on reaching end-of-file instead of stopping — ideal for kiosks, demos, and long-running validation.
-- 📂 **Flexible Media Loading:** Supports drag-and-drop file ingestion directly onto the player window, or custom local file system parsing.
-- 🗂️ **Native File Picker:** Cross-platform native OS file dialog powered by **nativefiledialog-extended (NFD)** — uses the Win32 File Explorer on Windows and GTK3/Portal on Linux.
-- 📊 **Diagnostics HUD & Pipeline Profiler:** Real-time HUD diagnostics overlay displaying player states, playback clock offsets, media metadata, and a lock-free pipeline profiler with time-series metrics.
-- 🎨 **Modern Glassmorphic GUI with Vector Icons:** Floating dock and cinematic header layouts with a frosted translucent obsidian design, circular progress grabs, interactive welcome onboarding cards, toggleable HUD sidebars, and **programmatically-rendered vector control icons** (Play, Pause, Stop, Seek, Volume, Loop, Browse) featuring neon cyan hover highlights and accessibility tooltips.
-- 🔤 **Bundled Open-Source Typography:** Integrated with **Noto Sans** fonts (SIL Open Font License 1.1) scanned dynamically from relative and installed system paths, avoiding system-dependent proprietary lookups.
-
----
-
-## Key Performance Indicators (KPIs)
-
-To maintain extreme performance and rendering accuracy, the core engine adheres to strict engineering targets:
-- ⏱️ **Audio-Video Drift (`< 10ms`):** Frame-alignment target relative to the audio device master clock timeline. If the video frame PTS lags behind the current playback clock, the render loop in `main.cpp` drains the decoded frame queue to discard late frames and present the most recent frame instantly.
-- 🏎️ **Seek Latency (`< 80ms`):** Seek-to-keyframe catch-up response time under normal workloads. The player immediately flushes packet queues and codec caches, then deactivates seeking catch-up in `PlayerController.cpp` once the decoded frame PTS reaches within 5ms (`m_catchupTarget - 0.005`) of the seek target.
-- 🧪 **Code Quality (`100.00%`):** Unit and integration test line coverage on all core playback, demuxing, and decoding engine files (`AudioDecoder.cpp`, `VideoDecoder.cpp`, `Demuxer.cpp`, `PlayerController.cpp`, and `ThreadSafeQueue.hpp`).
-- 🎛️ **Audio Attenuation:** Zero-overhead software attenuator bypass for mute and full volume states. Full volume (`volume >= 0.99f`) bypasses the scaling loop using `std::memcpy`; mute volume (`volume <= 0.01f`) bypasses the loop using `std::memset` to 0.
+- **Symmetric Seeking:** Keyframe seek operations flushing packet queues and decoding pipelines under 80ms.
+- **Dynamic Hardware Fallback:** Attempts initialization of platform-specific hardware decoders (D3D11VA, DXVA2, QSV, CUVID on Windows; V4L2M2M, VAAPI, QSV, CUVID on Linux), falling back dynamically to software H.264 decoding if hardware context allocation fails.
+- **Audio-Video Synchronization:** Reconstructs audio clock sample-accurately from PCM sample offsets to maintain drift under 10ms.
+- **Software Volume Attenuation:** Scalable audio output level adjustments with memcpy/memset bypasses for 100% and 0% volume states.
+- **Loop Playback:** Wraparound seek to 0.0 upon reaching end-of-file for continuous playback.
+- **Native File Dialog:** Cross-platform native file picker integration using nativefiledialog-extended (NFD) on Win32 and GTK3/Portal backends.
+- **Pipeline Diagnostics HUD:** Interactive overlay displaying player states, playback clock offsets, frame timings, and queue levels.
+- **Translucent User Interface:** ImGui-based desktop interface using bundled Noto Sans typography.
 
 ---
 
@@ -48,7 +35,7 @@ NaikAVPlayer follows the classic multi-threaded media player design: a demuxer t
 │             │   packets   ┌──────────────────┐                         │
 │             ├────────────►│  Audio Queue     │──► AudioDecoder         │ A/V Sync
 │             │             │ (AVPacket* [150])│    (SDL3 Audio Stream   │ (Master Clock)
-└─────────────┘             └──────────────────┘     callback thread)◄───┘
+│             └──────────────────┘     callback thread)◄───┘
 ```
 
 - **Demuxer thread**: Reads raw packets via `av_read_frame` and routes them into bounded `ThreadSafeQueue<AVPacket*>` instances (video capacity: 100 packets, audio capacity: 150 packets).
@@ -61,7 +48,7 @@ NaikAVPlayer follows the classic multi-threaded media player design: a demuxer t
 Instead of performing costly YUV-to-RGB color space conversions on the CPU, the video decoder pipeline extracts raw YUV 4:2:0 planar frame data directly. The main thread maps this data onto a hardware-accelerated SDL3 streaming texture (`SDL_PIXELFORMAT_IYUV`) using `SDL_UpdateYUVTexture`. This uploads the raw plane segments directly to GPU-mapped texture memory, allowing the graphics hardware to handle color space conversion and scaling efficiently.
 
 #### Dynamic Hardware Decoder Fallback
-To achieve optimal playback performance without sacrificing robustness, the video decoder pipeline employs a dynamic hardware-to-software fallback. At initialization, it queries and tries to open native hardware decoders (such as `h264_d3d11va`, `h264_dxva2`, `h264_qsv`, or `h264_cuvid` on Windows; `h264_vaapi`, `h264_v4l2m2m` on Linux). If a hardware decoder fails during initialization or encounters a fatal decoding or surface mapping error at runtime (e.g. running on driverless or virtualized headless environments), the decoder intercepts the failure, releases the hardware context, configures the software `h264` decoder, and resubmits the video packet. This guarantees a seamless transition with zero playback disruption or application crashes.
+To achieve optimal playback performance without sacrificing robustness, the video decoder pipeline employs a dynamic hardware-to-software fallback. At initialization, it queries and tries to open native hardware decoders (such as `h264_d3d11va`, `h264_dxva2`, `h264_qsv`, or `h264_cuvid` on Windows; `h264_vaapi`, `h264_v4l2m2m` on Linux). If a hardware decoder fails during initialization or encounters a fatal decoding or surface mapping error at runtime (e.g. running on driverless or virtualized headless environments), the decoder intercepts the failure, releases the hardware context, configures the software `h264` decoder, and resubmits the video packet. This guarantees a seamless transition with minimal playback disruption or application crashes.
 
 ### Audio-Master Clock
 
@@ -73,7 +60,7 @@ The audio clock isn't just "the last decoded packet's timestamp." It's reconstru
 audio_clock = base_pts_of_current_frame + (bytes_already_consumed_by_SDL / bytes_per_second)
 ```
 
-`AudioDecoder::getAudioClock()` combines the PTS of the most recently decoded frame with how far the SDL audio callback has already progressed *into* that frame's buffer, giving sub-frame timing resolution rather than per-packet granularity. This is what makes the `<10ms` drift KPI meaningful rather than aspirational — the reference clock itself is precise enough to support that tolerance.
+`AudioDecoder::getAudioClock()` combines the PTS of the most recently decoded frame with how far the SDL audio callback has already progressed *into* that frame's buffer, giving sub-frame timing resolution rather than per-packet granularity. This is what makes the `<10ms` drift target achievable rather than aspirational — the reference clock itself is precise enough to support that tolerance.
 
 When there's no audio track, the controller falls back to a wall-clock-driven `m_videoClock` that advances using `steady_clock` deltas between render ticks (`updateClockForVideoOnly`), so video-only files still play at the correct rate.
 
@@ -112,107 +99,40 @@ The player playback engine is governed by a strict state machine to synchronize 
 
 ---
 
-## Pipeline Instrumentation
+## Measured Performance
 
-To evaluate runtime execution without introducing synchronization overhead or memory allocation, NaikAVPlayer integrates a lock-free pipeline instrumentation framework.
+The player incorporates a lock-free Single Producer Single Consumer (SPSC) metric instrumentation framework that records and tracks execution times on the hot path without introducing synchronization locks or dynamic memory allocations.
 
-### Captured Metrics
-The engine tracks 9 distinct performance metrics:
-- **`video_packet_queue_depth` (M1)**: Instantaneous gauge of the video packet queue size (always-on).
-- **`audio_packet_queue_depth` (M2)**: Instantaneous gauge of the audio packet queue size (always-on).
-- **`decoded_frame_queue_depth` (M3)**: Instantaneous gauge of the decoded frame queue size (always-on).
-- **`demux_time_per_packet_us` (M4)**: SPSC ring recording time spent in `av_read_frame` (gated).
-- **`decode_time_per_frame_us` (M5)**: SPSC ring recording active video decoding time (gated).
-- **`convert_time_us` (M6-A)**: SPSC ring recording software scaling or hardware GPU-to-CPU data transfer times (gated).
-- **`upload_time_us` (M6-B)**: SPSC ring recording texture upload times on the main render thread (gated).
-- **`av_clock_offset_ms` (M7)**: SPSC ring recording video-to-audio clock synchronization offsets (gated).
-- **`frames_dropped_count` (M8)**: Counter of stale frames dropped to keep pace with master clock (always-on). Counts only render-loop drains of late frames; frames intentionally discarded by the decoder during seek catch-up (SeekCatchupMode::LANDING) are excluded by design, since they never reach the presentation queue.
-- **`seek_latency_ms` (M9)**: SPSC ring recording seek catch-up latency from seek entry to landing (gated).
-
-### Architecture & Gating
-- **MetricRing**: A header-only, cacheline-aligned (`alignas(64)`) lock-free SPSC (Single Producer Single Consumer) ring buffer of `std::atomic<float>` elements. Memory order relaxed is used for data elements, and acquire/release semantics coordinate head updates.
-- **Lock-Free Ring Writes**: All MetricRing::record writes and gauge/counter updates are lock-free std::atomic operations with no condition variables or heap allocations on the hot path. The single exception is M9's start-timestamp handoff, which reuses the pre-existing m_catchupMutex already taken by the seek catch-up state machine — no additional lock is introduced by instrumentation.
-- **Profiling Gating & CLI Option**: Gated time-series profiling metrics (`M4`, `M5`, `M6`, `M7`, `M9`) are disabled by default to eliminate profiling branch overhead on the hot path. Profiling can be activated in two ways:
-  - **At Launch:** Start the application with the `--metrics` command-line flag. This enables time-series collection (`setProfilingEnabled(true)`) and automatically displays the **Diagnostics HUD** on startup.
-  - **Dynamically at Runtime:** Press the **`D`** key or click the **"Show Info" / "Hide Info"** button located at the top-right corner of the player window. Toggling the HUD automatically starts/stops the background profiling in sync with the overlay visibility, ensuring real-time telemetry is instantly available while preserving CPU cycles when the HUD is closed.
-
-### Diagnostics HUD & Visualization
-When metrics/profiling is active, the Diagnostics HUD renders real-time telemetry:
-* **System Info & Metadata:** Shows player playback states (`PLAYING`, `PAUSED`, `ENDED`), source/playback resolutions, pixel formats, and indicates if hardware-accelerated decoding is active (green) or has dynamically fallen back to software decoding (yellow).
-* **Pipeline Queue Depths:** Renders real-time visual progress bars tracking packet and frame queues. Queue colors dynamically shift (Green/Yellow/Red) based on the buffer safety window (e.g., flagging packet starvation under 5 packets, or audio frame queue buffer under 50ms).
-* **Decode & Render Timings:** Displays time spent (in milliseconds) on Video Decode, Audio Decode, Video Render, Present/VSync, and Frame Pacing. Budgets are auto-computed relative to the stream's frame rate (e.g., a `1000 / FPS` ms frame-time budget) with progress bars warning in yellow (>50% budget) or red (>90% budget) if frames risk missing their presentation intervals. In addition to the M1–M9 pipeline metrics, the HUD displays frame-loop timings (Present/VSync wait, frame pacing, audio callback duration) measured with local steady_clock deltas on their owning threads; these are display-only and not part of the SPSC ring framework.
-* **Rolling Sync Graph:** An animated, rolling visual graph that plots the precise millisecond drift/offset of video (cyan) and audio (magenta) clocks relative to the master sync reference. The graph dynamically auto-scales its Y-axis range based on actual drift values, providing visual feedback of low-latency A/V synchronization.
-* **FPS Gauges:** Shows the current GUI refresh rate (ImGui loop FPS) alongside the video decoder's actual playback frame rate.
+### Telemetry Metrics
+- **A/V Sync Drift:** Maintained under 10ms drift relative to the audio device master clock.
+- **Seek Latency:** Kept under 80ms from seek command invocation to rendering target frame.
+- **Queue Depths:** Monitored dynamically for packet and frame buffers (M1–M3).
+- **Processing Budgets:** Gated time-series rings tracking demuxing, decoding, scaling, and GPU YUV upload durations (M4–M7, M9) to gauge real-time hardware bottlenecks.
 
 ---
 
-## Tech Stack & Dependencies
+## Build Instructions
 
-- **C++17** (compiled with GCC/MinGW)
-- **FFmpeg 8.x (avcodec, avformat, avutil, swscale, swresample)** (automatically downloaded LGPL-shared binaries)
-- **SDL3** (automatically fetched and dynamically compiled)
-- **Dear ImGui** (automatically fetched and statically compiled)
-- **nativefiledialog-extended (NFD)** (fetched and compiled dynamically for cross-platform native file dialogs — zlib license)
-- **Noto Sans Font** (bundled open-source SIL OFL 1.1 font files)
-- **App Icon Asset** (custom-designed PNG and BMP formats)
-- **ccache** (Optional: recommended compiler caching tool to accelerate clean compiles and CI workflows)
-
----
-
-## Supported Media Formats
-
-Thanks to its barebones FFmpeg demuxer and decoder integration, **NaikAVPlayer** supports a wide range of media containers and codecs, including:
-
-- **Video Containers:** `.mp4`, `.mkv`, `.avi`, `.mov`, `.webm`, `.flv`
-- **Audio Containers:** `.mp3`, `.wav`, `.ogg`, `.flac`, `.aac`
-- **Video Codecs:** H.264 (AVC), H.265 (HEVC), VP8, VP9, MPEG-4
-- **Audio Codecs:** AAC, MP3, Vorbis, FLAC, PCM
-
----
-
-## Installation & Compilation
-
-The project is natively cross-platform and compiles under **Windows** (via MinGW-w64 GCC) and **Linux** (via GCC).
-
-The build system supports the following CMake configuration options:
-
-#### Platform Configuration
-- **`-DPLATFORM=AUTO`** (default): Automatically detects the host operating system.
-- **`-DPLATFORM=WINDOWS`**: Explicitly configures the project to build for Windows (links Win32 subsystems, fetches and copies FFmpeg DLLs).
-- **`-DPLATFORM=LINUX`**: Explicitly configures the project to build for Linux (links `pthread` and `dl`).
-
-#### Quality & Diagnostics Configuration
-- **`-DENABLE_SANITIZERS=ON`** / **`OFF`** (default): Enables AddressSanitizer (ASan) and UndefinedBehaviorSanitizer (UBSan) to monitor memory safety and undefined behavior.
-- **`-DENABLE_TSAN=ON`** / **`OFF`** (default): Enables ThreadSanitizer (TSan) to capture data races and thread synchronization issues. *(Note: Must be run with ASan/UBSan disabled, as they are mutually exclusive)*.
-- **`-DTREAT_WARNINGS_AS_ERRORS=ON`** (default) / **`OFF`**: Configures compilers to treat warnings as build-blocking errors.
+The player is cross-platform and compiles natively under Linux (GCC) and Windows (MinGW-w64). It relies on CMake to retrieve and build dependencies automatically.
 
 ### Prerequisites
 
-#### Windows
-Ensure you have **CMake (version 3.16+)** and **MinGW-w64 (GCC)** configured on your path. 
-
-The project features a **fully automated setup** for Windows: CMake will automatically download, extract, and configure the correct pre-compiled FFmpeg shared binaries package in the `thirdparty/ffmpeg` folder.
-
 #### Linux
-Install the development libraries via your package manager (e.g. `apt` on Ubuntu):
+Install development packages using your package manager:
 ```bash
 sudo apt-get update
-sudo apt-get install -y libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libswresample-dev
-*(SDL3, Dear ImGui, and NFD are fetched and compiled from source automatically during CMake configure — no system packages needed.)*
+sudo apt-get install -y libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libswresample-dev libgtk-3-dev
 ```
+*(SDL3, Dear ImGui, and nativefiledialog-extended are automatically retrieved from source and built during configuration).*
 
-For the native file dialog to compile and work, ensure the GTK3 development library is installed:
-```bash
-sudo apt-get install -y libgtk-3-dev
-```
+#### Windows (Native MinGW-w64)
+Ensure CMake 3.16+ and MinGW-w64 GCC are configured on the path. The build system automatically downloads and verifies the correct month-end FFmpeg shared release package.
 
 ---
 
 ### Step 1: Configure the Project
 
-Generate the build configurations:
-
-**Auto-detect (Recommended):**
+**Auto-detect (Default):**
 ```bash
 cmake -B build
 ```
@@ -228,47 +148,41 @@ cmake -B build -DPLATFORM=LINUX
 ```
 
 **Cross-Compile for Windows on Linux:**
-If you are on a Linux host (e.g. Ubuntu) and want to cross-compile for Windows, you can use the MinGW-w64 GCC toolchain:
+Configure targeting Windows using the cross-compiler toolchain:
 ```bash
-# Install the cross-compiler
 sudo apt-get install -y mingw-w64
 
-# Configure CMake targeting Windows
 cmake -B build-windows \
   -DPLATFORM=WINDOWS \
   -DCMAKE_SYSTEM_NAME=Windows \
   -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc \
   -DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-g++
-
-# Build Windows binaries
-cmake --build build-windows
 ```
 
 ---
 
 ### Step 2: Compile the Project
 
-Build the primary player binary and the test suite:
+Compile the target executable and test suite:
 ```bash
 cmake --build build
 ```
-*Note: On Windows, a post-build recipe automatically copies the required FFmpeg shared DLLs, the SDL3 DLL, and the bundled assets directory directly into the compilation target folder so you can run the binaries immediately.*
+*(On Windows targets, the post-build recipe automatically retrieves and copies all required `.dll` binaries into the output directory).*
 
 ---
 
 ### Step 3: Install the Application (Linux)
 
-To install the application binaries, assets, desktop entry launcher, and system icons, run:
+Install application binaries, Noto Sans fonts, and desktop launchers into `/usr/local/`:
 ```bash
 sudo cmake --install build
 ```
-This registers **NaikAVPlayer** with the desktop environment launcher search and stores assets in system paths (`/usr/local/share/NaikAVPlayer`).
 
 ---
 
 ### Step 4: Uninstall the Application (Linux)
 
-To completely remove the installed files and clean desktop launcher integration:
+Remove installed components from the system:
 ```bash
 sudo cmake --build build --target uninstall
 ```
@@ -277,114 +191,65 @@ sudo cmake --build build --target uninstall
 
 ## Usage Guide
 
-### Running the Player
+Run the compiled executable passing a media path or launch it directly to open a file selector:
 
-Launch the compiled player executable or installed application:
-
-**Windows (PowerShell):**
+**Windows:**
 ```powershell
-.\build\NaikAVPlayer.exe
+.\build\NaikAVPlayer.exe "C:\Path\To\video.mp4"
 ```
 
-**Linux (Local Build):**
+**Linux:**
 ```bash
-./build/NaikAVPlayer
+./build/NaikAVPlayer "/home/user/Videos/video.mp4"
 ```
 
-**Linux (System-Wide Installed):**
-You can launch **NaikAVPlayer** from your desktop environment applications menu or run:
-```bash
-NaikAVPlayer
-```
-
-**Windows (with metrics):**
-```powershell
-.\build\NaikAVPlayer.exe --metrics "C:\Path\To\video.mp4"
-```
-
-**Linux (with metrics):**
+**Launch with Telemetry profiling enabled:**
 ```bash
 ./build/NaikAVPlayer --metrics "/home/user/Videos/video.mp4"
 ```
 
 ### Keyboard Shortcuts
+
 - **`Spacebar`**: Toggle Play / Pause.
-- **`Left Arrow`** ($\leftarrow$): Seek backward by 10 seconds.
-- **`Right Arrow`** ($\rightarrow$): Seek forward by 10 seconds.
-- **`L`**: Toggle Loop Mode on/off.
-- **`D`**: Toggle Diagnostics HUD and background metrics profiling.
-- **`Escape`**: Close and exit the player.
+- **`Left Arrow`**: Seek backward by 10 seconds.
+- **`Right Arrow`**: Seek forward by 10 seconds.
+- **`L`**: Toggle Loop Mode.
+- **`D`**: Toggle Diagnostics HUD / telemetry profiling.
+- **`Escape`**: Exit application.
 
 ---
 
-## Verification & Tests
+## Testing
 
-The test video was programmatically generated for testing purposes and contains only synthetic audio and graphics.
+The project uses a custom integration and mock test suite in `tests/tests.cpp` compiled as `NaikAVPlayer_tests`. Tests use injected mocks of FFmpeg and SDL APIs to achieve 100% line coverage of core playback, demuxing, and decoding files.
 
-### Running Tests Locally with CTest (Same as CI)
+### Running Tests Locally (via CTest)
 
-You can run the tests using standard CMake test driver commands.
-
-#### 1. Standard Test Execution
-Configure the project, build, and run tests via CTest:
+**Standard execution:**
 ```bash
-# Configure and Build
 cmake -B build -DCMAKE_BUILD_TYPE=Debug
 cmake --build build
-
-# Run tests via CTest (with verbose logs on failure)
 ctest --test-dir build --output-on-failure
 ```
 
-#### 2. Running with Address and Undefined Behavior Sanitizers (ASan/UBSan)
-To catch memory leaks, out-of-bounds access, and undefined behavior, build with Address/Undefined sanitizers enabled:
+**Address and Undefined Behavior Sanitizer checks:**
 ```bash
-# Configure with ASan/UBSan
 cmake -B build -DCMAKE_BUILD_TYPE=Debug -DENABLE_SANITIZERS=ON
-
-# Build
 cmake --build build
-
-# Run tests with Sanitizer instrumentation
 ctest --test-dir build --output-on-failure
 ```
 
-#### 3. Running with ThreadSanitizer (TSan)
-To catch concurrency-related bugs, data races, and deadlocks in multi-threaded code, build with ThreadSanitizer (TSan) enabled (note: ASan/UBSan and TSan are mutually exclusive):
+**ThreadSanitizer (TSan) concurrency checks:**
 ```bash
-# Configure with ThreadSanitizer
 cmake -B build -DCMAKE_BUILD_TYPE=Debug -DENABLE_TSAN=ON
-
-# Build
 cmake --build build
-
-# Run tests with TSan instrumentation
 ctest --test-dir build --output-on-failure
 ```
 
-#### 4. Native Direct Execution
-Alternatively, run the compiled test executable directly using the automatically generated test video:
-```powershell
-# Windows
-.\build\NaikAVPlayer_tests.exe ".\assets\hd_test_video_with_audio.mp4"
+### Code Coverage Analysis
 
-# Linux
-./build/NaikAVPlayer_tests "./assets/hd_test_video_with_audio.mp4"
-```
-Or use the `TEST_VIDEO_PATH` environment variable:
-```powershell
-# Windows (PowerShell)
-$env:TEST_VIDEO_PATH=".\assets\hd_test_video_with_audio.mp4"
-.\build\NaikAVPlayer_tests.exe
-
-# Linux
-export TEST_VIDEO_PATH="./assets/hd_test_video_with_audio.mp4"
-./build/NaikAVPlayer_tests
-```
-
-### Code Coverage Statistics
-To check the code coverage, run the tests and then generate the stats from the `build` directory:
-```powershell
+Generate coverage data locally via `gcov`:
+```bash
 cd build
 gcov -o CMakeFiles/NaikAVPlayer_tests.dir/tests/tests.cpp.obj ../src/AudioDecoder.cpp
 gcov -o CMakeFiles/NaikAVPlayer_tests.dir/tests/tests.cpp.obj ../src/VideoDecoder.cpp
@@ -392,28 +257,17 @@ gcov -o CMakeFiles/NaikAVPlayer_tests.dir/tests/tests.cpp.obj ../src/Demuxer.cpp
 gcov -o CMakeFiles/NaikAVPlayer_tests.dir/tests/tests.cpp.obj ../src/PlayerController.cpp
 gcov -o CMakeFiles/NaikAVPlayer_tests.dir/tests/tests.cpp.obj ../src/ThreadSafeQueue.hpp
 ```
-This generates `.gcov` files confirming **100.00% Line Coverage** for the core player logic engine.
-
-### CI/CD Pipeline (GitHub Actions)
-
-The project features an automated **GitHub Actions CI/CD pipeline** (configured in [.github/workflows/ci.yml](.github/workflows/ci.yml)) that runs on every commit (`push`) and pull request (`pull_request`).
-
-The pipeline executes entirely on a Linux runner (`ubuntu-latest`) and performs the following verification steps:
-- **C++ Compiler Warnings Check:** Compiles both targets with compiler warnings treated as errors (`-Werror`) for strict code quality.
-- **Native Linux Build & Test:** Compiles the player and runs the test suite natively under Linux using GCC.
-- **Sanitizers:** Re-compiles and runs the native test suite under AddressSanitizer (ASan) and UndefinedBehaviorSanitizer (UBSan) to check for memory safety and undefined behavior.
-- **ThreadSanitizer (TSan):** Re-compiles and runs the native test suite under ThreadSanitizer (TSan) to detect concurrency bugs, data races, and deadlocks.
-- **Static Analysis:** Performs static analysis using `cppcheck` on all C++ source files.
-- **Windows Cross-Compilation:** Cross-compiles the application for Windows using the MinGW-w64 GCC toolchain (`x86_64-w64-mingw32-gcc`/`g++`).
-- **Compiler Caching (`ccache`):** Employs `ccache` to cache compilation units globally, significantly reducing compile times for upstream dependencies (SDL3, ImGui, NFD) on subsequent workflow runs.
+This generates coverage files verifying the target coverage metrics. The CI workflow generates automated static analysis and sanitizer reports available on the [actions runs](https://github.com/sanjeev-naik/NaikAVPlayer/actions) artifacts.
 
 ---
 
-## Open-Source Attribution & Credits
+## License & Attributions
 
-NaikAVPlayer is published under the **MIT License**. It links dynamically and statically to the following libraries and assets:
-- **FFmpeg** (LGPL v2.1+; dynamically linked as shared libraries, compatible with this project's MIT license)
-- **SDL3** (Licensed under the Zlib License)
-- **Dear ImGui** (Licensed under the MIT License)
-- **nativefiledialog-extended (NFD)** (Licensed under the Zlib License — Copyright © 2014-2020 Michael Labbé, Copyright © 2020-2024 btzy)
-- **Noto Sans Font** (Licensed under the SIL Open Font License 1.1)
+NaikAVPlayer is released under the **MIT License**.
+
+This project links to or compiles the following third-party libraries:
+- **FFmpeg**: Licensed under LGPL v2.1+
+- **SDL3**: Licensed under the Zlib License
+- **Dear ImGui**: Licensed under the MIT License
+- **nativefiledialog-extended (NFD)**: Licensed under the Zlib License (Copyright © 2014-2020 Michael Labbé, Copyright © 2020-2024 btzy)
+- **Noto Sans Font**: Licensed under the SIL Open Font License 1.1)
