@@ -128,11 +128,10 @@ jobs:
 
           # Restrict existing amd64 list sources to [arch=amd64]
           if [ -f /etc/apt/sources.list ]; then
-            sudo sed -i 's/deb http/deb [arch=amd64] http/g' /etc/apt/sources.list
-            sudo sed -i 's/deb mirror/deb [arch=amd64] mirror/g' /etc/apt/sources.list
+            sudo sed -i -E 's/deb[[:space:]]+(http|https|mirror):/deb [arch=amd64] \1:/g' /etc/apt/sources.list
           fi
           if [ -d /etc/apt/sources.list.d ]; then
-            find /etc/apt/sources.list.d/ -type f -name "*.list" -exec sudo sed -i 's/deb http/deb [arch=amd64] http/g' {} +
+            find /etc/apt/sources.list.d/ -type f -name "*.list" -exec sudo sed -i -E 's/deb[[:space:]]+(http|https|mirror):/deb [arch=amd64] \1:/g' {} +
           fi
 
           # Restrict existing amd64 DEB822 sources to Architectures: amd64
@@ -140,23 +139,39 @@ jobs:
           import glob, os
           for p in glob.glob("/etc/apt/sources.list.d/*.sources"):
               with open(p, "r") as f:
-                  content = f.read()
-              blocks = content.split("\n\n")
-              new_blocks = []
+                  lines = f.readlines()
+              paragraphs = []
+              current_paragraph = []
+              for line in lines:
+                  stripped = line.strip()
+                  if not stripped:
+                      if current_paragraph:
+                          paragraphs.append(current_paragraph)
+                          current_paragraph = []
+                      paragraphs.append(line)
+                  else:
+                      current_paragraph.append(line)
+              if current_paragraph:
+                  paragraphs.append(current_paragraph)
+              new_content = []
               modified = False
-              for block in blocks:
-                  if "Suites:" in block and "Architectures:" not in block:
-                      lines = block.split("\n")
-                      for i, line in enumerate(lines):
-                          if line.startswith("Suites:"):
-                              lines.insert(i, "Architectures: amd64")
-                              modified = True
-                              break
-                      block = "\n".join(lines)
-                  new_blocks.append(block)
+              for item in paragraphs:
+                  if isinstance(item, list):
+                      has_suites = any(l.strip().startswith("Suites:") for l in item)
+                      has_arch = any(l.strip().startswith("Architectures:") for l in item)
+                      if has_suites and not has_arch:
+                          for idx, l in enumerate(item):
+                              if l.strip().startswith("Suites:"):
+                                  indent = l[:len(l) - len(l.lstrip())]
+                                  item.insert(idx, f"{indent}Architectures: amd64\n")
+                                  modified = True
+                                  break
+                      new_content.extend(item)
+                  else:
+                      new_content.append(item)
               if modified:
                   with open(p, "w") as f:
-                      f.write("\n\n".join(new_blocks))
+                      f.writelines(new_content)
           '
 
           # Add arm64 sources
