@@ -1,7 +1,7 @@
 # NaikAVPlayer
 
 [![CI/CD Pipeline](https://github.com/sanjeev-naik/NaikAVPlayer/actions/workflows/ci.yml/badge.svg)](https://github.com/sanjeev-naik/NaikAVPlayer/actions/workflows/ci.yml)
-[![Coverage Status](https://img.shields.io/badge/coverage-100%25-brightgreen)](https://github.com/sanjeev-naik/NaikAVPlayer/actions)
+[![Coverage Status](https://codecov.io/gh/sanjeev-naik/NaikAVPlayer/graph/badge.svg)](https://codecov.io/gh/sanjeev-naik/NaikAVPlayer)
 
 NaikAVPlayer is a native, multi-threaded C++ media engine and video player built on raw FFmpeg APIs, SDL3, and Dear ImGui. It performs container parsing, software/hardware video decoding, sample-accurate audio resampling, and clock synchronization directly using GPU-mapped texture updates without intermediate frameworks. It targets low-latency seeking and sub-10ms audio-video clock synchronization using lock-free data structures and dedicated worker threads.
 
