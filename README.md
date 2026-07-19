@@ -3,7 +3,7 @@
 [![CI/CD Pipeline](https://github.com/sanjeev-naik/NaikAVPlayer/actions/workflows/ci.yml/badge.svg)](https://github.com/sanjeev-naik/NaikAVPlayer/actions/workflows/ci.yml)
 [![Coverage Status](https://codecov.io/gh/sanjeev-naik/NaikAVPlayer/graph/badge.svg)](https://codecov.io/gh/sanjeev-naik/NaikAVPlayer)
 
-NaikAVPlayer is a native, multi-threaded C++ media engine and video player built on raw FFmpeg APIs, SDL3, and Dear ImGui. It performs container parsing, software/hardware video decoding, sample-accurate audio resampling, and clock synchronization directly using GPU-mapped texture updates without intermediate frameworks. It targets low-latency seeking and sub-10ms audio-video clock synchronization using lock-free data structures and dedicated worker threads.
+NaikAVPlayer is a native, multi-threaded C++ media engine and video player built on raw FFmpeg APIs, SDL3, and Dear ImGui. It performs container parsing, software/hardware video decoding, sample-accurate audio resampling, and clock synchronization directly using GPU-mapped texture updates without intermediate frameworks. It targets low-latency seeking and sub-10ms audio-video clock synchronization using dedicated worker threads coordinated through bounded blocking queues, with a lock-free Single Producer Single Consumer (SPSC) ring for hot-path telemetry.
 
 ![NaikAVPlayer Screenshot](assets/screenshot.png)
 
@@ -108,13 +108,13 @@ The player playback engine is governed by a strict state machine to synchronize 
 
 ---
 
-## Measured Performance
+## Performance Targets & Instrumentation
 
-The player incorporates a lock-free Single Producer Single Consumer (SPSC) metric instrumentation framework that records and tracks execution times on the hot path without introducing synchronization locks or dynamic memory allocations.
+The player incorporates a lock-free Single Producer Single Consumer (SPSC) metric instrumentation framework that records and tracks execution times on the hot path without introducing synchronization locks or dynamic memory allocations. Automated benchmark publication is planned; targets are validated interactively via the --metrics HUD.
 
 ### Telemetry Metrics
-- **A/V Sync Drift:** Maintained under 10ms drift relative to the audio device master clock.
-- **Seek Latency:** Kept under 80ms from seek command invocation to rendering target frame.
+- **A/V Sync Drift:** Design target: <10ms drift relative to the audio device master clock.
+- **Seek Latency:** Design target: <80ms from seek command invocation to rendering target frame.
 - **Queue Depths:** Monitored dynamically for packet and frame buffers (M1–M3).
 - **Processing Budgets:** Gated time-series rings tracking demuxing, decoding, scaling, and GPU YUV upload durations (M4–M7, M9) to gauge real-time hardware bottlenecks.
 
