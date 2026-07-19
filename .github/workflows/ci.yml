@@ -211,8 +211,10 @@ jobs:
           cp -r assets NaikAVPlayer-linux-x64/
           rm -f NaikAVPlayer-linux-x64/assets/hd_test_video_with_audio.mp4 \
                 NaikAVPlayer-linux-x64/assets/screenshot.png
+          cp -r licenses NaikAVPlayer-linux-x64/
           cp LICENSE README.md NaikAVPlayer-linux-x64/
           tar czf NaikAVPlayer-linux-x64.tar.gz NaikAVPlayer-linux-x64
+
 
       - name: Upload Linux Executable Package
         if: >-
@@ -292,8 +294,10 @@ jobs:
           cp -r assets NaikAVPlayer-windows-x64/
           rm -f NaikAVPlayer-windows-x64/assets/hd_test_video_with_audio.mp4 \
                 NaikAVPlayer-windows-x64/assets/screenshot.png
+          cp -r licenses NaikAVPlayer-windows-x64/
           cp LICENSE README.md NaikAVPlayer-windows-x64/
           zip -r NaikAVPlayer-windows-x64.zip NaikAVPlayer-windows-x64
+
 
       - name: Upload Windows Executable Package
         if: >-

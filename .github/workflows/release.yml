@@ -39,8 +39,10 @@ jobs:
             -name "libwinpthread-1.dll" -exec cp {} $PKG/ \; 2>/dev/null || true
           cp -r assets $PKG/
           rm -f $PKG/assets/hd_test_video_with_audio.mp4 $PKG/assets/screenshot.png
+          cp -r licenses $PKG/
           cp LICENSE README.md $PKG/
           zip -r $PKG.zip $PKG
+
 
       - name: Verify DLL closure
         run: |
@@ -92,8 +94,10 @@ jobs:
           find build -name "libSDL3.so*" -exec cp -P {} $PKG/lib/ \;
           cp -r assets $PKG/
           rm -f $PKG/assets/hd_test_video_with_audio.mp4 $PKG/assets/screenshot.png
+          cp -r licenses $PKG/
           cp LICENSE README.md $PKG/
           tar czf $PKG.tar.gz $PKG
+
 
       - name: Verify shared library resolution
         run: |
