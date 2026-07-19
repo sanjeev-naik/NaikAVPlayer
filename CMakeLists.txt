@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
-project(NaikAVPlayer C CXX)
+project(NaikAVPlayer VERSION 1.0.0 LANGUAGES C CXX)
+#project(NaikAVPlayer C CXX)
 
 # Enforce C++17 standard
 set(CMAKE_CXX_STANDARD 17)
