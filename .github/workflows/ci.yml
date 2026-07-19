@@ -195,6 +195,23 @@ jobs:
           path: ubsan_report.xlsx
           if-no-files-found: warn
 
+      - name: Package Linux Release Executable
+        if: success()
+        run: |
+          mkdir -p NaikAVPlayer-linux-x64
+          cp build-linux/NaikAVPlayer NaikAVPlayer-linux-x64/
+          cp -r assets NaikAVPlayer-linux-x64/
+          cp LICENSE README.md NaikAVPlayer-linux-x64/
+          tar czf NaikAVPlayer-linux-x64.tar.gz NaikAVPlayer-linux-x64
+
+      - name: Upload Linux Executable Package
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-release-package
+          path: NaikAVPlayer-linux-x64.tar.gz
+
+
   cross-compile-windows:
     name: Windows Cross-Compilation (MinGW-w64 on Linux)
     runs-on: ubuntu-latest
@@ -242,3 +259,20 @@ jobs:
           ls -la build-windows/NaikAVPlayer.exe 2>/dev/null || echo "Windows Executable not found"
           echo "Files in workspace:"
           find . -maxdepth 3 -not -path '*/.*' -not -path './build*' -not -path './thirdparty*'
+
+      - name: Package Windows Release Executable
+        if: success()
+        run: |
+          mkdir -p NaikAVPlayer-windows-x64
+          cp build-windows/NaikAVPlayer.exe build-windows/*.dll NaikAVPlayer-windows-x64/
+          cp -r build-windows/assets NaikAVPlayer-windows-x64/
+          cp LICENSE README.md NaikAVPlayer-windows-x64/
+          zip -r NaikAVPlayer-windows-x64.zip NaikAVPlayer-windows-x64
+
+      - name: Upload Windows Executable Package
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-release-package
+          path: NaikAVPlayer-windows-x64.zip
+
