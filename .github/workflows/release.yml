@@ -116,9 +116,84 @@ jobs:
           name: linux-package
           path: NaikAVPlayer-*.tar.gz
 
+  build-linux-aarch64:
+    name: Linux aarch64 Package (ARM64 Cross-Compilation)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Cross-Compiler and Dependencies
+        run: |
+          sudo dpkg --add-architecture arm64
+          sudo tee /etc/apt/sources.list.d/arm64.list <<EOF
+          deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ $(lsb_release -cs) main restricted universe multiverse
+          deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ $(lsb_release -cs)-updates main restricted universe multiverse
+          deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ $(lsb_release -cs)-security main restricted universe multiverse
+          EOF
+          sudo sed -i 's/deb http/deb [arch=amd64] http/g' /etc/apt/sources.list
+          sudo sed -i 's/deb mirror/deb [arch=amd64] mirror/g' /etc/apt/sources.list
+          
+          sudo apt-get update
+          sudo apt-get install -y \
+            g++-aarch64-linux-gnu \
+            libavcodec-dev:arm64 \
+            libavformat-dev:arm64 \
+            libavutil-dev:arm64 \
+            libswscale-dev:arm64 \
+            libswresample-dev:arm64 \
+            libgtk-3-dev:arm64 \
+            ccache
+
+      - name: Setup Compiler Cache (ccache)
+        uses: hendrikmuhs/ccache-action@v1
+        with:
+          key: linux-aarch64-ccache-release
+
+      - name: Configure CMake
+        env:
+          CC: "ccache aarch64-linux-gnu-gcc"
+          CXX: "ccache aarch64-linux-gnu-g++"
+          PKG_CONFIG_PATH: "/usr/lib/aarch64-linux-gnu/pkgconfig"
+        run: |
+          cmake -B build-linux-aarch64 \
+            -DPLATFORM=LINUX \
+            -DCMAKE_SYSTEM_NAME=Linux \
+            -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+            -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
+            -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ \
+            -DTREAT_WARNINGS_AS_ERRORS=ON \
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: |
+          cmake --build build-linux-aarch64 --config Release -j$(nproc)
+
+      - name: Package
+        run: |
+          PKG=NaikAVPlayer-${{ github.ref_name }}-linux-aarch64
+          mkdir -p $PKG/lib
+          cp build-linux-aarch64/NaikAVPlayer $PKG/
+          find build-linux-aarch64 -name "libSDL3.so*" -exec cp -P {} $PKG/lib/ \;
+          cp -r assets $PKG/
+          rm -f $PKG/assets/hd_test_video_with_audio.mp4 $PKG/assets/screenshot.png
+          cp -r licenses $PKG/
+          cp LICENSE README.md $PKG/
+          tar czf $PKG.tar.gz $PKG
+
+      - name: Verify shared library resolution
+        run: |
+          PKG=NaikAVPlayer-${{ github.ref_name }}-linux-aarch64
+          ls -la $PKG/lib/
+          aarch64-linux-gnu-readelf -d $PKG/NaikAVPlayer | grep -E "NEEDED|RUNPATH" || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-aarch64-package
+          path: NaikAVPlayer-*.tar.gz
+
   publish:
     name: Create GitHub Release
-    needs: [build-windows, build-linux]
+    needs: [build-windows, build-linux, build-linux-aarch64]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -135,3 +210,4 @@ jobs:
             ## Downloads
             - **Windows (x64):** self-contained — extract and run `NaikAVPlayer.exe`. All FFmpeg/SDL3/runtime DLLs are bundled.
             - **Linux (x64):** SDL3 is bundled; FFmpeg libraries must be installed from your distribution, e.g. Ubuntu/Debian: `sudo apt install libavcodec-dev libavformat-dev libswscale-dev libswresample-dev` or the `ffmpeg` package.
+            - **Linux (aarch64):** SDL3 is bundled; FFmpeg libraries must be installed from your distribution, e.g., Debian/Ubuntu/Raspberry Pi OS: `sudo apt install libavcodec-dev libavformat-dev libswscale-dev libswresample-dev` or the `ffmpeg` package.

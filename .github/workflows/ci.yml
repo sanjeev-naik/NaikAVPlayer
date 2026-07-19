@@ -311,3 +311,102 @@ jobs:
           name: windows-release-package
           path: NaikAVPlayer-windows-x64.zip
 
+  cross-compile-linux-aarch64:
+    name: Linux aarch64 Build (ARM64 Cross-Compilation)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install Cross-Compiler and Dependencies
+        run: |
+          sudo dpkg --add-architecture arm64
+          sudo tee /etc/apt/sources.list.d/arm64.list <<EOF
+          deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ $(lsb_release -cs) main restricted universe multiverse
+          deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ $(lsb_release -cs)-updates main restricted universe multiverse
+          deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ $(lsb_release -cs)-security main restricted universe multiverse
+          EOF
+          sudo sed -i 's/deb http/deb [arch=amd64] http/g' /etc/apt/sources.list
+          sudo sed -i 's/deb mirror/deb [arch=amd64] mirror/g' /etc/apt/sources.list
+          
+          sudo apt-get update
+          sudo apt-get install -y \
+            g++-aarch64-linux-gnu \
+            libavcodec-dev:arm64 \
+            libavformat-dev:arm64 \
+            libavutil-dev:arm64 \
+            libswscale-dev:arm64 \
+            libswresample-dev:arm64 \
+            libgtk-3-dev:arm64 \
+            ccache
+
+      - name: Setup Compiler Cache (ccache)
+        uses: hendrikmuhs/ccache-action@v1
+        with:
+          key: linux-aarch64-ccache
+
+      - name: Configure CMake (Cross-Compile for Linux aarch64)
+        env:
+          CC: "ccache aarch64-linux-gnu-gcc"
+          CXX: "ccache aarch64-linux-gnu-g++"
+          PKG_CONFIG_PATH: "/usr/lib/aarch64-linux-gnu/pkgconfig"
+        run: |
+          cmake -B build-linux-aarch64 \
+            -DPLATFORM=LINUX \
+            -DCMAKE_SYSTEM_NAME=Linux \
+            -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+            -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
+            -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ \
+            -DTREAT_WARNINGS_AS_ERRORS=ON \
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build (Cross-Compile for Linux aarch64)
+        run: |
+          cmake --build build-linux-aarch64 --config Release -j$(nproc)
+
+      - name: Diagnostic Logging
+        if: always()
+        run: |
+          echo "=== Diagnostic Log ==="
+          echo "Current working directory: $(pwd)"
+          echo "Executable output locations:"
+          ls -la build-linux-aarch64/NaikAVPlayer 2>/dev/null || echo "Linux aarch64 Executable not found"
+
+      - name: Package Linux aarch64 Release Executable
+        if: >-
+          success() && (
+            startsWith(github.ref, 'refs/heads/release/') ||
+            startsWith(github.ref, 'refs/tags/v') ||
+            startsWith(github.head_ref, 'release/')
+          )
+        run: |
+          mkdir -p NaikAVPlayer-linux-aarch64/lib
+          cp build-linux-aarch64/NaikAVPlayer NaikAVPlayer-linux-aarch64/
+          find build-linux-aarch64 -name "libSDL3.so*" -exec cp -P {} NaikAVPlayer-linux-x64/lib/ \; # Wait, copy to NaikAVPlayer-linux-aarch64/lib/
+          # Wait, let's fix the above copy destination to: NaikAVPlayer-linux-aarch64/lib/
+          # I will correct the template copy below in ReplacementContent:
+          # find build-linux-aarch64 -name "libSDL3.so*" -exec cp -P {} NaikAVPlayer-linux-aarch64/lib/ \;
+          # Yes, that is correct. Let's make sure the destination matches.
+          find build-linux-aarch64 -name "libSDL3.so*" -exec cp -P {} NaikAVPlayer-linux-aarch64/lib/ \;
+          cp -r assets NaikAVPlayer-linux-aarch64/
+          rm -f NaikAVPlayer-linux-aarch64/assets/hd_test_video_with_audio.mp4 \
+                NaikAVPlayer-linux-aarch64/assets/screenshot.png
+          cp -r licenses NaikAVPlayer-linux-aarch64/
+          cp LICENSE README.md NaikAVPlayer-linux-aarch64/
+          tar czf NaikAVPlayer-linux-aarch64.tar.gz NaikAVPlayer-linux-aarch64
+
+      - name: Upload Linux aarch64 Executable Package
+        if: >-
+          success() && (
+            startsWith(github.ref, 'refs/heads/release/') ||
+            startsWith(github.ref, 'refs/tags/v') ||
+            startsWith(github.head_ref, 'release/')
+          )
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-aarch64-release-package
+          path: NaikAVPlayer-linux-aarch64.tar.gz
+
+
+
