@@ -174,7 +174,13 @@ public:
     void setPresentTimeUs(uint64_t us) { m_presentTimeUs.store(us); }
     void setFramePacingUs(uint64_t us) { m_framePacingUs.store(us); }
 
-    double getVideoDecodeTimeMs() const { return m_videoDecodeTimeUs.load() / 1000.0; }
+    double getVideoDecodeTimeMs() const {
+        float latestUs = 0.0f;
+        if (m_metrics && m_metrics->m_decodeTimePerFrameUs.snapshot(&latestUs, 1) > 0) {
+            return latestUs / 1000.0;
+        }
+        return 0.0;
+    }
     double getAudioDecodeTimeMs() const { return m_audioDecodeTimeUs.load() / 1000.0; }
     double getVideoRenderTimeMs() const { return m_videoRenderTimeUs.load() / 1000.0; }
     double getPresentTimeMs() const { return m_presentTimeUs.load() / 1000.0; }

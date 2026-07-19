@@ -533,8 +533,14 @@ int main(int argc, char *argv[]) {
     uint64_t presentUs = std::chrono::duration_cast<std::chrono::microseconds>(presentEnd - presentStart).count();
     controller.setPresentTimeUs(presentUs);
 
-    // Sleep to avoid pegging CPU when idle/VSync limits
-    SDL_Delay(5);
+    // Sleep to avoid pegging CPU when minimized or if VSync is disabled.
+    // If VSync is enabled, SDL_RenderPresent blocks and rate-limits naturally,
+    // so we do not sleep to avoid missing refresh boundaries.
+    int vsync = 0;
+    SDL_GetRenderVSync(renderer, &vsync);
+    if (windowMinimized || vsync <= 0) {
+      SDL_Delay(5);
+    }
   }
 
   // 4. Cleanup resources on exit

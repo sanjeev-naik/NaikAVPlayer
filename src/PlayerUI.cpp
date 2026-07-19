@@ -968,10 +968,10 @@ void PlayerUI::drawDiagnosticsHUD(int windowWidth, int windowHeight) {
     if (std::strcmp(label, "Video Frame Q") == 0) {
       if (size == 0) color = ImVec4(1.0f, 0.2f, 0.2f, 1.0f); // Red
       else if (size <= 2) color = ImVec4(0.9f, 0.7f, 0.0f, 1.0f); // Yellow
-    } else if (std::strcmp(label, "Audio Frame Q") == 0) {
+    /* } else if (std::strcmp(label, "Audio Frame Q") == 0) {
       float ms = (size * 1000.0f) / 48000.0f;
       if (ms < 50.0f) color = ImVec4(1.0f, 0.2f, 0.2f, 1.0f); // Red
-      else if (ms < 150.0f) color = ImVec4(0.9f, 0.7f, 0.0f, 1.0f); // Yellow
+      else if (ms < 150.0f) color = ImVec4(0.9f, 0.7f, 0.0f, 1.0f); // Yellow */
     } else { // Packets Q
       if (size < 5) color = ImVec4(1.0f, 0.2f, 0.2f, 1.0f); // Red
       else if (size < 20) color = ImVec4(0.9f, 0.7f, 0.0f, 1.0f); // Yellow
@@ -997,20 +997,20 @@ void PlayerUI::drawDiagnosticsHUD(int windowWidth, int windowHeight) {
   if (m_controller.hasAudio()) {
     drawQueueDepth("Audio Packet Q", m_controller.getAudioPacketQueueSize(), m_controller.getAudioPacketQueueCapacity(), nullptr);
     
-    size_t audioFrmSize = m_controller.getAudioFrameQueueSize();
+    /* size_t audioFrmSize = m_controller.getAudioFrameQueueSize();
     float queuedMs = (audioFrmSize * 1000.0f) / 48000.0f;
     char audioInfo[32];
     std::snprintf(audioInfo, sizeof(audioInfo), "%.0f ms buf", queuedMs);
-    drawQueueDepth("Audio Frame Q", audioFrmSize, m_controller.getAudioFrameQueueCapacity(), audioInfo);
+    drawQueueDepth("Audio Frame Q", audioFrmSize, m_controller.getAudioFrameQueueCapacity(), audioInfo); */
   }
 
   // Subtitle Queue: hardcoded to disabled since it's not supported by core
-  ImGui::Text("Subtitle Q: N/A");
+  /* ImGui::Text("Subtitle Q: N/A");
   ImGui::SameLine();
   ImGui::TextDisabled(" (Disabled)");
   ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(0.3f, 0.3f, 0.3f, 1.0f));
   ImGui::ProgressBar(0.0f, ImVec2(-1, 14), "0.0%");
-  ImGui::PopStyleColor();
+  ImGui::PopStyleColor(); */
 
   ImGui::Spacing();
   ImGui::Separator();
@@ -1021,10 +1021,31 @@ void PlayerUI::drawDiagnosticsHUD(int windowWidth, int windowHeight) {
   auto drawTimingBar = [](const char* label, double timeMs, double budgetMs) {
     float fraction = budgetMs > 0.0 ? static_cast<float>(timeMs / budgetMs) : 0.0f;
     ImVec4 color = ImVec4(0.0f, 0.83f, 0.4f, 1.0f); // Green
-    if (fraction > 0.9f) {
-      color = ImVec4(1.0f, 0.2f, 0.2f, 1.0f); // Red
-    } else if (fraction > 0.5f) {
-      color = ImVec4(0.9f, 0.7f, 0.0f, 1.0f); // Yellow
+
+    if (std::strcmp(label, "Frame Pacing") == 0) {
+      // For Frame Pacing, the ideal time is exactly the target budget (100%).
+      // We warn if there is a significant deviation from the target budget.
+      float deviation = std::abs(fraction - 1.0f);
+      if (deviation > 0.30f) {
+        color = ImVec4(1.0f, 0.2f, 0.2f, 1.0f); // Red
+      } else if (deviation > 0.15f) {
+        color = ImVec4(0.9f, 0.7f, 0.0f, 1.0f); // Yellow
+      }
+    } else if (std::strcmp(label, "Present/VSync") == 0) {
+      // High Present/VSync time means high headroom (Good -> Green).
+      // Low Present/VSync time means we are running out of time (Bad -> Yellow/Red).
+      if (fraction < 0.05f) {
+        color = ImVec4(1.0f, 0.2f, 0.2f, 1.0f); // Red
+      } else if (fraction < 0.15f) {
+        color = ImVec4(0.9f, 0.7f, 0.0f, 1.0f); // Yellow
+      }
+    } else {
+      // Processing times (Video/Audio Decode, Video Render): smaller is better.
+      if (fraction > 0.9f) {
+        color = ImVec4(1.0f, 0.2f, 0.2f, 1.0f); // Red
+      } else if (fraction > 0.5f) {
+        color = ImVec4(0.9f, 0.7f, 0.0f, 1.0f); // Yellow
+      }
     }
     ImGui::Text("%s: %.2f ms", label, timeMs);
     ImGui::SameLine();
