@@ -5,7 +5,7 @@
 
 NaikAVPlayer is a native, multi-threaded C++ media engine and video player built on raw FFmpeg APIs, SDL3, and Dear ImGui. It performs container parsing, software/hardware video decoding, sample-accurate audio resampling, and clock synchronization directly using GPU-mapped texture updates without intermediate frameworks. It targets low-latency seeking and sub-10ms audio-video clock synchronization using lock-free data structures and dedicated worker threads.
 
-![NaikAVPlayer Screenshot](assets/screenshot.png)
+
 
 ## Features
 
@@ -26,16 +26,24 @@ NaikAVPlayer follows the classic multi-threaded media player design: a demuxer t
 
 ### Thread Model
 
-```
-┌─────────────┐   packets   ┌──────────────────┐               ┌────────────────────┐
-│             ├────────────►│  Video Queue     │──► Video      │ Decoded Frame      │──► Main/Render Loop
-│   Demuxer   │             │ (AVPacket* [100])│    Decoder    │ Queue              │    (SDL YUV Texture)
-│  (thread)   │             └──────────────────┘    (thread)   │ (DecodedFrame [8]) │
-│             │                                                └─────────┬──────────┘
-│             │   packets   ┌──────────────────┐                         │
-│             ├────────────►│  Audio Queue     │──► AudioDecoder         │ A/V Sync
-│             │             │ (AVPacket* [150])│    (SDL3 Audio Stream   │ (Master Clock)
-│             └──────────────────┘     callback thread)◄───┘
+```mermaid
+flowchart LR
+    media[Media File / Stream] --> demux[Demuxer Thread]
+    demux -- packets --> vq[Video Queue<br>100 packets]
+    demux -- packets --> aq[Audio Queue<br>150 packets]
+    vq --> vdec[Video Decoder Thread<br>HW / SW fallback]
+    vdec --> fq[Decoded Frame Queue<br>8 frames]
+    aq --> adec[Audio Decoder<br>SDL3 audio callback thread]
+    adec -- PCM --> dev[SDL3 Audio Device Output]
+    adec --> clock[Master Clock<br>audio clock, or wall-clock<br>when no audio stream]
+    subgraph loop[Main / Render Loop]
+        direction TB
+        deq[Dequeue frames] --> sync[Query master clock<br>A/V sync]
+        sync --> drop[Drop late frames]
+        drop --> gpu[GPU YUV texture upload<br>display output]
+    end
+    fq --> deq
+    clock --> sync
 ```
 
 - **Demuxer thread**: Reads raw packets via `av_read_frame` and routes them into bounded `ThreadSafeQueue<AVPacket*>` instances (video capacity: 100 packets, audio capacity: 150 packets).
