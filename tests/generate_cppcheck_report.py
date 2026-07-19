@@ -88,6 +88,10 @@ def generate_cppcheck_report(xml_path, xlsx_path):
         # Title
         ws.cell(row=1, column=1, value="Cppcheck Static Analysis Report").font = title_font
 
+        # Command Invocation
+        command_font = Font(name="Calibri", size=9, italic=True, color="555555")
+        ws.cell(row=2, column=1, value="Command: cppcheck --enable=warning,style,performance,portability --inline-suppr --std=c++17 --error-exitcode=1 --xml --xml-version=2 src/ tests/").font = command_font
+
         # Summary Metrics
         ws.cell(row=3, column=1, value="Metric").font = bold_font
         ws.cell(row=3, column=1).fill = sub_header_fill
@@ -209,6 +213,7 @@ def generate_cppcheck_report(xml_path, xlsx_path):
 </head>
 <body>
 <div class="title">Cppcheck Static Analysis Report</div>
+<div style="font-size: 11px; font-style: italic; color: #555555; margin-bottom: 15px;">Command: cppcheck --enable=warning,style,performance,portability --inline-suppr --std=c++17 --error-exitcode=1 --xml --xml-version=2 src/ tests/</div>
 """)
             total_issues = len(errors_list)
             errors_count = sum(1 for e in errors_list if e["severity"].lower() == "error")

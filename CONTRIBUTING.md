@@ -171,10 +171,11 @@ We maintain a strict quality target of **100% code coverage** on all core playba
 2. Or configure the build with ThreadSanitizer enabled to detect data races (note: TSan and ASan are mutually exclusive):
    ```bash
    mkdir build-tsan && cd build-tsan
-   cmake -DENABLE_COVERAGE=ON -DENABLE_TSAN=ON ..
+   cmake -DENABLE_TSAN=ON ..
    cmake --build .
    ctest --output-on-failure
    ```
+   *Note: Coverage instrumentation is automatically disabled under TSan: GCC's gcov counters are incremented non-atomically and would trip ThreadSanitizer on the counters themselves rather than on real application state.*
    *Note: CMake automatically generates a dummy test video if `assets/hd_test_video_with_audio.mp4` is missing.*
 
 ### Code Coverage

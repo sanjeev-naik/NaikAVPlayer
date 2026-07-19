@@ -33,7 +33,10 @@ endif()
 # -------------------------------------------------------------
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     # GCC/MinGW/Clang hardening flags
-    add_compile_options(-fstack-protector-strong -D_FORTIFY_SOURCE=2 -Wformat -Wformat-security)
+    add_compile_options(
+        -fstack-protector-strong -Wformat -Wformat-security
+        "$<$<NOT:$<CONFIG:Debug>>:-U_FORTIFY_SOURCE;-D_FORTIFY_SOURCE=2>"
+    )
 elseif(MSVC)
     # MSVC uses its own security flags instead of GCC/Clang warnings
     add_compile_options(/GS)

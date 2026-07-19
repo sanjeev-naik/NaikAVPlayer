@@ -151,11 +151,8 @@ NaikAVPlayer natively supports hardware-accelerated H.264 decoding to deliver ma
 ## 6. Security & Dependency Maintenance
 
 - **Upstream Security**: NaikAVPlayer relies on external decoders (FFmpeg) to parse and process media streams. Because parsing media files carries inherent security risks (e.g. malformed files attempting to exploit decoder bugs), keeping your shared libraries updated is the best defense.
-- **Updating Libraries**: The project is designed to automatically download the latest stable dependency packages during configuration. To force an update of the local FFmpeg binaries, delete the `thirdparty/ffmpeg` directory and compile the project again:
-  ```bash
-  cmake -B build -G "MinGW Makefiles"
-  cmake --build build
-  ```
+- **Pinned, Verified Dependencies**: All dependencies are pinned to exact versions for reproducible, supply-chain-verifiable builds: FFmpeg is pinned to a specific month-end BtbN release with SHA256 checksum verification at download time, and SDL3, Dear ImGui, and NFD are pinned to release tags via CMake FetchContent. Builds cannot silently drift to unverified upstream binaries.
+- **Updating the FFmpeg pin**: Run `update_ffmpeg_pin.py --tag <new-month-end-tag>` to derive a fresh verified URL + SHA256 pair, which updates `FFMPEG_ZIP_URL` and `FFMPEG_ZIP_SHA256` in `CMakeLists.txt`. Then delete `thirdparty/ffmpeg` and re-run the CMake configure step to fetch the new pinned version. To update SDL3/ImGui/NFD, bump the corresponding `GIT_TAG` in `CMakeLists.txt`.
 
 ---
 
@@ -197,8 +194,8 @@ This section documents the hook sites, thread ownership, and architectural detai
 - **SPSC Ring Verification**: Each `MetricRing` is modified by a single producer thread and snapshot/read by the main render thread, strictly adhering to the SPSC (Single Producer Single Consumer) model.
   - **Convert Time vs. Upload Time**: Both the hardware CPU copy (`av_hwframe_transfer_data`) and the software color-conversion/scaling path (`sws_scale`) run completely on the background video decoder thread. Thus, `convert_time_us` (Hook-A) is safely recorded on the video decoder thread. Meanwhile, `upload_time_us` (Hook-B) is recorded on the main render thread where `SDL_UpdateYUVTexture` / `SDL_UpdateNVTexture` takes place. This separation ensures both rings are single-producer.
   - **Seek Latency**: Latency delta is recorded on the transition side (`finishCatchup`) on the video decoder thread, passing the start timestamp from `seek()` safely through catch-up epoch state variables protected under `m_catchupMutex`. This avoids any concurrent write access to the SPSC ring.
-- **Lock-Free Instrumentation**: All hooks employ lock-free std::atomic operations and avoid condition variables or heap allocations on the hot path, preserving near-zero overhead.
+- **Lock-Free Ring Writes**: All MetricRing::record writes and gauge/counter updates are lock-free std::atomic operations with no condition variables or heap allocations on the hot path. The single exception is M9's start-timestamp handoff, which reuses the pre-existing m_catchupMutex already taken by the seek catch-up state machine — no additional lock is introduced by instrumentation.
 - **Profiling Activation Gate**: Instantiations of time-series ring measurements (`MetricRing::record`) are gated behind the `m_profilingEnabled` relaxed load check. Instantaneous gauges (M1-M3) and the dropped-frame counter (M8) are always-on to avoid unnecessary branching overhead.
 
 #### Omissions or splits
-- No metrics were omitted or split incorrectly. `convert_time_us` and `upload_time_us` were mapped to separate rings as they run on separate threads, fully keeping to the SPSC thread constraints.
+- No metrics were omitted or split incorrectly. `convert_time_us` and `upload_time_us` were mapped to separate rings as they run on separate threads, fully keeping to the SPSC thread constraints. In addition to the SPSC ring framework, the diagnostics HUD displays other frame-loop timings (Present/VSync wait, frame pacing, audio callback duration) measured with local steady_clock deltas on their owning threads for real-time visualization.

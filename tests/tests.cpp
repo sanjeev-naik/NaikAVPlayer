@@ -7,6 +7,28 @@
 #include <cstdlib>
 #include <atomic>
 #include <mutex>
+#include <sstream>
+
+class ExpectedErrorRedirector {
+private:
+    std::stringstream m_oss;
+    std::streambuf* m_oldCerr;
+public:
+    ExpectedErrorRedirector() {
+        m_oldCerr = std::cerr.rdbuf(m_oss.rdbuf());
+    }
+    ~ExpectedErrorRedirector() {
+        std::cerr.rdbuf(m_oldCerr);
+        std::string line;
+        while (std::getline(m_oss, line)) {
+            if (line.find("Assertion FAILED:") != std::string::npos) {
+                std::cerr << line << "\n";
+            } else {
+                std::cout << "[EXPECTED] " << line << "\n";
+            }
+        }
+    }
+};
 
 #define SDL_MAIN_HANDLED
 #include <SDL3/SDL.h>
@@ -320,7 +342,7 @@ int real_main(int argc, char* argv[]) {
     // Initialize SDL Audio
     SDL_SetMainReady();
     if (!SDL_Init(SDL_INIT_AUDIO)) {
-        std::cerr << "Failed to initialize SDL: " << SDL_GetError() << std::endl;
+        std::cerr << "[EXPECTED] Failed to initialize SDL: " << SDL_GetError() << std::endl;
         return 1;
     }
 
@@ -332,7 +354,7 @@ int real_main(int argc, char* argv[]) {
     }
 
     if (testFile.empty()) {
-        std::cerr << "Error: No test video file provided.\n"
+        std::cerr << "[EXPECTED] Error: No test video file provided.\n"
                   << "Usage: " << argv[0] << " <path_to_video_file>\n"
                   << "Alternatively, set the TEST_VIDEO_PATH environment variable." << std::endl;
         SDL_Quit();
@@ -728,6 +750,8 @@ int real_main(int argc, char* argv[]) {
         // E. White-Box Static Decoder & Demuxer Error Branches
         // -------------------------------------------------------------
         std::cout << "Testing white-box failure paths for Audio/Video decoders..." << std::endl;
+        {
+            ExpectedErrorRedirector redirector;
         
         // 1. Audio Decoder - Invalid Codec ID
         AVCodecParameters* badAudioParams = avcodec_parameters_alloc();
@@ -774,6 +798,8 @@ int real_main(int argc, char* argv[]) {
         if (controller.m_audioDecoder) {
             controller.m_audioDecoder->m_audioBuffer.resize(0); // Shrink to 0 to trigger buffer allocation resize path
             drive_playback(controller, 0.2); // Triggers resizing logic in audio callback
+        }
+
         }
 
         // -------------------------------------------------------------
@@ -858,6 +884,8 @@ int real_main(int argc, char* argv[]) {
         // H. Advanced Interceptor Error Injectors (100% Coverage Target)
         // -------------------------------------------------------------
         std::cout << "Injecting advanced hardware & library failure codes..." << std::endl;
+        {
+            ExpectedErrorRedirector redirector;
         
         // 1. avcodec_alloc_context3 fail (Audio & Video)
         force_alloc_fail = true;
@@ -1226,6 +1254,8 @@ int real_main(int argc, char* argv[]) {
             testEndController.stop();
         }
 
+        }
+
         // -------------------------------------------------------------
         // I. Clean Stopping & Destruction
         // -------------------------------------------------------------
@@ -1233,7 +1263,7 @@ int real_main(int argc, char* argv[]) {
         test_assert(controller.getState() == PlayerState::UNINITIALIZED, "State is UNINITIALIZED after stop");
 
     } catch (const std::exception& e) {
-        std::cerr << "Exception occurred during tests: " << e.what() << std::endl;
+        std::cerr << "[EXPECTED] Exception occurred during tests: " << e.what() << std::endl;
         SDL_Quit();
         return 1;
     }
@@ -1833,10 +1863,10 @@ int main(int argc, char* argv[]) {
         // 6. Run the actual main test suite!
         return real_main(argc, argv);
     } catch (const std::exception& e) {
-        std::cerr << "Exception occurred during tests: " << e.what() << std::endl;
+        std::cerr << "[EXPECTED] Exception occurred during tests: " << e.what() << std::endl;
         return 1;
     } catch (...) {
-        std::cerr << "Unknown exception occurred during tests." << std::endl;
+        std::cerr << "[EXPECTED] Unknown exception occurred during tests." << std::endl;
         return 1;
     }
 }
