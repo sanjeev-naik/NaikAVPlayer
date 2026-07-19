@@ -202,86 +202,88 @@ FetchContent_MakeAvailable(nativefiledialog-extended)
 # -------------------------------------------------------------
 # Configure FFmpeg (Download automatically if missing on Windows)
 # -------------------------------------------------------------
-if(TARGET_PLATFORM_WINDOWS)
+if(TARGET_PLATFORM_WINDOWS OR (TARGET_PLATFORM_LINUX AND EXISTS "${CMAKE_SOURCE_DIR}/thirdparty/ffmpeg/include/libavcodec/avcodec.h"))
     set(FFMPEG_DIR "${CMAKE_SOURCE_DIR}/thirdparty/ffmpeg")
 
-    if(NOT EXISTS "${FFMPEG_DIR}/include/libavcodec/avcodec.h" OR NOT EXISTS "${FFMPEG_DIR}/lib/avcodec.lib")
-        message(STATUS "FFmpeg headers/libraries not found in thirdparty/ffmpeg. Setting up automatically...")
-        
-        # NOTE: Dated BtbN release tags (autobuild-YYYY-MM-DD-HH-MM) do NOT use the
-        # "ffmpeg-master-latest-*" filename pattern - that pattern only exists under
-        # the floating "latest" tag. Dated tags publish git-describe-style names
-        # instead (e.g. ffmpeg-n8.1.2-21-gce3c09c101-win64-lgpl-shared-8.1.zip).
-        #
-        # BtbN retains dated tags for ~14 daily builds, but keeps the LAST build of
-        # each calendar month for ~2 years. This pin deliberately uses a month-end
-        # tag (2026-06-30) rather than a daily one, so it survives far longer before
-        # needing to be re-pinned. When it does need updating, use
-        # update_ffmpeg_pin.py --tag <new-month-end-tag> to get a fresh, verified
-        # URL + hash rather than editing this by hand.
-        #
-        # This URL also pins the FFmpeg 8.1 release branch (via the "-8.1" variant),
-        # so it won't silently drift to a different FFmpeg version either.
-        set(FFMPEG_ZIP_URL "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-06-30-13-34/ffmpeg-n8.1.2-21-gce3c09c101-win64-lgpl-shared-8.1.zip")
-        set(FFMPEG_ZIP_PATH "${CMAKE_BINARY_DIR}/ffmpeg_download.zip")
-        set(FFMPEG_EXTRACT_DIR "${CMAKE_BINARY_DIR}/ffmpeg_extracted")
+    if(TARGET_PLATFORM_WINDOWS)
+        if(NOT EXISTS "${FFMPEG_DIR}/include/libavcodec/avcodec.h" OR NOT EXISTS "${FFMPEG_DIR}/lib/avcodec.lib")
+            message(STATUS "FFmpeg headers/libraries not found in thirdparty/ffmpeg. Setting up automatically...")
+            
+            # NOTE: Dated BtbN release tags (autobuild-YYYY-MM-DD-HH-MM) do NOT use the
+            # "ffmpeg-master-latest-*" filename pattern - that pattern only exists under
+            # the floating "latest" tag. Dated tags publish git-describe-style names
+            # instead (e.g. ffmpeg-n8.1.2-21-gce3c09c101-win64-lgpl-shared-8.1.zip).
+            #
+            # BtbN retains dated tags for ~14 daily builds, but keeps the LAST build of
+            # each calendar month for ~2 years. This pin deliberately uses a month-end
+            # tag (2026-06-30) rather than a daily one, so it survives far longer before
+            # needing to be re-pinned. When it does need updating, use
+            # update_ffmpeg_pin.py --tag <new-month-end-tag> to get a fresh, verified
+            # URL + hash rather than editing this by hand.
+            #
+            # This URL also pins the FFmpeg 8.1 release branch (via the "-8.1" variant),
+            # so it won't silently drift to a different FFmpeg version either.
+            set(FFMPEG_ZIP_URL "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-06-30-13-34/ffmpeg-n8.1.2-21-gce3c09c101-win64-lgpl-shared-8.1.zip")
+            set(FFMPEG_ZIP_PATH "${CMAKE_BINARY_DIR}/ffmpeg_download.zip")
+            set(FFMPEG_EXTRACT_DIR "${CMAKE_BINARY_DIR}/ffmpeg_extracted")
 
-        # Verified against the release's checksums.sha256 asset on 2026-07-18.
-        # If you bump FFMPEG_ZIP_URL to a newer release/version, re-derive this
-        # from that release's checksums.sha256 (or set it blank to skip
-        # verification, with a build-time warning).
-        set(FFMPEG_ZIP_SHA256 "27bcaf58b5140171dfe838a0b365d12c60607d71fc168424456410bad6a834da" CACHE STRING "Expected SHA256 of the pinned FFmpeg zip (see GitHub release assets page)")
+            # Verified against the release's checksums.sha256 asset on 2026-07-18.
+            # If you bump FFMPEG_ZIP_URL to a newer release/version, re-derive this
+            # from that release's checksums.sha256 (or set it blank to skip
+            # verification, with a build-time warning).
+            set(FFMPEG_ZIP_SHA256 "27bcaf58b5140171dfe838a0b365d12c60607d71fc168424456410bad6a834da" CACHE STRING "Expected SHA256 of the pinned FFmpeg zip (see GitHub release assets page)")
 
-        message(STATUS "Downloading FFmpeg shared binaries from ${FFMPEG_ZIP_URL}...")
-        if(FFMPEG_ZIP_SHA256)
-            file(DOWNLOAD "${FFMPEG_ZIP_URL}" "${FFMPEG_ZIP_PATH}"
-                 SHOW_PROGRESS
-                 EXPECTED_HASH SHA256=${FFMPEG_ZIP_SHA256}
-                 STATUS download_status)
-        else()
-            message(WARNING "FFMPEG_ZIP_SHA256 is not set - downloaded FFmpeg archive will not be checksum-verified. "
-                             "Set -DFFMPEG_ZIP_SHA256=<hash> (from the release's assets page) for reproducible, verified builds.")
-            file(DOWNLOAD "${FFMPEG_ZIP_URL}" "${FFMPEG_ZIP_PATH}"
-                 SHOW_PROGRESS
-                 STATUS download_status)
+            message(STATUS "Downloading FFmpeg shared binaries from ${FFMPEG_ZIP_URL}...")
+            if(FFMPEG_ZIP_SHA256)
+                file(DOWNLOAD "${FFMPEG_ZIP_URL}" "${FFMPEG_ZIP_PATH}"
+                     SHOW_PROGRESS
+                     EXPECTED_HASH SHA256=${FFMPEG_ZIP_SHA256}
+                     STATUS download_status)
+            else()
+                message(WARNING "FFMPEG_ZIP_SHA256 is not set - downloaded FFmpeg archive will not be checksum-verified. "
+                                 "Set -DFFMPEG_ZIP_SHA256=<hash> (from the release's assets page) for reproducible, verified builds.")
+                file(DOWNLOAD "${FFMPEG_ZIP_URL}" "${FFMPEG_ZIP_PATH}"
+                     SHOW_PROGRESS
+                     STATUS download_status)
+            endif()
+
+            list(GET download_status 0 status_code)
+            list(GET download_status 1 status_msg)
+            if(NOT status_code EQUAL 0)
+                message(FATAL_ERROR "Failed to download FFmpeg (Code: ${status_code}): ${status_msg}")
+            endif()
+
+            message(STATUS "Extracting FFmpeg package...")
+            file(ARCHIVE_EXTRACT INPUT "${FFMPEG_ZIP_PATH}" DESTINATION "${FFMPEG_EXTRACT_DIR}")
+
+            # Find the extracted folder name
+            file(GLOB EXTRACTED_FOLDERS "${FFMPEG_EXTRACT_DIR}/ffmpeg-*")
+            list(LENGTH EXTRACTED_FOLDERS folders_len)
+            if(folders_len EQUAL 0)
+                message(FATAL_ERROR "No extracted FFmpeg folder found. Extraction may have failed.")
+            endif()
+            list(GET EXTRACTED_FOLDERS 0 FFMPEG_SRC_DIR)
+
+            message(STATUS "Installing FFmpeg to thirdparty/ffmpeg...")
+            file(REMOVE_RECURSE "${FFMPEG_DIR}") # Clear clean install
+            file(MAKE_DIRECTORY "${FFMPEG_DIR}")
+            
+            file(COPY "${FFMPEG_SRC_DIR}/bin" DESTINATION "${FFMPEG_DIR}")
+            file(COPY "${FFMPEG_SRC_DIR}/include" DESTINATION "${FFMPEG_DIR}")
+            file(COPY "${FFMPEG_SRC_DIR}/lib" DESTINATION "${FFMPEG_DIR}")
+            
+            # Copy LICENSE and README if present
+            if(EXISTS "${FFMPEG_SRC_DIR}/LICENSE.txt")
+                file(COPY "${FFMPEG_SRC_DIR}/LICENSE.txt" DESTINATION "${FFMPEG_DIR}")
+            endif()
+            if(EXISTS "${FFMPEG_SRC_DIR}/README.txt")
+                file(COPY "${FFMPEG_SRC_DIR}/README.txt" DESTINATION "${FFMPEG_DIR}")
+            endif()
+
+            file(REMOVE "${FFMPEG_ZIP_PATH}")
+            file(REMOVE_RECURSE "${FFMPEG_EXTRACT_DIR}")
+            message(STATUS "FFmpeg setup complete!")
         endif()
-
-        list(GET download_status 0 status_code)
-        list(GET download_status 1 status_msg)
-        if(NOT status_code EQUAL 0)
-            message(FATAL_ERROR "Failed to download FFmpeg (Code: ${status_code}): ${status_msg}")
-        endif()
-
-        message(STATUS "Extracting FFmpeg package...")
-        file(ARCHIVE_EXTRACT INPUT "${FFMPEG_ZIP_PATH}" DESTINATION "${FFMPEG_EXTRACT_DIR}")
-
-        # Find the extracted folder name
-        file(GLOB EXTRACTED_FOLDERS "${FFMPEG_EXTRACT_DIR}/ffmpeg-*")
-        list(LENGTH EXTRACTED_FOLDERS folders_len)
-        if(folders_len EQUAL 0)
-            message(FATAL_ERROR "No extracted FFmpeg folder found. Extraction may have failed.")
-        endif()
-        list(GET EXTRACTED_FOLDERS 0 FFMPEG_SRC_DIR)
-
-        message(STATUS "Installing FFmpeg to thirdparty/ffmpeg...")
-        file(REMOVE_RECURSE "${FFMPEG_DIR}") # Clear clean install
-        file(MAKE_DIRECTORY "${FFMPEG_DIR}")
-        
-        file(COPY "${FFMPEG_SRC_DIR}/bin" DESTINATION "${FFMPEG_DIR}")
-        file(COPY "${FFMPEG_SRC_DIR}/include" DESTINATION "${FFMPEG_DIR}")
-        file(COPY "${FFMPEG_SRC_DIR}/lib" DESTINATION "${FFMPEG_DIR}")
-        
-        # Copy LICENSE and README if present
-        if(EXISTS "${FFMPEG_SRC_DIR}/LICENSE.txt")
-            file(COPY "${FFMPEG_SRC_DIR}/LICENSE.txt" DESTINATION "${FFMPEG_DIR}")
-        endif()
-        if(EXISTS "${FFMPEG_SRC_DIR}/README.txt")
-            file(COPY "${FFMPEG_SRC_DIR}/README.txt" DESTINATION "${FFMPEG_DIR}")
-        endif()
-
-        file(REMOVE "${FFMPEG_ZIP_PATH}")
-        file(REMOVE_RECURSE "${FFMPEG_EXTRACT_DIR}")
-        message(STATUS "FFmpeg setup complete!")
     endif()
 
     include_directories(SYSTEM "${FFMPEG_DIR}/include")
