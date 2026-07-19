@@ -12,10 +12,11 @@ NaikAVPlayer is a native, multi-threaded C++ media engine and video player built
 - **Symmetric Seeking:** Keyframe seek operations flushing packet queues and decoding pipelines under 80ms.
 - **Dynamic Hardware Fallback:** Attempts initialization of platform-specific hardware decoders (D3D11VA, DXVA2, QSV, CUVID on Windows; V4L2M2M, VAAPI, QSV, CUVID on Linux), falling back dynamically to software H.264 decoding if hardware context allocation fails.
 - **Audio-Video Synchronization:** Reconstructs audio clock sample-accurately from PCM sample offsets to maintain drift under 10ms.
+- **Dynamic Resolution Scaling:** Real-time playback scaling supporting dynamic output resolution selection (Original source, 360p, 480p, 720p, 1080p, 1440p, 4K) from the UI dropdown to optimize rendering performance and GPU upload bandwidth.
 - **Software Volume Attenuation:** Scalable audio output level adjustments with memcpy/memset bypasses for 100% and 0% volume states.
 - **Loop Playback:** Wraparound seek to 0.0 upon reaching end-of-file for continuous playback.
 - **Native File Dialog:** Cross-platform native file picker integration using nativefiledialog-extended (NFD) on Win32 and GTK3/Portal backends.
-- **Pipeline Diagnostics HUD:** Interactive overlay displaying player states, playback clock offsets, frame timings, and queue levels.
+- **Pipeline Diagnostics & System Info HUD:** Real-time overlay displaying active player states, media telemetry (native vs. playback resolution, pixel format, hardware vs. software decoder type), pipeline queue depth levels, decode/render frame pacing budgets, and rolling clock synchronization offsets.
 - **Translucent User Interface:** ImGui-based desktop interface using bundled Noto Sans typography.
 
 ---
