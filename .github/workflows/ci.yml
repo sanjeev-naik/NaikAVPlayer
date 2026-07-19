@@ -62,8 +62,8 @@ jobs:
       - name: Capture and Filter Coverage
         run: |
           lcov --directory build-linux --capture --output-file coverage.info
-          lcov --remove coverage.info '/usr/*' '*/thirdparty/*' '*/tests/*' --output-file coverage.info
-          lcov --list coverage.info
+          lcov --remove coverage.info '/usr/*' '*/thirdparty/*' '*/tests/*' --output-file coverage.info --ignore-errors unused
+          lcov --list coverage.info --ignore-errors unused
 
       - name: Upload Coverage to Codecov
         uses: codecov/codecov-action@v4
