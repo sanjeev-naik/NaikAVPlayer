@@ -31,13 +31,35 @@ jobs:
 
       - name: Package
         run: |
-          mkdir -p NaikAVPlayer-${{ github.ref_name }}-windows-x64
-          cp build-windows/NaikAVPlayer.exe build-windows/*.dll \
-             NaikAVPlayer-${{ github.ref_name }}-windows-x64/
-          cp -r build-windows/assets NaikAVPlayer-${{ github.ref_name }}-windows-x64/
-          cp LICENSE README.md NaikAVPlayer-${{ github.ref_name }}-windows-x64/
-          zip -r NaikAVPlayer-${{ github.ref_name }}-windows-x64.zip \
-             NaikAVPlayer-${{ github.ref_name }}-windows-x64
+          PKG=NaikAVPlayer-${{ github.ref_name }}-windows-x64
+          mkdir -p $PKG
+          cp build-windows/NaikAVPlayer.exe build-windows/*.dll $PKG/
+          # MinGW runtime: winpthread is not covered by -static-libgcc/-static-libstdc++
+          find /usr/x86_64-w64-mingw32 /usr/lib/gcc/x86_64-w64-mingw32 \
+            -name "libwinpthread-1.dll" -exec cp {} $PKG/ \; 2>/dev/null || true
+          cp -r assets $PKG/
+          rm -f $PKG/assets/hd_test_video_with_audio.mp4 $PKG/assets/screenshot.png
+          cp LICENSE README.md $PKG/
+          zip -r $PKG.zip $PKG
+
+      - name: Verify DLL closure
+        run: |
+          PKG=NaikAVPlayer-${{ github.ref_name }}-windows-x64
+          missing=0
+          for dll in $(x86_64-w64-mingw32-objdump -p $PKG/NaikAVPlayer.exe | awk '/DLL Name/{print $3}'); do
+            case "$dll" in
+              KERNEL32.dll|USER32.dll|GDI32.dll|SHELL32.dll|ADVAPI32.dll|ole32.dll|OLEAUT32.dll|msvcrt.dll|WS2_32.dll|bcrypt.dll|IMM32.dll|SETUPAPI.dll|VERSION.dll|WINMM.dll|uuid.dll|comdlg32.dll|SHLWAPI.dll|dwmapi.dll|CRYPT32.dll|Secur32.dll)
+                ;;
+              *)
+                if [ ! -f "$PKG/$dll" ]; then
+                  echo "::error::Missing dependent DLL in package: $dll"
+                  missing=1
+                fi
+                ;;
+            esac
+          done
+          [ $missing -eq 0 ] && echo "All non-system DLL dependencies are bundled."
+          exit $missing
 
       - uses: actions/upload-artifact@v4
         with:
@@ -63,12 +85,27 @@ jobs:
 
       - name: Package
         run: |
-          mkdir -p NaikAVPlayer-${{ github.ref_name }}-linux-x64
-          cp build/NaikAVPlayer NaikAVPlayer-${{ github.ref_name }}-linux-x64/
-          cp -r assets NaikAVPlayer-${{ github.ref_name }}-linux-x64/
-          cp LICENSE README.md NaikAVPlayer-${{ github.ref_name }}-linux-x64/
-          tar czf NaikAVPlayer-${{ github.ref_name }}-linux-x64.tar.gz \
-             NaikAVPlayer-${{ github.ref_name }}-linux-x64
+          PKG=NaikAVPlayer-${{ github.ref_name }}-linux-x64
+          mkdir -p $PKG/lib
+          cp build/NaikAVPlayer $PKG/
+          # Bundle the in-tree built SDL3 shared library; binary finds it via $ORIGIN/lib RPATH
+          find build -name "libSDL3.so*" -exec cp -P {} $PKG/lib/ \;
+          cp -r assets $PKG/
+          rm -f $PKG/assets/hd_test_video_with_audio.mp4 $PKG/assets/screenshot.png
+          cp LICENSE README.md $PKG/
+          tar czf $PKG.tar.gz $PKG
+
+      - name: Verify shared library resolution
+        run: |
+          PKG=NaikAVPlayer-${{ github.ref_name }}-linux-x64
+          ls -la $PKG/lib/
+          cd $PKG
+          if ldd ./NaikAVPlayer | grep "not found"; then
+            echo "::error::Unresolved shared libraries in packaged binary"
+            exit 1
+          fi
+          ldd ./NaikAVPlayer | grep -E "libSDL3|libav" || true
+          echo "All shared libraries resolve (FFmpeg via system packages, SDL3 bundled)."
 
       - uses: actions/upload-artifact@v4
         with:
@@ -90,3 +127,7 @@ jobs:
             NaikAVPlayer-*.zip
             NaikAVPlayer-*.tar.gz
           generate_release_notes: true
+          body: |
+            ## Downloads
+            - **Windows (x64):** self-contained — extract and run `NaikAVPlayer.exe`. All FFmpeg/SDL3/runtime DLLs are bundled.
+            - **Linux (x64):** SDL3 is bundled; FFmpeg libraries must be installed from your distribution, e.g. Ubuntu/Debian: `sudo apt install libavcodec-dev libavformat-dev libswscale-dev libswresample-dev` or the `ffmpeg` package.

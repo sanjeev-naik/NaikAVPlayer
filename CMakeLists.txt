@@ -320,11 +320,20 @@ target_link_libraries(NaikAVPlayer PRIVATE
 # Ensure standard Win32 subsystems link correctly for MinGW only
 if(TARGET_PLATFORM_WINDOWS AND CMAKE_CXX_COMPILER_ID MATCHES "GNU")
     target_link_libraries(NaikAVPlayer PRIVATE mingw32)
+    # Statically link the GCC runtime so the shipped .exe does not depend on
+    # toolchain DLLs (libgcc_s_seh-1.dll / libstdc++-6.dll) that only exist
+    # on the build machine.
+    target_link_options(NaikAVPlayer PRIVATE -static-libgcc -static-libstdc++)
 endif()
 
 # Link Linux specific libraries
 if(TARGET_PLATFORM_LINUX)
     target_link_libraries(NaikAVPlayer PRIVATE pthread dl)
+    # Search a lib/ directory next to the binary so release packages can
+    # bundle libSDL3.so alongside the executable.
+    set_target_properties(NaikAVPlayer PROPERTIES
+        BUILD_RPATH "\$ORIGIN/lib"
+        INSTALL_RPATH "\$ORIGIN/lib")
 endif()
 
 # Apply compiler warning flags to main application target

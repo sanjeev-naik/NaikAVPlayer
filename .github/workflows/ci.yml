@@ -195,17 +195,32 @@ jobs:
           path: ubsan_report.xlsx
           if-no-files-found: warn
 
+      # Packaging runs only for release activity (release/* branches, their PRs,
+      # and v* tags) — never on normal development pushes.
       - name: Package Linux Release Executable
-        if: success()
+        if: >-
+          success() && (
+            startsWith(github.ref, 'refs/heads/release/') ||
+            startsWith(github.ref, 'refs/tags/v') ||
+            startsWith(github.head_ref, 'release/')
+          )
         run: |
-          mkdir -p NaikAVPlayer-linux-x64
+          mkdir -p NaikAVPlayer-linux-x64/lib
           cp build-linux/NaikAVPlayer NaikAVPlayer-linux-x64/
+          find build-linux -name "libSDL3.so*" -exec cp -P {} NaikAVPlayer-linux-x64/lib/ \;
           cp -r assets NaikAVPlayer-linux-x64/
+          rm -f NaikAVPlayer-linux-x64/assets/hd_test_video_with_audio.mp4 \
+                NaikAVPlayer-linux-x64/assets/screenshot.png
           cp LICENSE README.md NaikAVPlayer-linux-x64/
           tar czf NaikAVPlayer-linux-x64.tar.gz NaikAVPlayer-linux-x64
 
       - name: Upload Linux Executable Package
-        if: success()
+        if: >-
+          success() && (
+            startsWith(github.ref, 'refs/heads/release/') ||
+            startsWith(github.ref, 'refs/tags/v') ||
+            startsWith(github.head_ref, 'release/')
+          )
         uses: actions/upload-artifact@v4
         with:
           name: linux-release-package
@@ -260,17 +275,33 @@ jobs:
           echo "Files in workspace:"
           find . -maxdepth 3 -not -path '*/.*' -not -path './build*' -not -path './thirdparty*'
 
+      # Packaging runs only for release activity (release/* branches, their PRs,
+      # and v* tags) — never on normal development pushes.
       - name: Package Windows Release Executable
-        if: success()
+        if: >-
+          success() && (
+            startsWith(github.ref, 'refs/heads/release/') ||
+            startsWith(github.ref, 'refs/tags/v') ||
+            startsWith(github.head_ref, 'release/')
+          )
         run: |
           mkdir -p NaikAVPlayer-windows-x64
           cp build-windows/NaikAVPlayer.exe build-windows/*.dll NaikAVPlayer-windows-x64/
-          cp -r build-windows/assets NaikAVPlayer-windows-x64/
+          find /usr/x86_64-w64-mingw32 /usr/lib/gcc/x86_64-w64-mingw32 \
+            -name "libwinpthread-1.dll" -exec cp {} NaikAVPlayer-windows-x64/ \; 2>/dev/null || true
+          cp -r assets NaikAVPlayer-windows-x64/
+          rm -f NaikAVPlayer-windows-x64/assets/hd_test_video_with_audio.mp4 \
+                NaikAVPlayer-windows-x64/assets/screenshot.png
           cp LICENSE README.md NaikAVPlayer-windows-x64/
           zip -r NaikAVPlayer-windows-x64.zip NaikAVPlayer-windows-x64
 
       - name: Upload Windows Executable Package
-        if: success()
+        if: >-
+          success() && (
+            startsWith(github.ref, 'refs/heads/release/') ||
+            startsWith(github.ref, 'refs/tags/v') ||
+            startsWith(github.head_ref, 'release/')
+          )
         uses: actions/upload-artifact@v4
         with:
           name: windows-release-package
