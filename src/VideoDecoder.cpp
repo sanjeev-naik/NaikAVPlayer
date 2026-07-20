@@ -262,11 +262,13 @@ bool VideoDecoder::decodeNextFrame() {
   }
 
   AVPacket *packet = nullptr;
+  int hardwareDeadlockRetries = 0;
   while (true) {
     // 1. Attempt to receive a decoded frame from the codec's internal buffers
     int ret = avcodec_receive_frame(m_codecCtx, m_decodedFrame);
     if (ret >= 0) {
       m_consecutiveEagainCount = 0;
+      hardwareDeadlockRetries = 0;
       m_hardwareRecoveryAttempts =
           0; // a real frame proves the session is healthy
       // We have successfully decoded a frame.
@@ -329,8 +331,27 @@ bool VideoDecoder::decodeNextFrame() {
         // hardware decoders, its surface pool) is full. Its own contract
         // guarantees a frame is waiting to be drained -- loop back to
         // receive_frame() and resend this same packet once space frees up.
+        if (isHardwareDecoder(m_codecCtx->codec)) {
+          hardwareDeadlockRetries++;
+          if (hardwareDeadlockRetries > 50) {
+            std::cerr << "Hardware decoder " << m_codecCtx->codec->name
+                      << " deadlock detected (EAGAIN on send/receive). Recovering..." << std::endl;
+            if (recoverHardwareDecoder()) {
+              ret = avcodec_send_packet(m_codecCtx, packet);
+              hardwareDeadlockRetries = 0;
+              if (ret == AVERROR(EAGAIN)) continue;
+            } else {
+              av_packet_free(&packet);
+              m_hasDecodeStart = false;
+              return false;
+            }
+          } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+          }
+        }
         continue;
       }
+      hardwareDeadlockRetries = 0;
       if (ret < 0 && isHardwareDecoder(m_codecCtx->codec)) {
         std::cerr << "Hardware decoder " << m_codecCtx->codec->name
                   << " failed on send. Recovering..." << std::endl;
