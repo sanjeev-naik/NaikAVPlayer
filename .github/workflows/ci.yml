@@ -78,7 +78,6 @@ jobs:
             --prefix=${{ github.workspace }}/thirdparty/ffmpeg \
             --enable-shared \
             --disable-static \
-            --enable-programs \
             --disable-doc \
             --disable-avdevice \
             --disable-avfilter \
@@ -669,7 +668,6 @@ jobs:
             --prefix=${{ github.workspace }}/thirdparty/ffmpeg \
             --enable-shared \
             --disable-static \
-            --enable-programs \
             --disable-doc \
             --disable-avdevice \
             --disable-avfilter \
