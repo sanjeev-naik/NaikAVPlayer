@@ -266,7 +266,7 @@ jobs:
           fi
 
       - name: Upload Artifact
-        if: github.ref == 'refs/heads/release'
+        if: startsWith(github.ref, 'refs/heads/release')
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact_name }}
@@ -358,7 +358,7 @@ jobs:
           cp build/lib/*.so* package/lib/ 2>/dev/null || true
 
       - name: Upload Artifact
-        if: github.ref == 'refs/heads/release'
+        if: startsWith(github.ref, 'refs/heads/release')
         uses: actions/upload-artifact@v4
         with:
           name: NaikAVPlayer-linux-arm64
