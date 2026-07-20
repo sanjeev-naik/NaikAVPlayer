@@ -54,6 +54,20 @@ endif()
 if(TARGET_PLATFORM_WINDOWS)
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         add_link_options(-Wl,--dynamicbase -Wl,--nxcompat -static-libgcc -static-libstdc++)
+        # -fstack-protector-strong / -D_FORTIFY_SOURCE=2 above pull in
+        # __stack_chk_fail/__stack_chk_guard/__memcpy_chk/__memmove_chk,
+        # which on MinGW live in libssp (unlike glibc, where they're part of
+        # libc itself). link_libraries() - not add_link_options("-lssp") -
+        # is required here: CMake emits add_link_options content in the
+        # linker-flags position, which most Makefile/Ninja link rules place
+        # BEFORE the object files, so GNU ld would see no undefined symbols
+        # yet and skip pulling anything from the archive. link_libraries()
+        # instead populates each target's LINK_LIBRARIES, which is emitted
+        # AFTER the objects - where archive resolution actually works. This
+        # also affects the FetchContent-built SDL3 target, since directory-
+        # scoped link_libraries()/add_compile_options() propagate to
+        # subdirectories added later (SDL3 is fetched further below).
+        link_libraries(ssp)
     elseif(MSVC)
         add_link_options(/DYNAMICBASE /NXCOMPAT)
     endif()

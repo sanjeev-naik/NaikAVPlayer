@@ -150,7 +150,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/thirdparty/ffmpeg
-          key: ${{ runner.os }}-ffmpeg-8.1-ce3c09c101-linux-x64-v1
+          key: ${{ runner.os }}-ffmpeg-8.1-ce3c09c101-linux-x64-v2
 
       - name: Build FFmpeg from source (Linux x64)
         if: steps.cache-ffmpeg-linux-x64.outputs.cache-hit != 'true'
@@ -165,6 +165,7 @@ jobs:
             --disable-doc \
             --disable-avdevice \
             --disable-avfilter \
+            --disable-bzlib \
             --enable-libdrm \
             --enable-v4l2-m2m
           grep -q "#define CONFIG_V4L2_M2M 1" config.h || { echo "::error::FFmpeg configured WITHOUT V4L2 M2M support"; exit 1; }
@@ -416,7 +417,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/thirdparty/ffmpeg
-          key: ${{ runner.os }}-ffmpeg-8.1-ce3c09c101-linux-aarch64-v1
+          key: ${{ runner.os }}-ffmpeg-8.1-ce3c09c101-linux-aarch64-v2
 
       - name: Build FFmpeg from source (Linux aarch64 cross-compile)
         if: steps.cache-ffmpeg-linux-aarch64.outputs.cache-hit != 'true'
@@ -434,6 +435,7 @@ jobs:
             --disable-doc \
             --disable-avdevice \
             --disable-avfilter \
+            --disable-bzlib \
             --enable-cross-compile \
             --cross-prefix=aarch64-linux-gnu- \
             --arch=aarch64 \
@@ -441,8 +443,15 @@ jobs:
             --cc=aarch64-linux-gnu-gcc \
             --cxx=aarch64-linux-gnu-g++ \
             --pkg-config=pkg-config \
+            --extra-cflags=--sysroot=/ \
+            --extra-ldflags=--sysroot=/ \
             --enable-libdrm \
             --enable-v4l2-m2m
+          # See the matching step in ci.yml for why --disable-bzlib and
+          # --sysroot=/ are needed (unsatisfiable libbz2 dependency, and a
+          # glibc version mismatch between aarch64-linux-gnu-gcc's own
+          # bundled cross-sysroot and the ports.ubuntu.com multiarch arm64
+          # packages everything else here resolves against).
           grep -q "#define CONFIG_V4L2_M2M 1" config.h || { echo "::error::FFmpeg (aarch64) configured WITHOUT V4L2 M2M support"; exit 1; }
           grep -q "#define CONFIG_LIBDRM 1" config.h || { echo "::error::FFmpeg (aarch64) configured WITHOUT libdrm/DRM PRIME support"; exit 1; }
           make -j$(nproc)
@@ -466,6 +475,7 @@ jobs:
             -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
             -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
             -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ \
+            -DCMAKE_SYSROOT=/ \
             -DTREAT_WARNINGS_AS_ERRORS=ON \
             -DCMAKE_BUILD_TYPE=Release \
             -DENABLE_FFMPEG_AUTO_DOWNLOAD=OFF \

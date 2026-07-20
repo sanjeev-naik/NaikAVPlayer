@@ -66,7 +66,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/thirdparty/ffmpeg
-          key: ${{ runner.os }}-ffmpeg-8.1-ce3c09c101-linux-x64-v1
+          key: ${{ runner.os }}-ffmpeg-8.1-ce3c09c101-linux-x64-v2
 
       - name: Build FFmpeg from source (Linux x64)
         if: steps.cache-ffmpeg-linux-x64.outputs.cache-hit != 'true'
@@ -81,8 +81,13 @@ jobs:
             --disable-doc \
             --disable-avdevice \
             --disable-avfilter \
+            --disable-bzlib \
             --enable-libdrm \
             --enable-v4l2-m2m
+          # --disable-bzlib: kept identical to the aarch64 leg for config
+          # parity - NaikAVPlayer doesn't use bzip2-compressed containers,
+          # and it avoids an FFmpeg feature set that silently differs
+          # between the two Linux targets.
           # Hard-fail the build if the decoders this project depends on for
           # Raspberry Pi / embedded ARM hardware decode (V4L2 M2M) and
           # zero-copy display (DRM PRIME, via libdrm) were not actually
@@ -647,7 +652,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/thirdparty/ffmpeg
-          key: ${{ runner.os }}-ffmpeg-8.1-ce3c09c101-linux-aarch64-v1
+          key: ${{ runner.os }}-ffmpeg-8.1-ce3c09c101-linux-aarch64-v2
 
       - name: Build FFmpeg from source (Linux aarch64 cross-compile)
         if: steps.cache-ffmpeg-linux-aarch64.outputs.cache-hit != 'true'
@@ -671,6 +676,7 @@ jobs:
             --disable-doc \
             --disable-avdevice \
             --disable-avfilter \
+            --disable-bzlib \
             --enable-cross-compile \
             --cross-prefix=aarch64-linux-gnu- \
             --arch=aarch64 \
@@ -678,8 +684,27 @@ jobs:
             --cc=aarch64-linux-gnu-gcc \
             --cxx=aarch64-linux-gnu-g++ \
             --pkg-config=pkg-config \
+            --extra-cflags=--sysroot=/ \
+            --extra-ldflags=--sysroot=/ \
             --enable-libdrm \
             --enable-v4l2-m2m
+          # --disable-bzlib: FFmpeg's configure auto-detects bzlib.h and
+          # enables it opportunistically, but no arm64 libbz2 is installed
+          # here and this project never needs bzip2-compressed containers -
+          # left enabled, libavformat.so records a NEEDED dependency that's
+          # unsatisfiable at link/runtime.
+          #
+          # --sysroot=/: aarch64-linux-gnu-gcc's OWN bundled cross-sysroot
+          # (from libc6-dev-arm64-cross) ships a different/newer glibc
+          # baseline than the ports.ubuntu.com multiarch arm64 packages
+          # (glibc 2.35, jammy) everything else here - SDL3, libdrm, and
+          # CMake's own aarch64 build below - resolves against. Without
+          # forcing --sysroot=/, FFmpeg links against the cross-toolchain's
+          # own glibc while the final NaikAVPlayer link resolves against the
+          # multiarch one, producing exactly the kind of compile-time vs.
+          # runtime ABI mismatch (undefined reference to fmod@GLIBC_2.38)
+          # this whole audit exists to eliminate. Forcing both to resolve
+          # against the real on-disk sysroot keeps them consistent.
           # Hard-fail rather than silently shipping a Pi build without
           # hardware decode / zero-copy display support.
           grep -q "#define CONFIG_V4L2_M2M 1" config.h || { echo "::error::FFmpeg (aarch64) configured WITHOUT V4L2 M2M support"; exit 1; }
@@ -705,6 +730,7 @@ jobs:
             -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
             -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
             -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ \
+            -DCMAKE_SYSROOT=/ \
             -DTREAT_WARNINGS_AS_ERRORS=ON \
             -DCMAKE_BUILD_TYPE=Release \
             -DENABLE_FFMPEG_AUTO_DOWNLOAD=OFF \
