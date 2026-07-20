@@ -54,7 +54,6 @@ jobs:
             --disable-programs \
             --disable-doc \
             --disable-avdevice \
-            --disable-postproc \
             --disable-avfilter \
             --enable-vaapi \
             --enable-v4l2-m2m \
@@ -296,7 +295,6 @@ jobs:
             --disable-programs \
             --disable-doc \
             --disable-avdevice \
-            --disable-postproc \
             --disable-avfilter \
             --enable-cross-compile \
             --cross-prefix=x86_64-w64-mingw32- \
@@ -472,7 +470,6 @@ jobs:
             --disable-programs \
             --disable-doc \
             --disable-avdevice \
-            --disable-postproc \
             --disable-avfilter \
             --enable-cross-compile \
             --cross-prefix=aarch64-linux-gnu- \
