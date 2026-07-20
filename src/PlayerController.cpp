@@ -80,6 +80,10 @@ bool PlayerController::openFile(const std::string& filename) {
             m_metrics->m_profilingEnabled
         );
         m_hasVideo = m_videoDecoder->init();
+        if (m_hasVideo) {
+            m_videoIsHardware.store(m_videoDecoder->isHardware(),
+                                    std::memory_order_relaxed);
+        }
     }
 
     // Initialize Audio Decoder if audio stream is available
@@ -432,17 +436,32 @@ double PlayerController::getDuration() const {
 }
 
 int PlayerController::getVideoWidth() const {
-    std::lock_guard<std::mutex> lock(m_videoDecoderMutex);
-    if (m_videoDecoder) {
-        return m_videoDecoder->getWidth();
+    // Lock-free: read the last decoded frame's width. Falls back to the
+    // container's codec parameters before the first frame arrives. Must not
+    // take m_videoDecoderMutex (see header note).
+    int w = m_lastFrameWidth.load(std::memory_order_relaxed);
+    if (w > 0) {
+        return w;
+    }
+    if (m_hasVideo && m_demuxer) {
+        AVCodecParameters* params = m_demuxer->getVideoCodecParams();
+        if (params) {
+            return params->width;
+        }
     }
     return 0;
 }
 
 int PlayerController::getVideoHeight() const {
-    std::lock_guard<std::mutex> lock(m_videoDecoderMutex);
-    if (m_videoDecoder) {
-        return m_videoDecoder->getHeight();
+    int h = m_lastFrameHeight.load(std::memory_order_relaxed);
+    if (h > 0) {
+        return h;
+    }
+    if (m_hasVideo && m_demuxer) {
+        AVCodecParameters* params = m_demuxer->getVideoCodecParams();
+        if (params) {
+            return params->height;
+        }
     }
     return 0;
 }
@@ -517,11 +536,9 @@ std::string PlayerController::getVideoPixelFormat() const {
 }
 
 bool PlayerController::isVideoHardware() const {
-    std::lock_guard<std::mutex> lock(m_videoDecoderMutex);
-    if (m_videoDecoder) {
-        return m_videoDecoder->isHardware();
-    }
-    return false;
+    // Lock-free snapshot refreshed by the video thread each decode iteration
+    // (so software fallback is reflected). Must not take m_videoDecoderMutex.
+    return m_videoIsHardware.load(std::memory_order_relaxed);
 }
 
 void PlayerController::videoThreadLoop() {
@@ -571,6 +588,8 @@ void PlayerController::videoThreadLoop() {
             std::lock_guard<std::mutex> lock(m_videoDecoderMutex);
             if (m_videoDecoder && !m_seeking.load()) {
                 decoded = m_videoDecoder->decodeNextFrame();
+                m_videoIsHardware.store(m_videoDecoder->isHardware(),
+                                        std::memory_order_relaxed);
                 if (decoded) {
                     converted = m_videoDecoder->convertFrame(m_resolutionOption.load());
                     if (converted) {
@@ -585,6 +604,10 @@ void PlayerController::videoThreadLoop() {
                                                              : m_videoDecoder->getWidth();
                             frameHeight = srcFrame->height > 0 ? srcFrame->height
                                                                : m_videoDecoder->getHeight();
+                            m_lastFrameWidth.store(frameWidth,
+                                                   std::memory_order_relaxed);
+                            m_lastFrameHeight.store(frameHeight,
+                                                    std::memory_order_relaxed);
                         }
                     }
                 }

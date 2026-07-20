@@ -32,37 +32,15 @@ jobs:
             cppcheck \
             lcov \
             libdrm-dev \
-            libudev-dev \
-            nasm \
-            yasm
+            libudev-dev
 
-      - name: Cache FFmpeg Build
-        id: cache-ffmpeg
-        uses: actions/cache@v4
-        with:
-          path: ${{ github.workspace }}/thirdparty/ffmpeg
-          key: ${{ runner.os }}-ffmpeg-8.1-ce3c09c101-x64-v1
-
-      - name: Build FFmpeg from source
-        if: steps.cache-ffmpeg.outputs.cache-hit != 'true'
-        run: |
-          git clone https://github.com/FFmpeg/FFmpeg.git ffmpeg-src
-          cd ffmpeg-src
-          git checkout ce3c09c101
-          ./configure \
-            --prefix=${{ github.workspace }}/thirdparty/ffmpeg \
-            --enable-shared \
-            --disable-static \
-            --disable-programs \
-            --disable-doc \
-            --disable-avdevice \
-            --disable-avfilter \
-            --enable-vaapi \
-            --enable-v4l2-m2m \
-            --enable-libdrm \
-            --enable-udev
-          make -j$(nproc)
-          make install
+      # FFmpeg is NOT built from source here. CMake's ENABLE_FFMPEG_AUTO_DOWNLOAD
+      # (ON by default) fetches the exact same SHA256-pinned BtbN shared build
+      # that local developer builds use, so the CI-packaged libav* are
+      # bit-identical to a local build's. The previous source-build step was
+      # broken (--enable-udev is not a valid FFmpeg configure option, so a cold
+      # cache could never rebuild) and shipped a stale, unreproducible
+      # actions/cache blob whose v4l2m2m decoder stalls on Raspberry Pi.
 
       - name: Setup Compiler Cache (ccache)
         uses: hendrikmuhs/ccache-action@v1
@@ -275,9 +253,7 @@ jobs:
           sudo apt-get install -y \
             ffmpeg \
             mingw-w64 \
-            ccache \
-            nasm \
-            yasm
+            ccache
 
       - name: Cache FFmpeg Build (Windows)
         id: cache-ffmpeg-windows
@@ -454,39 +430,13 @@ jobs:
             libudev-dev:arm64 \
             ccache
 
-      - name: Cache FFmpeg Build (aarch64)
-        id: cache-ffmpeg-aarch64
-        uses: actions/cache@v4
-        with:
-          path: ${{ github.workspace }}/thirdparty/ffmpeg
-          key: ${{ runner.os }}-ffmpeg-8.1-ce3c09c101-aarch64-v1
-
-      - name: Build FFmpeg from source (aarch64)
-        if: steps.cache-ffmpeg-aarch64.outputs.cache-hit != 'true'
-        run: |
-          git clone https://github.com/FFmpeg/FFmpeg.git ffmpeg-src
-          cd ffmpeg-src
-          git checkout ce3c09c101
-          ./configure \
-            --prefix=${{ github.workspace }}/thirdparty/ffmpeg \
-            --enable-shared \
-            --disable-static \
-            --disable-programs \
-            --disable-doc \
-            --disable-avdevice \
-            --disable-avfilter \
-            --enable-cross-compile \
-            --cross-prefix=aarch64-linux-gnu- \
-            --arch=aarch64 \
-            --target-os=linux \
-            --cc=aarch64-linux-gnu-gcc \
-            --cxx=aarch64-linux-gnu-g++ \
-            --enable-vaapi \
-            --enable-v4l2-m2m \
-            --enable-libdrm \
-            --enable-udev
-          make -j$(nproc)
-          make install
+      # FFmpeg is NOT cross-built from source here. CMake's auto-download picks
+      # the SHA256-pinned BtbN linuxarm64 build (CMAKE_SYSTEM_PROCESSOR=aarch64
+      # selects the linuxarm64 URL), i.e. the exact libraries a local Raspberry
+      # Pi build links and ships in its lib/ directory. This is what makes the
+      # CI aarch64 package behave identically to a local Pi build, including
+      # h264_v4l2m2m hardware decode. See notes in the x64 job above for why
+      # the old source-build step was removed.
 
       - name: Setup Compiler Cache (ccache)
         uses: hendrikmuhs/ccache-action@v1
