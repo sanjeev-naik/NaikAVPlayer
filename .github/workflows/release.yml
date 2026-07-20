@@ -405,58 +405,17 @@ jobs:
             qemu-user-static \
             ccache
 
-      # Pinned, source-built, V4L2M2M+DRM-enabled FFmpeg for aarch64 - see the
-      # matching step in ci.yml for the full rationale. This replaces
-      # `ffmpeg:arm64` from Ubuntu ports (FFmpeg 4.4.2, generic config, not
-      # guaranteed to have V4L2 M2M / DRM PRIME compiled in), which is the
-      # primary reason the previously-released Raspberry Pi build could work
-      # locally but show a blank screen on hardware decode / hang on "Show
-      # Info" when downloaded from a GitHub Release.
-      - name: Cache FFmpeg Build (Linux aarch64)
-        id: cache-ffmpeg-linux-aarch64
-        uses: actions/cache@v4
-        with:
-          path: ${{ github.workspace }}/thirdparty/ffmpeg
-          key: ${{ runner.os }}-ffmpeg-8.1-ce3c09c101-linux-aarch64-v2
-
-      - name: Build FFmpeg from source (Linux aarch64 cross-compile)
-        if: steps.cache-ffmpeg-linux-aarch64.outputs.cache-hit != 'true'
-        env:
-          PKG_CONFIG_LIBDIR: "/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig"
-          PKG_CONFIG_SYSROOT_DIR: "/"
-        run: |
-          git clone https://github.com/FFmpeg/FFmpeg.git ffmpeg-src
-          cd ffmpeg-src
-          git checkout ce3c09c101
-          ./configure \
-            --prefix=${{ github.workspace }}/thirdparty/ffmpeg \
-            --enable-shared \
-            --disable-static \
-            --disable-doc \
-            --disable-avdevice \
-            --disable-avfilter \
-            --disable-bzlib \
-            --enable-cross-compile \
-            --cross-prefix=aarch64-linux-gnu- \
-            --arch=aarch64 \
-            --target-os=linux \
-            --cc=aarch64-linux-gnu-gcc \
-            --cxx=aarch64-linux-gnu-g++ \
-            --pkg-config=pkg-config \
-            --extra-cflags=--sysroot=/ \
-            --extra-ldflags=--sysroot=/ \
-            --enable-libdrm \
-            --enable-v4l2-m2m
-          # See the matching step in ci.yml for why --disable-bzlib and
-          # --sysroot=/ are needed (unsatisfiable libbz2 dependency, and a
-          # glibc version mismatch between aarch64-linux-gnu-gcc's own
-          # bundled cross-sysroot and the ports.ubuntu.com multiarch arm64
-          # packages everything else here resolves against).
-          grep -q "#define CONFIG_V4L2_M2M 1" config.h || { echo "::error::FFmpeg (aarch64) configured WITHOUT V4L2 M2M support"; exit 1; }
-          grep -q "#define CONFIG_LIBDRM 1" config.h || { echo "::error::FFmpeg (aarch64) configured WITHOUT libdrm/DRM PRIME support"; exit 1; }
-          make -j$(nproc)
-          make install
-
+      # FFmpeg for aarch64 is obtained the SAME way a local Raspberry Pi
+      # developer build gets it: CMake's own auto-download of the pinned
+      # BtbN prebuilt (n8.1.2, ce3c09c101) - see the ENABLE_FFMPEG_AUTO_DOWNLOAD
+      # option in CMakeLists.txt, and the matching step in ci.yml for the
+      # full rationale. An earlier pass at this fix cross-compiled FFmpeg
+      # from source here in CI instead; on real Raspberry Pi hardware that
+      # produced a binary that opened the V4L2 M2M hardware decoder but then
+      # silently stalled with zero frames ever decoded - a symptom that did
+      # NOT reproduce with a locally-built executable using this exact
+      # auto-download path. Using the identical acquisition path as local
+      # dev builds eliminates that whole class of risk by construction.
       - name: Setup Compiler Cache (ccache)
         uses: hendrikmuhs/ccache-action@v1
         with:
@@ -475,13 +434,29 @@ jobs:
             -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
             -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
             -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ \
-            -DCMAKE_SYSROOT=/ \
             -DTREAT_WARNINGS_AS_ERRORS=ON \
             -DCMAKE_BUILD_TYPE=Release \
-            -DENABLE_FFMPEG_AUTO_DOWNLOAD=OFF \
+            -DENABLE_FFMPEG_AUTO_DOWNLOAD=ON \
             -DSDL_WAYLAND=ON \
             -DSDL_X11=ON \
             -DSDL_KMSDRM=ON
+
+      - name: Verify downloaded FFmpeg has V4L2M2M/DRM support
+        run: |
+          FFMPEG_BIN="thirdparty/ffmpeg/bin/ffmpeg"
+          if [ ! -x "$FFMPEG_BIN" ]; then
+            echo "::error::$FFMPEG_BIN not found after CMake's FFmpeg auto-download"
+            exit 1
+          fi
+          if ! "$FFMPEG_BIN" -decoders 2>/dev/null | grep -qi v4l2m2m; then
+            echo "::error::Downloaded FFmpeg has no V4L2 M2M decoder (or qemu execution failed)"
+            exit 1
+          fi
+          if ! "$FFMPEG_BIN" -hwaccels 2>/dev/null | grep -qi drm; then
+            echo "::error::Downloaded FFmpeg has no DRM PRIME hwaccel (or qemu execution failed)"
+            exit 1
+          fi
+          echo "Confirmed: downloaded FFmpeg has V4L2 M2M + DRM PRIME support."
 
       - name: Build
         run: |
@@ -499,7 +474,7 @@ jobs:
           cmake --version >> diagnostics-linux-aarch64/cmake_version.txt 2>&1
 
           # Executed transparently via the qemu-user-static binfmt_misc
-          # handler installed above, so this reflects the real cross-compiled
+          # handler installed above, so this reflects the real downloaded
           # binary, not a guess from headers.
           FFMPEG_BIN="thirdparty/ffmpeg/bin/ffmpeg"
 
