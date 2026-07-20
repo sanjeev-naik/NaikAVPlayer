@@ -402,7 +402,6 @@ jobs:
             libegl-dev:arm64 \
             libdbus-1-dev:arm64 \
             libpulse-dev:arm64 \
-            qemu-user-static \
             ccache
 
       # FFmpeg for aarch64 is obtained the SAME way a local Raspberry Pi
@@ -441,19 +440,25 @@ jobs:
             -DSDL_X11=ON \
             -DSDL_KMSDRM=ON
 
+      # Codec/hwaccel names are baked into libavcodec's/libavutil's string
+      # tables at FFmpeg's own build time, so grepping the raw .so for them
+      # is a reliable, static, architecture-agnostic check - no need to
+      # execute the aarch64 binary (qemu-user-static binfmt execution proved
+      # unreliable here; see the matching step in ci.yml).
       - name: Verify downloaded FFmpeg has V4L2M2M/DRM support
         run: |
-          FFMPEG_BIN="thirdparty/ffmpeg/bin/ffmpeg"
-          if [ ! -x "$FFMPEG_BIN" ]; then
-            echo "::error::$FFMPEG_BIN not found after CMake's FFmpeg auto-download"
+          AVCODEC_SO=$(ls thirdparty/ffmpeg/lib/libavcodec.so* 2>/dev/null | head -1)
+          AVUTIL_SO=$(ls thirdparty/ffmpeg/lib/libavutil.so* 2>/dev/null | head -1)
+          if [ -z "$AVCODEC_SO" ] || [ -z "$AVUTIL_SO" ]; then
+            echo "::error::libavcodec.so/libavutil.so not found after CMake's FFmpeg auto-download"
             exit 1
           fi
-          if ! "$FFMPEG_BIN" -decoders 2>/dev/null | grep -qi v4l2m2m; then
-            echo "::error::Downloaded FFmpeg has no V4L2 M2M decoder (or qemu execution failed)"
+          if ! strings "$AVCODEC_SO" | grep -qi "h264_v4l2m2m"; then
+            echo "::error::Downloaded FFmpeg has no V4L2 M2M decoder"
             exit 1
           fi
-          if ! "$FFMPEG_BIN" -hwaccels 2>/dev/null | grep -qi drm; then
-            echo "::error::Downloaded FFmpeg has no DRM PRIME hwaccel (or qemu execution failed)"
+          if ! strings "$AVCODEC_SO" "$AVUTIL_SO" | grep -qi "drm_prime"; then
+            echo "::error::Downloaded FFmpeg has no DRM PRIME hwaccel"
             exit 1
           fi
           echo "Confirmed: downloaded FFmpeg has V4L2 M2M + DRM PRIME support."
@@ -473,14 +478,10 @@ jobs:
           echo "=== CMake Version ===" > diagnostics-linux-aarch64/cmake_version.txt
           cmake --version >> diagnostics-linux-aarch64/cmake_version.txt 2>&1
 
-          # Executed transparently via the qemu-user-static binfmt_misc
-          # handler installed above, so this reflects the real downloaded
-          # binary, not a guess from headers.
-          FFMPEG_BIN="thirdparty/ffmpeg/bin/ffmpeg"
-
-          echo "=== FFmpeg Version (qemu-aarch64: $FFMPEG_BIN) ===" > diagnostics-linux-aarch64/ffmpeg_version.txt
-          "$FFMPEG_BIN" -version >> diagnostics-linux-aarch64/ffmpeg_version.txt 2>&1 || echo "(qemu execution unavailable)" >> diagnostics-linux-aarch64/ffmpeg_version.txt
-
+          # No qemu-user-static execution here: transparently running the
+          # aarch64 ffmpeg binary via binfmt_misc proved unreliable on this
+          # runner. pkg-config and strings-on-the-.so both give real,
+          # non-executed answers instead.
           echo "=== pkg-config versions ===" > diagnostics-linux-aarch64/pkg_config_versions.txt
           export PKG_CONFIG_LIBDIR="/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig"
           export PKG_CONFIG_PATH="${{ github.workspace }}/thirdparty/ffmpeg/lib/pkgconfig:$(find build-linux-aarch64 -name "*.pc" -exec dirname {} \; | tr '\n' ':')"
@@ -489,13 +490,16 @@ jobs:
           pkg-config --modversion libavutil >> diagnostics-linux-aarch64/pkg_config_versions.txt 2>&1 || true
           pkg-config --modversion sdl3 >> diagnostics-linux-aarch64/pkg_config_versions.txt 2>&1 || true
 
-          echo "=== FFmpeg hwaccels ===" > diagnostics-linux-aarch64/ffmpeg_hwaccels.txt
-          "$FFMPEG_BIN" -hwaccels >> diagnostics-linux-aarch64/ffmpeg_hwaccels.txt 2>&1 || echo "(qemu execution unavailable)" >> diagnostics-linux-aarch64/ffmpeg_hwaccels.txt
-
-          echo "=== FFmpeg decoders (v4l2m2m / drm filtered) ===" > diagnostics-linux-aarch64/ffmpeg_decoders.txt
-          "$FFMPEG_BIN" -decoders >> diagnostics-linux-aarch64/ffmpeg_decoders.txt 2>&1 || echo "(qemu execution unavailable)" >> diagnostics-linux-aarch64/ffmpeg_decoders.txt
-          echo "=== grep v4l2m2m ===" >> diagnostics-linux-aarch64/ffmpeg_decoders.txt
-          "$FFMPEG_BIN" -decoders 2>/dev/null | grep -i v4l2m2m >> diagnostics-linux-aarch64/ffmpeg_decoders.txt || echo "(none found / qemu unavailable)" >> diagnostics-linux-aarch64/ffmpeg_decoders.txt
+          echo "=== FFmpeg hwaccel/decoder support (static string check, see 'Verify downloaded FFmpeg' step) ===" > diagnostics-linux-aarch64/ffmpeg_hwaccels.txt
+          AVCODEC_SO=$(ls thirdparty/ffmpeg/lib/libavcodec.so* 2>/dev/null | head -1)
+          AVUTIL_SO=$(ls thirdparty/ffmpeg/lib/libavutil.so* 2>/dev/null | head -1)
+          if [ -n "$AVCODEC_SO" ]; then
+            echo "h264_v4l2m2m present: $(strings "$AVCODEC_SO" | grep -qi h264_v4l2m2m && echo yes || echo no)" >> diagnostics-linux-aarch64/ffmpeg_hwaccels.txt
+          fi
+          if [ -n "$AVCODEC_SO" ] && [ -n "$AVUTIL_SO" ]; then
+            echo "drm_prime present: $(strings "$AVCODEC_SO" "$AVUTIL_SO" | grep -qi drm_prime && echo yes || echo no)" >> diagnostics-linux-aarch64/ffmpeg_hwaccels.txt
+          fi
+          cp diagnostics-linux-aarch64/ffmpeg_hwaccels.txt diagnostics-linux-aarch64/ffmpeg_decoders.txt
 
           if [ -f build-linux-aarch64/NaikAVPlayer ]; then
             echo "=== ldd NaikAVPlayer ===" > diagnostics-linux-aarch64/ldd_NaikAVPlayer.txt

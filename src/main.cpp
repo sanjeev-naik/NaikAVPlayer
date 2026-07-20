@@ -135,6 +135,11 @@ static SDL_Colorspace getSDLColorspace(const AVFrame *frame) {
   }
 }
 
+// argv is intentionally non-const: SDL3's SDL_main.h can #define main to
+// SDL_main and provide its own entry point glue that expects this exact
+// signature (int argc, char *argv[]) - adding const here risks a prototype
+// mismatch against that macro substitution on platforms where it's active.
+// cppcheck-suppress constParameter
 int main(int argc, char *argv[]) {
   SDL_SetMainReady();
 
