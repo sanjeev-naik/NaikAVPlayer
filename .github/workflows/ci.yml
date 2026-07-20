@@ -441,7 +441,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/thirdparty/ffmpeg
-          key: ${{ runner.os }}-ffmpeg-8.1-ce3c09c101-mingw-x64-v1
+          key: ${{ runner.os }}-ffmpeg-8.1-ce3c09c101-mingw-x64-v2
 
       - name: Build FFmpeg from source (Windows)
         if: steps.cache-ffmpeg-windows.outputs.cache-hit != 'true'
@@ -461,8 +461,8 @@ jobs:
             --cross-prefix=x86_64-w64-mingw32- \
             --arch=x86_64 \
             --target-os=mingw32 \
-            --cc=x86_64-w64-mingw32-gcc \
-            --cxx=x86_64-w64-mingw32-g++
+            --cc=x86_64-w64-mingw32-gcc-posix \
+            --cxx=x86_64-w64-mingw32-g++-posix
           make -j$(nproc)
           make install
 
@@ -473,14 +473,14 @@ jobs:
 
       - name: Configure CMake (Cross-Compile for Windows)
         env:
-          CC: "ccache x86_64-w64-mingw32-gcc"
-          CXX: "ccache x86_64-w64-mingw32-g++"
+          CC: "ccache x86_64-w64-mingw32-gcc-posix"
+          CXX: "ccache x86_64-w64-mingw32-g++-posix"
         run: |
           cmake -B build-windows \
             -DPLATFORM=WINDOWS \
             -DCMAKE_SYSTEM_NAME=Windows \
-            -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc \
-            -DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-g++ \
+            -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc-posix \
+            -DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-g++-posix \
             -DTREAT_WARNINGS_AS_ERRORS=ON \
             -DCMAKE_BUILD_TYPE=Release \
             -DENABLE_FFMPEG_AUTO_DOWNLOAD=OFF
