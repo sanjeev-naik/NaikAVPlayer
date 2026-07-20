@@ -170,8 +170,8 @@ sudo apt-get install -y mingw-w64
 cmake -B build-windows \
   -DPLATFORM=WINDOWS \
   -DCMAKE_SYSTEM_NAME=Windows \
-  -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc-posix \
-  -DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-g++-posix
+  -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc \
+  -DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-g++
 ```
 
 ---
