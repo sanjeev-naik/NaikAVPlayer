@@ -290,6 +290,14 @@ jobs:
       - name: Setup Multiarch Sysroot and Dependencies
         run: |
           dpkg --add-architecture arm64
+          # Update sources.list to use archive.ubuntu.com only for amd64, and ports.ubuntu.com for arm64
+          sed -i 's/deb http/deb [arch=amd64,i386] http/g' /etc/apt/sources.list
+          cat <<EOF >> /etc/apt/sources.list.d/arm64.list
+          deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports jammy main restricted universe multiverse
+          deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports jammy-updates main restricted universe multiverse
+          deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports jammy-security main restricted universe multiverse
+          deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports jammy-backports main restricted universe multiverse
+          EOF
           apt-get update
           # Install cross-compiler and build tools
           apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu ccache cmake pkg-config python3
@@ -307,9 +315,12 @@ jobs:
         env:
           CC: "ccache aarch64-linux-gnu-gcc"
           CXX: "ccache aarch64-linux-gnu-g++"
+          PKG_CONFIG_LIBDIR: "/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig"
+          PKG_CONFIG_SYSROOT_DIR: "/"
         run: |
           cmake -B build -DPLATFORM=LINUX -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
                 -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ \
+                -DCMAKE_LIBRARY_ARCHITECTURE=aarch64-linux-gnu \
                 -DCMAKE_BUILD_TYPE=Release -DTREAT_WARNINGS_AS_ERRORS=ON
 
       - name: Build
