@@ -156,6 +156,12 @@ cmake -B build -G "MinGW Makefiles" -DPLATFORM=WINDOWS
 cmake -B build -DPLATFORM=LINUX
 ```
 
+**Opt-out of Auto-downloads (Recommended for Raspberry Pi & Local Linux Dev):**
+By default, the build system automatically downloads a prebuilt FFmpeg package. If you want to use the system-installed FFmpeg development packages instead (highly recommended on devices like the Raspberry Pi, where the system-wide packages are optimized and patched for hardware-accelerated V4L2M2M decoding), configure the project with `ENABLE_FFMPEG_AUTO_DOWNLOAD=OFF`:
+```bash
+cmake -B build -DPLATFORM=LINUX -DENABLE_FFMPEG_AUTO_DOWNLOAD=OFF
+```
+
 **Cross-Compile for Windows on Linux:**
 Configure targeting Windows using the cross-compiler toolchain:
 ```bash

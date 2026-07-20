@@ -200,9 +200,11 @@ FetchContent_MakeAvailable(nativefiledialog-extended)
 
 
 # -------------------------------------------------------------
-# Configure FFmpeg (Download automatically if missing on Windows & Linux)
+# Configure FFmpeg
 # -------------------------------------------------------------
-if(TARGET_PLATFORM_WINDOWS OR TARGET_PLATFORM_LINUX)
+option(ENABLE_FFMPEG_AUTO_DOWNLOAD "Automatically download FFmpeg if missing" ON)
+
+if(TARGET_PLATFORM_WINDOWS OR (TARGET_PLATFORM_LINUX AND (ENABLE_FFMPEG_AUTO_DOWNLOAD OR EXISTS "${CMAKE_SOURCE_DIR}/thirdparty/ffmpeg/include/libavcodec/avcodec.h")))
     set(FFMPEG_DIR "${CMAKE_SOURCE_DIR}/thirdparty/ffmpeg")
 
     # Check if headers and libraries are already present

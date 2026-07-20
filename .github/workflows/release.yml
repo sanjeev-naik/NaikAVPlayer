@@ -17,7 +17,38 @@ jobs:
       - name: Install Cross-Compiler
         run: |
           sudo apt-get update
-          sudo apt-get install -y mingw-w64 ffmpeg
+          sudo apt-get install -y mingw-w64
+
+      - name: Cache FFmpeg Build (Windows)
+        id: cache-ffmpeg-windows
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/thirdparty/ffmpeg
+          key: ${{ runner.os }}-ffmpeg-8.1-ce3c09c101-mingw-x64-v1
+
+      - name: Build FFmpeg from source (Windows)
+        if: steps.cache-ffmpeg-windows.outputs.cache-hit != 'true'
+        run: |
+          git clone https://github.com/FFmpeg/FFmpeg.git ffmpeg-src
+          cd ffmpeg-src
+          git checkout ce3c09c101
+          ./configure \
+            --prefix=${{ github.workspace }}/thirdparty/ffmpeg \
+            --enable-shared \
+            --disable-static \
+            --disable-programs \
+            --disable-doc \
+            --disable-avdevice \
+            --disable-postproc \
+            --disable-avfilter \
+            --enable-cross-compile \
+            --cross-prefix=x86_64-w64-mingw32- \
+            --arch=x86_64 \
+            --target-os=mingw32 \
+            --cc=x86_64-w64-mingw32-gcc \
+            --cxx=x86_64-w64-mingw32-g++
+          make -j$(nproc)
+          make install
 
       - name: Configure & Build
         run: |
@@ -77,7 +108,36 @@ jobs:
       - name: Install Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libva-dev libvdpau-dev
+          sudo apt-get install -y libgtk-3-dev libva-dev libvdpau-dev libdrm-dev libudev-dev
+
+      - name: Cache FFmpeg Build
+        id: cache-ffmpeg
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/thirdparty/ffmpeg
+          key: ${{ runner.os }}-ffmpeg-8.1-ce3c09c101-x64-v1
+
+      - name: Build FFmpeg from source
+        if: steps.cache-ffmpeg.outputs.cache-hit != 'true'
+        run: |
+          git clone https://github.com/FFmpeg/FFmpeg.git ffmpeg-src
+          cd ffmpeg-src
+          git checkout ce3c09c101
+          ./configure \
+            --prefix=${{ github.workspace }}/thirdparty/ffmpeg \
+            --enable-shared \
+            --disable-static \
+            --disable-programs \
+            --disable-doc \
+            --disable-avdevice \
+            --disable-postproc \
+            --disable-avfilter \
+            --enable-vaapi \
+            --enable-v4l2-m2m \
+            --enable-libdrm \
+            --enable-udev
+          make -j$(nproc)
+          make install
 
       - name: Configure & Build
         run: |
@@ -191,7 +251,44 @@ jobs:
             libxss-dev:arm64 \
             libva-dev:arm64 \
             libvdpau-dev:arm64 \
+            libdrm-dev:arm64 \
+            libudev-dev:arm64 \
             ccache
+
+      - name: Cache FFmpeg Build (aarch64)
+        id: cache-ffmpeg-aarch64
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/thirdparty/ffmpeg
+          key: ${{ runner.os }}-ffmpeg-8.1-ce3c09c101-aarch64-v1
+
+      - name: Build FFmpeg from source (aarch64)
+        if: steps.cache-ffmpeg-aarch64.outputs.cache-hit != 'true'
+        run: |
+          git clone https://github.com/FFmpeg/FFmpeg.git ffmpeg-src
+          cd ffmpeg-src
+          git checkout ce3c09c101
+          ./configure \
+            --prefix=${{ github.workspace }}/thirdparty/ffmpeg \
+            --enable-shared \
+            --disable-static \
+            --disable-programs \
+            --disable-doc \
+            --disable-avdevice \
+            --disable-postproc \
+            --disable-avfilter \
+            --enable-cross-compile \
+            --cross-prefix=aarch64-linux-gnu- \
+            --arch=aarch64 \
+            --target-os=linux \
+            --cc=aarch64-linux-gnu-gcc \
+            --cxx=aarch64-linux-gnu-g++ \
+            --enable-vaapi \
+            --enable-v4l2-m2m \
+            --enable-libdrm \
+            --enable-udev
+          make -j$(nproc)
+          make install
 
       - name: Setup Compiler Cache (ccache)
         uses: hendrikmuhs/ccache-action@v1
