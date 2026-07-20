@@ -48,7 +48,9 @@ jobs:
             libegl-dev \
             libdbus-1-dev \
             libpulse-dev \
-            libasound2-dev
+            libasound2-dev \
+            nasm \
+            yasm
 
       - name: Cache FFmpeg Build (Linux x64)
         id: cache-ffmpeg-linux-x64
@@ -396,7 +398,9 @@ jobs:
           sudo apt-get install -y \
             ffmpeg \
             mingw-w64 \
-            ccache
+            ccache \
+            nasm \
+            yasm
 
       - name: Cache FFmpeg Build (Windows)
         id: cache-ffmpeg-windows

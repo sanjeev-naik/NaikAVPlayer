@@ -17,7 +17,7 @@ jobs:
       - name: Install Cross-Compiler
         run: |
           sudo apt-get update
-          sudo apt-get install -y mingw-w64 ccache
+          sudo apt-get install -y mingw-w64 ccache nasm yasm
 
       - name: Cache FFmpeg Build (Windows)
         id: cache-ffmpeg-windows
@@ -134,7 +134,9 @@ jobs:
             libdbus-1-dev \
             libpulse-dev \
             libasound2-dev \
-            ccache
+            ccache \
+            nasm \
+            yasm
 
       - name: Cache FFmpeg Build (Linux x64)
         id: cache-ffmpeg-linux-x64
