@@ -191,16 +191,6 @@ jobs:
             executable_name: NaikAVPlayer
             is_native: true
 
-          - target: linux-aarch64
-            os_name: linux
-            cc: ccache aarch64-linux-gnu-gcc
-            cxx: ccache aarch64-linux-gnu-g++
-            apt_packages: "gcc-aarch64-linux-gnu g++-aarch64-linux-gnu ccache"
-            cmake_args: "-DPLATFORM=LINUX -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=aarch64 -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ -DCMAKE_BUILD_TYPE=Release"
-            artifact_name: NaikAVPlayer-linux-arm64
-            executable_name: NaikAVPlayer
-            is_native: false
-
           - target: windows-x86_64
             os_name: windows
             cc: ccache x86_64-w64-mingw32-gcc
@@ -280,5 +270,85 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact_name }}
+          path: package/
+          if-no-files-found: error
+
+  build-package-aarch64:
+    name: Build & Package (linux-aarch64)
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:22.04
+    steps:
+      - name: Install minimal container tools
+        run: |
+          apt-get update
+          apt-get install -y git curl unzip tar xz-utils sudo
+
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Multiarch Sysroot and Dependencies
+        run: |
+          dpkg --add-architecture arm64
+          apt-get update
+          # Install cross-compiler and build tools
+          apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu ccache cmake pkg-config python3
+          # Install ARM64 UI and rendering dev libraries for SDL3
+          apt-get install -y libx11-dev:arm64 libxext-dev:arm64 libxcursor-dev:arm64 libxi-dev:arm64 \
+                             libxrandr-dev:arm64 libxss-dev:arm64 libwayland-dev:arm64 libxkbcommon-dev:arm64 \
+                             libdrm-dev:arm64 libgbm-dev:arm64
+
+      - name: Setup Compiler Cache (ccache)
+        uses: hendrikmuhs/ccache-action@v1
+        with:
+          key: linux-aarch64-ccache
+
+      - name: Configure CMake
+        env:
+          CC: "ccache aarch64-linux-gnu-gcc"
+          CXX: "ccache aarch64-linux-gnu-g++"
+        run: |
+          cmake -B build -DPLATFORM=LINUX -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+                -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ \
+                -DCMAKE_BUILD_TYPE=Release -DTREAT_WARNINGS_AS_ERRORS=ON
+
+      - name: Build
+        run: |
+          cmake --build build --config Release -j$(nproc)
+
+      - name: Validate Linux Binaries (readelf)
+        run: |
+          echo "Running readelf on cross-compiled binary..."
+          aarch64-linux-gnu-readelf -d build/NaikAVPlayer
+
+      - name: Assemble Release Package
+        run: |
+          mkdir -p package/LICENSES
+          mkdir -p package/lib
+          mkdir -p package/assets
+          
+          # Copy Binary
+          cp build/NaikAVPlayer package/
+          
+          # Copy Assets
+          cp -r assets/* package/assets/
+          
+          # Copy README
+          cp README.md package/
+          
+          # Copy Licenses
+          cp LICENSE package/LICENSES/
+          if [ -f "thirdparty/ffmpeg/LICENSE.txt" ]; then
+            cp thirdparty/ffmpeg/LICENSE.txt package/LICENSES/FFMPEG_LICENSE.txt
+          fi
+          
+          # Copy Libraries
+          cp build/lib/*.so* package/lib/ 2>/dev/null || true
+
+      - name: Upload Artifact
+        if: github.ref == 'refs/heads/release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: NaikAVPlayer-linux-arm64
           path: package/
           if-no-files-found: error
