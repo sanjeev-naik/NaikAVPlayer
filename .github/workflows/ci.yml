@@ -30,35 +30,7 @@ jobs:
             libvdpau-dev \
             ccache \
             cppcheck \
-            lcov \
-            yasm
-
-      - name: Cache FFmpeg Build
-        id: cache-ffmpeg
-        uses: actions/cache@v4
-        with:
-          path: ${{ github.workspace }}/thirdparty/ffmpeg
-          key: ${{ runner.os }}-ffmpeg-7.1-x64-v1
-
-      - name: Build FFmpeg from source
-        if: steps.cache-ffmpeg.outputs.cache-hit != 'true'
-        run: |
-          mkdir -p ffmpeg-src
-          curl -sSL https://github.com/FFmpeg/FFmpeg/archive/refs/tags/n7.1.tar.gz | tar xz -C ffmpeg-src --strip-components=1
-          cd ffmpeg-src
-          ./configure \
-            --prefix=${{ github.workspace }}/thirdparty/ffmpeg \
-            --enable-shared \
-            --disable-static \
-            --disable-programs \
-            --disable-doc \
-            --disable-avdevice \
-            --disable-postproc \
-            --disable-avfilter \
-            --enable-vaapi \
-            --enable-v4l2-m2m
-          make -j$(nproc)
-          make install
+            lcov
 
       - name: Setup Compiler Cache (ccache)
         uses: hendrikmuhs/ccache-action@v1
@@ -415,39 +387,6 @@ jobs:
             libva-dev:arm64 \
             libvdpau-dev:arm64 \
             ccache
-
-      - name: Cache FFmpeg Build (aarch64)
-        id: cache-ffmpeg-aarch64
-        uses: actions/cache@v4
-        with:
-          path: ${{ github.workspace }}/thirdparty/ffmpeg
-          key: ${{ runner.os }}-ffmpeg-7.1-aarch64-v1
-
-      - name: Build FFmpeg from source (aarch64)
-        if: steps.cache-ffmpeg-aarch64.outputs.cache-hit != 'true'
-        run: |
-          mkdir -p ffmpeg-src
-          curl -sSL https://github.com/FFmpeg/FFmpeg/archive/refs/tags/n7.1.tar.gz | tar xz -C ffmpeg-src --strip-components=1
-          cd ffmpeg-src
-          ./configure \
-            --prefix=${{ github.workspace }}/thirdparty/ffmpeg \
-            --enable-shared \
-            --disable-static \
-            --disable-programs \
-            --disable-doc \
-            --disable-avdevice \
-            --disable-postproc \
-            --disable-avfilter \
-            --enable-cross-compile \
-            --cross-prefix=aarch64-linux-gnu- \
-            --arch=aarch64 \
-            --target-os=linux \
-            --cc=aarch64-linux-gnu-gcc \
-            --cxx=aarch64-linux-gnu-g++ \
-            --enable-vaapi \
-            --enable-v4l2-m2m
-          make -j$(nproc)
-          make install
 
       - name: Setup Compiler Cache (ccache)
         uses: hendrikmuhs/ccache-action@v1
