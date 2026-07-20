@@ -1364,18 +1364,7 @@ int main(int argc, char* argv[]) {
                 test_assert(!controller.isSeeking(), "isSeeking returns false during normal playback init");
                 std::string pixFmt = controller.getVideoPixelFormat();
                 test_assert(!pixFmt.empty() && pixFmt != "unknown", "getVideoPixelFormat returns valid format name");
-                // Hardware decode isn't available on every machine this
-                // suite runs on (e.g. CI runners with no V4L2M2M/VAAPI/QSV/
-                // NVDEC device), so this can't be a hard requirement -
-                // matching the same guard used for the repeated-seek
-                // hardware-recovery check above. Report it when it does
-                // happen so the assertion still shows up on hardware-capable
-                // runs instead of just silently vanishing everywhere.
-                if (controller.isVideoHardware()) {
-                    test_assert(true, "isVideoHardware returns true when using hardware");
-                } else {
-                    std::cout << "Skipped: no hardware decoder available in this environment" << std::endl;
-                }
+                test_assert(controller.isVideoHardware(), "isVideoHardware returns true when using hardware");
             }
             g_disableHardwareDecoders = true;
         }
@@ -1797,7 +1786,6 @@ int main(int argc, char* argv[]) {
                     // The count must be exactly 1, because the first seek was superseded and discarded!
                     test_assert(count == 1, "T5: superseded seek measurement must be discarded, count should be 1");
                 }
-                g_videoThreadEnabled = false;
             }
 
             // T6: m_profilingEnabled=false results in no ring writes (all ring heads unchanged after exercising hooks); depth gauges still update

@@ -2,5 +2,3 @@
 # Suppress all leaks originating from the SDL2 library (including TLS error buffers and driver structures)
 leak:SDL_
 leak:libSDL3
-# Suppress leaks from dynamically loaded/unloaded external libraries/drivers (e.g. hardware decoder drivers)
-leak:<unknown module>

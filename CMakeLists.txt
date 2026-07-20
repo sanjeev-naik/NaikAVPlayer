@@ -154,15 +154,6 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(SDL3)
 
-# Link libssp (Stack Smashing Protector) to SDL3-shared on Windows MinGW/Clang builds
-if(TARGET_PLATFORM_WINDOWS)
-    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-        if(TARGET SDL3-shared)
-            target_link_libraries(SDL3-shared PRIVATE ssp)
-        endif()
-    endif()
-endif()
-
 # -------------------------------------------------------------
 # Fetch Dear ImGui
 # -------------------------------------------------------------
@@ -208,79 +199,37 @@ FetchContent_MakeAvailable(nativefiledialog-extended)
 
 
 # -------------------------------------------------------------
-# Configure FFmpeg (Download automatically if missing on Windows & Linux)
+# Configure FFmpeg (Download automatically if missing on Windows)
 # -------------------------------------------------------------
-option(ENABLE_FFMPEG_AUTO_DOWNLOAD "Automatically download FFmpeg if missing" ON)
-
-if(TARGET_PLATFORM_WINDOWS OR (TARGET_PLATFORM_LINUX AND (ENABLE_FFMPEG_AUTO_DOWNLOAD OR EXISTS "${CMAKE_SOURCE_DIR}/thirdparty/ffmpeg/include/libavcodec/avcodec.h")))
+if(TARGET_PLATFORM_WINDOWS)
     set(FFMPEG_DIR "${CMAKE_SOURCE_DIR}/thirdparty/ffmpeg")
 
-    # Check if headers and libraries are already present
-    set(FFMPEG_FOUND FALSE)
-    if(EXISTS "${FFMPEG_DIR}/include/libavcodec/avcodec.h")
-        if(TARGET_PLATFORM_WINDOWS AND EXISTS "${FFMPEG_DIR}/lib/avcodec.lib")
-            set(FFMPEG_FOUND TRUE)
-        elseif(TARGET_PLATFORM_LINUX)
-            # Version-agnostic check: the SONAME suffix (.so.NN) tracks the
-            # FFmpeg ABI version and changes on every major bump (e.g. the
-            # n8.1.2 pin below produces libavcodec.so.62, not .so.61). A
-            # hardcoded suffix here would silently report "not found" after
-            # every version bump, causing CMake to blow away and re-download
-            # a perfectly good CI/locally-built FFmpeg (including one built
-            # from source with project-specific flags like --enable-v4l2-m2m)
-            # in favor of the generic downloaded binary. Glob instead.
-            file(GLOB _naikav_existing_libavcodec "${FFMPEG_DIR}/lib/libavcodec.so*")
-            if(_naikav_existing_libavcodec)
-                set(FFMPEG_FOUND TRUE)
-            endif()
-            unset(_naikav_existing_libavcodec)
-        endif()
-    endif()
-
-    if(NOT FFMPEG_FOUND)
+    if(NOT EXISTS "${FFMPEG_DIR}/include/libavcodec/avcodec.h" OR NOT EXISTS "${FFMPEG_DIR}/lib/avcodec.lib")
         message(STATUS "FFmpeg headers/libraries not found in thirdparty/ffmpeg. Setting up automatically...")
-
-        # Detect Architecture
-        if(CMAKE_SYSTEM_PROCESSOR)
-            set(ARCH "${CMAKE_SYSTEM_PROCESSOR}")
-        else()
-            set(ARCH "${CMAKE_HOST_SYSTEM_PROCESSOR}")
-        endif()
-        string(TOLOWER "${ARCH}" ARCH_LOWER)
-
-        if(ARCH_LOWER MATCHES "arm64|aarch64")
-            set(IS_ARM64 ON)
-        else()
-            set(IS_ARM64 OFF)
-        endif()
-
-        # Select URL, SHA256 and Extension based on Platform & Architecture
-        if(TARGET_PLATFORM_WINDOWS)
-            if(IS_ARM64)
-                set(FFMPEG_ZIP_URL "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-06-30-13-34/ffmpeg-n8.1.2-21-gce3c09c101-winarm64-lgpl-shared-8.1.zip")
-                set(FFMPEG_ZIP_SHA256_DEFAULT "78e601aa0583e7e865dc20764ecb3e45e5429a2671c1f12376ca095b1753bd83")
-            else()
-                set(FFMPEG_ZIP_URL "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-06-30-13-34/ffmpeg-n8.1.2-21-gce3c09c101-win64-lgpl-shared-8.1.zip")
-                set(FFMPEG_ZIP_SHA256_DEFAULT "27bcaf58b5140171dfe838a0b365d12c60607d71fc168424456410bad6a834da")
-            endif()
-            set(FFMPEG_ZIP_PATH "${CMAKE_BINARY_DIR}/ffmpeg_download.zip")
-        elseif(TARGET_PLATFORM_LINUX)
-            if(IS_ARM64)
-                set(FFMPEG_ZIP_URL "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-06-30-13-34/ffmpeg-n8.1.2-21-gce3c09c101-linuxarm64-lgpl-shared-8.1.tar.xz")
-                set(FFMPEG_ZIP_SHA256_DEFAULT "08a9639de779e0d024af5190ad4d0463c6c91b42ba79f00a51359fb4645e8ce7")
-            else()
-                set(FFMPEG_ZIP_URL "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-06-30-13-34/ffmpeg-n8.1.2-21-gce3c09c101-linux64-lgpl-shared-8.1.tar.xz")
-                set(FFMPEG_ZIP_SHA256_DEFAULT "bc60572d89533c7987e7cfbb654eba4d35122a77885c6938483dd7ef8219cde9")
-            endif()
-            set(FFMPEG_ZIP_PATH "${CMAKE_BINARY_DIR}/ffmpeg_download.tar.xz")
-        endif()
+        
+        # NOTE: Dated BtbN release tags (autobuild-YYYY-MM-DD-HH-MM) do NOT use the
+        # "ffmpeg-master-latest-*" filename pattern - that pattern only exists under
+        # the floating "latest" tag. Dated tags publish git-describe-style names
+        # instead (e.g. ffmpeg-n8.1.2-21-gce3c09c101-win64-lgpl-shared-8.1.zip).
+        #
+        # BtbN retains dated tags for ~14 daily builds, but keeps the LAST build of
+        # each calendar month for ~2 years. This pin deliberately uses a month-end
+        # tag (2026-06-30) rather than a daily one, so it survives far longer before
+        # needing to be re-pinned. When it does need updating, use
+        # update_ffmpeg_pin.py --tag <new-month-end-tag> to get a fresh, verified
+        # URL + hash rather than editing this by hand.
+        #
+        # This URL also pins the FFmpeg 8.1 release branch (via the "-8.1" variant),
+        # so it won't silently drift to a different FFmpeg version either.
+        set(FFMPEG_ZIP_URL "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-06-30-13-34/ffmpeg-n8.1.2-21-gce3c09c101-win64-lgpl-shared-8.1.zip")
+        set(FFMPEG_ZIP_PATH "${CMAKE_BINARY_DIR}/ffmpeg_download.zip")
+        set(FFMPEG_EXTRACT_DIR "${CMAKE_BINARY_DIR}/ffmpeg_extracted")
 
         # Verified against the release's checksums.sha256 asset on 2026-07-18.
         # If you bump FFMPEG_ZIP_URL to a newer release/version, re-derive this
         # from that release's checksums.sha256 (or set it blank to skip
         # verification, with a build-time warning).
-        set(FFMPEG_ZIP_SHA256 "${FFMPEG_ZIP_SHA256_DEFAULT}" CACHE STRING "Expected SHA256 of the pinned FFmpeg zip (see GitHub release assets page)")
-        set(FFMPEG_EXTRACT_DIR "${CMAKE_BINARY_DIR}/ffmpeg_extracted")
+        set(FFMPEG_ZIP_SHA256 "27bcaf58b5140171dfe838a0b365d12c60607d71fc168424456410bad6a834da" CACHE STRING "Expected SHA256 of the pinned FFmpeg zip (see GitHub release assets page)")
 
         message(STATUS "Downloading FFmpeg shared binaries from ${FFMPEG_ZIP_URL}...")
         if(FFMPEG_ZIP_SHA256)
@@ -317,9 +266,7 @@ if(TARGET_PLATFORM_WINDOWS OR (TARGET_PLATFORM_LINUX AND (ENABLE_FFMPEG_AUTO_DOW
         file(REMOVE_RECURSE "${FFMPEG_DIR}") # Clear clean install
         file(MAKE_DIRECTORY "${FFMPEG_DIR}")
         
-        if(EXISTS "${FFMPEG_SRC_DIR}/bin")
-            file(COPY "${FFMPEG_SRC_DIR}/bin" DESTINATION "${FFMPEG_DIR}")
-        endif()
+        file(COPY "${FFMPEG_SRC_DIR}/bin" DESTINATION "${FFMPEG_DIR}")
         file(COPY "${FFMPEG_SRC_DIR}/include" DESTINATION "${FFMPEG_DIR}")
         file(COPY "${FFMPEG_SRC_DIR}/lib" DESTINATION "${FFMPEG_DIR}")
         
@@ -356,15 +303,6 @@ add_executable(NaikAVPlayer
     src/PlayerUI.cpp
     ${PLAYER_LOGIC_SOURCES}
 )
-
-# Make Linux release self-contained by searching for shared libraries
-# in the bundled ./lib directory.
-if(TARGET_PLATFORM_LINUX)
-    set_target_properties(NaikAVPlayer PROPERTIES
-        BUILD_RPATH "$ORIGIN/lib"
-        INSTALL_RPATH "$ORIGIN/lib"
-    )
-endif()
 
 # Link libraries to our executable
 target_link_libraries(NaikAVPlayer PRIVATE
@@ -405,17 +343,6 @@ if(TARGET_PLATFORM_WINDOWS)
             $<TARGET_FILE:SDL3::SDL3-shared>
             $<TARGET_FILE_DIR:NaikAVPlayer>
         COMMENT "Copying SDL3.dll to output directory..."
-    )
-endif()
-
-# Copy FFmpeg shared libraries to output lib/ directory on Linux so the executable runs smoothly
-if(TARGET_PLATFORM_LINUX AND EXISTS "${FFMPEG_DIR}/lib")
-    add_custom_command(TARGET NaikAVPlayer POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:NaikAVPlayer>/lib
-        COMMAND ${CMAKE_COMMAND} -E copy_directory
-            "${FFMPEG_DIR}/lib"
-            $<TARGET_FILE_DIR:NaikAVPlayer>/lib
-        COMMENT "Copying FFmpeg shared libraries to output lib directory..."
     )
 endif()
 
