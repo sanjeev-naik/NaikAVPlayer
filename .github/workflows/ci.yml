@@ -542,12 +542,19 @@ jobs:
         run: |
           sudo dpkg --add-architecture arm64
 
-          # Restrict existing amd64 list sources to [arch=amd64]
+          # Restrict existing amd64 list sources to [arch=amd64]. Matched
+          # scheme-agnostically (not "http|https|mirror:") because GitHub's
+          # ubuntu-22.04 runner sources its default lists via
+          # "deb mirror+file:/etc/apt/apt-mirrors.txt ...", and "mirror+file:"
+          # doesn't match a literal "mirror:" alternative - that gap left the
+          # default lists unrestricted, so apt-get update went on to request
+          # arm64 indexes from security.ubuntu.com (which doesn't mirror
+          # arm64/ports packages at all) and failed with 404s.
           if [ -f /etc/apt/sources.list ]; then
-            sudo sed -i -E 's/deb[[:space:]]+(http|https|mirror):/deb [arch=amd64] \1:/g' /etc/apt/sources.list
+            sudo sed -i -E 's/^deb([[:space:]]+)([^[])/deb\1[arch=amd64] \2/' /etc/apt/sources.list
           fi
           if [ -d /etc/apt/sources.list.d ]; then
-            find /etc/apt/sources.list.d/ -type f -name "*.list" -exec sudo sed -i -E 's/deb[[:space:]]+(http|https|mirror):/deb [arch=amd64] \1:/g' {} +
+            find /etc/apt/sources.list.d/ -type f -name "*.list" -exec sudo sed -i -E 's/^deb([[:space:]]+)([^[])/deb\1[arch=amd64] \2/' {} +
           fi
 
           # Restrict existing amd64 DEB822 sources to Architectures: amd64
