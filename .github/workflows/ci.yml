@@ -7,10 +7,9 @@ on:
     branches: [ "**" ]
 
 jobs:
-  build-linux:
-    name: Linux Build & Test (GCC)
+  test-and-analysis:
+    name: Native Linux Testing & Analysis
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -23,12 +22,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            ffmpeg \
-            libavcodec-dev \
-            libavformat-dev \
-            libavutil-dev \
-            libswscale-dev \
-            libswresample-dev \
             libsdl2-dev \
             libgtk-3-dev \
             ccache \
@@ -149,20 +142,6 @@ jobs:
             echo "::warning:: build-sanitizers directory not found. ASan & UBSan reports will not be generated."
           fi
 
-      - name: Diagnostic Logging
-        if: always()
-        run: |
-          echo "=== Diagnostic Log ==="
-          echo "Current working directory: $(pwd)"
-          echo "Generated report locations:"
-          ls -la *.xlsx 2>/dev/null || echo "No .xlsx reports found in root"
-          echo "Executable output locations:"
-          ls -la build-linux/NaikAVPlayer 2>/dev/null || echo "Linux Release Executable not found"
-          ls -la build-sanitizers/NaikAVPlayer 2>/dev/null || echo "Linux Sanitizers Executable not found"
-          ls -la build-tsan/NaikAVPlayer 2>/dev/null || echo "Linux TSan Executable not found"
-          echo "Files in workspace:"
-          find . -maxdepth 3 -not -path '*/.*' -not -path './build*' -not -path './thirdparty*'
-
       - name: Upload Test Report Artifact
         if: always()
         uses: actions/upload-artifact@v4
@@ -195,50 +174,111 @@ jobs:
           path: ubsan_report.xlsx
           if-no-files-found: warn
 
-  cross-compile-windows:
-    name: Windows Cross-Compilation (MinGW-w64 on Linux)
+  build-packages:
+    name: Build & Package (${{ matrix.target }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x86_64
+            os_name: linux
+            cc: ccache gcc
+            cxx: ccache g++
+            apt_packages: "libsdl2-dev libgtk-3-dev ccache"
+            cmake_args: "-DPLATFORM=LINUX -DCMAKE_BUILD_TYPE=Release"
+            artifact_name: NaikAVPlayer-linux-x64
+            executable_name: NaikAVPlayer
+            is_native: true
+
+          - target: linux-aarch64
+            os_name: linux
+            cc: ccache aarch64-linux-gnu-gcc
+            cxx: ccache aarch64-linux-gnu-g++
+            apt_packages: "gcc-aarch64-linux-gnu g++-aarch64-linux-gnu ccache"
+            cmake_args: "-DPLATFORM=LINUX -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=aarch64 -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ -DCMAKE_BUILD_TYPE=Release"
+            artifact_name: NaikAVPlayer-linux-arm64
+            executable_name: NaikAVPlayer
+            is_native: false
+
+          - target: windows-x86_64
+            os_name: windows
+            cc: ccache x86_64-w64-mingw32-gcc
+            cxx: ccache x86_64-w64-mingw32-g++
+            apt_packages: "mingw-w64 ccache"
+            cmake_args: "-DPLATFORM=WINDOWS -DCMAKE_SYSTEM_NAME=Windows -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc -DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-g++ -DCMAKE_BUILD_TYPE=Release"
+            artifact_name: NaikAVPlayer-windows-x64
+            executable_name: NaikAVPlayer.exe
+            is_native: false
 
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Install Cross-Compiler
+      - name: Install System Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            ffmpeg \
-            mingw-w64 \
-            ccache
+          sudo apt-get install -y ${{ matrix.apt_packages }}
 
       - name: Setup Compiler Cache (ccache)
         uses: hendrikmuhs/ccache-action@v1
         with:
-          key: windows-mingw-ccache
+          key: ${{ matrix.target }}-ccache
 
-      - name: Configure CMake (Cross-Compile for Windows)
+      - name: Configure CMake
         env:
-          CC: "ccache x86_64-w64-mingw32-gcc"
-          CXX: "ccache x86_64-w64-mingw32-g++"
+          CC: "${{ matrix.cc }}"
+          CXX: "${{ matrix.cxx }}"
         run: |
-          cmake -B build-windows \
-            -DPLATFORM=WINDOWS \
-            -DCMAKE_SYSTEM_NAME=Windows \
-            -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc \
-            -DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-g++ \
-            -DTREAT_WARNINGS_AS_ERRORS=ON \
-            -DCMAKE_BUILD_TYPE=Release
+          cmake -B build ${{ matrix.cmake_args }} -DTREAT_WARNINGS_AS_ERRORS=ON
 
-      - name: Build (Cross-Compile for Windows)
+      - name: Build
         run: |
-          cmake --build build-windows --config Release -j$(nproc)
+          cmake --build build --config Release -j$(nproc)
 
-      - name: Diagnostic Logging
-        if: always()
+      - name: Validate Linux Binaries (ldd/readelf)
+        if: matrix.os_name == 'linux'
         run: |
-          echo "=== Diagnostic Log ==="
-          echo "Current working directory: $(pwd)"
-          echo "Executable output locations:"
-          ls -la build-windows/NaikAVPlayer.exe 2>/dev/null || echo "Windows Executable not found"
-          echo "Files in workspace:"
-          find . -maxdepth 3 -not -path '*/.*' -not -path './build*' -not -path './thirdparty*'
+          if [ "${{ matrix.is_native }}" = "true" ]; then
+            echo "Running ldd on native binary..."
+            ldd build/${{ matrix.executable_name }}
+          else
+            echo "Running readelf on cross-compiled binary..."
+            aarch64-linux-gnu-readelf -d build/${{ matrix.executable_name }}
+          fi
+
+      - name: Assemble Release Package
+        run: |
+          mkdir -p package/LICENSES
+          mkdir -p package/lib
+          mkdir -p package/assets
+          
+          # Copy Binary
+          cp build/${{ matrix.executable_name }} package/
+          
+          # Copy Assets
+          cp -r assets/* package/assets/
+          
+          # Copy README
+          cp README.md package/
+          
+          # Copy Licenses
+          cp LICENSE package/LICENSES/
+          if [ -f "thirdparty/ffmpeg/LICENSE.txt" ]; then
+            cp thirdparty/ffmpeg/LICENSE.txt package/LICENSES/FFMPEG_LICENSE.txt
+          fi
+          
+          # Copy Libraries
+          if [ "${{ matrix.os_name }}" = "windows" ]; then
+            cp build/*.dll package/
+          else
+            cp build/lib/*.so* package/lib/ 2>/dev/null || true
+          fi
+
+      - name: Upload Artifact
+        if: github.ref == 'refs/heads/release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: package/
+          if-no-files-found: error
