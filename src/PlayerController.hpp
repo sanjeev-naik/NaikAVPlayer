@@ -65,15 +65,6 @@ private:
     // Background video decoding thread
     std::thread m_videoThread;
     std::atomic<bool> m_videoThreadRunning;
-    // Lock-free diagnostics snapshot: written by the video thread / init,
-    // read by the UI thread. The Info panel must NEVER take
-    // m_videoDecoderMutex: the video thread holds that mutex across
-    // decodeNextFrame(), which can block for a long time inside a hardware
-    // decoder (e.g. a stalled v4l2m2m VIDIOC_DQBUF on Raspberry Pi), and a
-    // plain lock_guard on the UI thread then freezes the whole player.
-    std::atomic<int> m_lastFrameWidth{0};
-    std::atomic<int> m_lastFrameHeight{0};
-    std::atomic<bool> m_videoIsHardware{false};
     bool m_videoThreadEnabled;
     // mutable: also taken by const getters (getVideoWidth/Height,
     // isVideoHardware) that read m_videoDecoder's codec context, which the

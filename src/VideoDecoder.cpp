@@ -123,33 +123,12 @@ bool VideoDecoder::init() {
                           receiveRet == AVERROR_EOF);
 
         if (sendOk && receiveOk) {
-          // avcodec_flush_buffers() only resets libavcodec's own bookkeeping;
-          // for kernel-backed hardware decoders like V4L2 M2M it does not
-          // reliably reset in-flight V4L2 queue/format-negotiation state left
-          // by the dry-run probe above. That can leave the real decode
-          // session silently stuck afterwards: avcodec_send_packet() keeps
-          // accepting packets but avcodec_receive_frame() never yields a
-          // frame - and can block rather than return EAGAIN, which bypasses
-          // the stuck-decoder recovery below entirely (it only counts EAGAIN
-          // returns), hanging the video thread indefinitely with the packet
-          // queue filling up and nothing ever reaching the frame queue.
-          // Close the probed context and open a genuinely fresh one instead
-          // of flushing it.
-          avcodec_free_context(&ctx);
-          ctx = avcodec_alloc_context3(candidate);
-          if (ctx && avcodec_parameters_to_context(ctx, m_codecParams) >= 0) {
-            ctx->thread_count = 1;
-            ctx->thread_type = 0;
-            ctx->pkt_timebase = m_timeBase;
-            if (avcodec_open2(ctx, candidate, nullptr) == 0) {
-              codec = candidate;
-              codecCtx = ctx;
-              std::cout << "Using decoder: " << codec->name << '\n';
-              break;
-            }
-          }
-          // Reopen failed - fall through to the shared cleanup/message below
-          // and try the next candidate.
+          codec = candidate;
+          codecCtx = ctx;
+          avcodec_flush_buffers(
+              codecCtx); // <-- reset internal state after the dry-run probe
+          std::cout << "Using decoder: " << codec->name << '\n';
+          break;
         }
       }
 
