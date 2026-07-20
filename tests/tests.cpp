@@ -1797,6 +1797,7 @@ int main(int argc, char* argv[]) {
                     // The count must be exactly 1, because the first seek was superseded and discarded!
                     test_assert(count == 1, "T5: superseded seek measurement must be discarded, count should be 1");
                 }
+                g_videoThreadEnabled = false;
             }
 
             // T6: m_profilingEnabled=false results in no ring writes (all ring heads unchanged after exercising hooks); depth gauges still update
