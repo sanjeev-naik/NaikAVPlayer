@@ -114,11 +114,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            libavcodec-dev \
-            libavformat-dev \
-            libavutil-dev \
-            libswscale-dev \
-            libswresample-dev \
             libgtk-3-dev \
             libva-dev \
             libvdpau-dev \
@@ -140,7 +135,43 @@ jobs:
             libdbus-1-dev \
             libpulse-dev \
             libasound2-dev \
+            nasm \
+            yasm \
             ccache
+
+      # Pinned to the exact same FFmpeg commit/version (n8.1.2, ce3c09c101)
+      # as every other leg of this pipeline and as the CMake auto-download
+      # path used by local developer builds. Previously this job linked
+      # against Ubuntu 22.04's apt libavcodec-dev (FFmpeg 4.4.2) while
+      # shipping a release tarball with NO FFmpeg at all, relying on
+      # whatever the target machine happened to already have installed.
+      - name: Cache FFmpeg Build (Linux x64)
+        id: cache-ffmpeg-linux-x64
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/thirdparty/ffmpeg
+          key: ${{ runner.os }}-ffmpeg-8.1-ce3c09c101-linux-x64-v1
+
+      - name: Build FFmpeg from source (Linux x64)
+        if: steps.cache-ffmpeg-linux-x64.outputs.cache-hit != 'true'
+        run: |
+          git clone https://github.com/FFmpeg/FFmpeg.git ffmpeg-src
+          cd ffmpeg-src
+          git checkout ce3c09c101
+          ./configure \
+            --prefix=${{ github.workspace }}/thirdparty/ffmpeg \
+            --enable-shared \
+            --disable-static \
+            --enable-programs \
+            --disable-doc \
+            --disable-avdevice \
+            --disable-avfilter \
+            --enable-libdrm \
+            --enable-v4l2-m2m
+          grep -q "#define CONFIG_V4L2_M2M 1" config.h || { echo "::error::FFmpeg configured WITHOUT V4L2 M2M support"; exit 1; }
+          grep -q "#define CONFIG_LIBDRM 1" config.h || { echo "::error::FFmpeg configured WITHOUT libdrm/DRM PRIME support"; exit 1; }
+          make -j$(nproc)
+          make install
 
       - name: Setup Compiler Cache (ccache)
         uses: hendrikmuhs/ccache-action@v1
@@ -149,7 +180,9 @@ jobs:
 
       - name: Configure & Build
         run: |
-          cmake -B build -DPLATFORM=LINUX -DCMAKE_BUILD_TYPE=Release -DENABLE_FFMPEG_AUTO_DOWNLOAD=OFF
+          cmake -B build -DPLATFORM=LINUX -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_FFMPEG_AUTO_DOWNLOAD=OFF \
+            -DSDL_WAYLAND=ON -DSDL_X11=ON -DSDL_KMSDRM=ON
           cmake --build build --config Release -j$(nproc)
 
       - name: Collect CI Diagnostics
@@ -163,21 +196,26 @@ jobs:
           echo "=== CMake Version ===" > diagnostics-linux-x64/cmake_version.txt
           cmake --version >> diagnostics-linux-x64/cmake_version.txt 2>&1
 
-          echo "=== FFmpeg Version ===" > diagnostics-linux-x64/ffmpeg_version.txt
-          ffmpeg -version >> diagnostics-linux-x64/ffmpeg_version.txt 2>&1 || true
+          FFMPEG_BIN="thirdparty/ffmpeg/bin/ffmpeg"
+          if [ ! -x "$FFMPEG_BIN" ]; then FFMPEG_BIN="ffmpeg"; fi
+
+          echo "=== FFmpeg Version ($FFMPEG_BIN) ===" > diagnostics-linux-x64/ffmpeg_version.txt
+          "$FFMPEG_BIN" -version >> diagnostics-linux-x64/ffmpeg_version.txt 2>&1 || true
 
           echo "=== pkg-config versions ===" > diagnostics-linux-x64/pkg_config_versions.txt
+          export PKG_CONFIG_PATH="${{ github.workspace }}/thirdparty/ffmpeg/lib/pkgconfig:$(find build -name "*.pc" -exec dirname {} \; | tr '\n' ':'):$PKG_CONFIG_PATH"
           pkg-config --modversion libavcodec >> diagnostics-linux-x64/pkg_config_versions.txt 2>&1 || true
           pkg-config --modversion libavformat >> diagnostics-linux-x64/pkg_config_versions.txt 2>&1 || true
           pkg-config --modversion libavutil >> diagnostics-linux-x64/pkg_config_versions.txt 2>&1 || true
-          export PKG_CONFIG_PATH="$(find build -name "*.pc" -exec dirname {} \; | tr '\n' ':'):$PKG_CONFIG_PATH"
           pkg-config --modversion sdl3 >> diagnostics-linux-x64/pkg_config_versions.txt 2>&1 || true
 
           echo "=== FFmpeg hwaccels ===" > diagnostics-linux-x64/ffmpeg_hwaccels.txt
-          ffmpeg -hwaccels >> diagnostics-linux-x64/ffmpeg_hwaccels.txt 2>&1 || true
+          "$FFMPEG_BIN" -hwaccels >> diagnostics-linux-x64/ffmpeg_hwaccels.txt 2>&1 || true
 
-          echo "=== FFmpeg decoders ===" > diagnostics-linux-x64/ffmpeg_decoders.txt
-          ffmpeg -decoders >> diagnostics-linux-x64/ffmpeg_decoders.txt 2>&1 || true
+          echo "=== FFmpeg decoders (v4l2m2m / drm filtered) ===" > diagnostics-linux-x64/ffmpeg_decoders.txt
+          "$FFMPEG_BIN" -decoders >> diagnostics-linux-x64/ffmpeg_decoders.txt 2>&1 || true
+          echo "=== grep v4l2m2m ===" >> diagnostics-linux-x64/ffmpeg_decoders.txt
+          "$FFMPEG_BIN" -decoders 2>/dev/null | grep -i v4l2m2m >> diagnostics-linux-x64/ffmpeg_decoders.txt || echo "(none found)" >> diagnostics-linux-x64/ffmpeg_decoders.txt
 
           if [ -f build/NaikAVPlayer ]; then
             echo "=== ldd NaikAVPlayer ===" > diagnostics-linux-x64/ldd_NaikAVPlayer.txt
@@ -197,6 +235,11 @@ jobs:
           cp build/NaikAVPlayer $PKG/
           # Bundle the in-tree built SDL3 shared library; binary finds it via $ORIGIN/lib RPATH
           find build -name "libSDL3.so*" -exec cp -P {} $PKG/lib/ \;
+          # Bundle the exact FFmpeg .so's this binary was compiled/linked
+          # against (built from source, pinned commit - see above) so the
+          # release cannot silently pick up a different FFmpeg from the
+          # target system.
+          cp -P thirdparty/ffmpeg/lib/libav*.so* thirdparty/ffmpeg/lib/libsw*.so* $PKG/lib/
           cp -r assets $PKG/
           rm -f $PKG/assets/hd_test_video_with_audio.mp4 $PKG/assets/screenshot.png
           cp -r licenses $PKG/
@@ -215,8 +258,8 @@ jobs:
 
           echo "=== Verifying Bundled Shared Libraries ==="
           ls -l "$PKG/lib/"
-          
-          REQUIRED_LIBS=("libSDL3.so")
+
+          REQUIRED_LIBS=("libSDL3.so" "libavcodec.so" "libavformat.so" "libavutil.so" "libswscale.so" "libswresample.so")
           for lib in "${REQUIRED_LIBS[@]}"; do
             if ! ls "$PKG/lib/" | grep -q "$lib"; then
               echo "::error::Missing bundled library: $lib"
@@ -224,21 +267,16 @@ jobs:
             fi
           done
 
-          # Ensure FFmpeg is NOT bundled (relies on system dynamic packages instead)
-          if ls "$PKG/lib/" | grep -q -E "libav|libsw"; then
-            echo "::error::FFmpeg libraries should not be bundled on Linux packages!"
-            exit 1
-          fi
-
           echo "=== Verifying Binary Dependencies ==="
           NEEDED_LIBS=$(readelf -d "$PKG/NaikAVPlayer" | grep NEEDED | awk -F'[' '{print $2}' | awk -F']' '{print $1}')
           echo "Needed libraries:"
           echo "$NEEDED_LIBS"
-          
-          # Check if SDL3 is dynamically linked to our bundled path
+
+          # Every FFmpeg/SDL3 NEEDED entry must resolve inside our bundled
+          # lib/ dir via the $ORIGIN/lib RPATH.
           for needed in $NEEDED_LIBS; do
             case "$needed" in
-              libSDL3*)
+              libSDL3*|libavcodec*|libavformat*|libavutil*|libswscale*|libswresample*)
                 if [ ! -f "$PKG/lib/$needed" ]; then
                   resolved_base=$(echo "$needed" | sed -E 's/\.so\..*/.so/')
                   if ! ls "$PKG/lib/" | grep -q "$resolved_base"; then
@@ -336,11 +374,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             g++-aarch64-linux-gnu \
-            libavcodec-dev:arm64 \
-            libavformat-dev:arm64 \
-            libavutil-dev:arm64 \
-            libswscale-dev:arm64 \
-            libswresample-dev:arm64 \
             libgtk-3-dev:arm64 \
             libasound2-dev:arm64 \
             libxss-dev:arm64 \
@@ -363,8 +396,52 @@ jobs:
             libdbus-1-dev:arm64 \
             libpulse-dev:arm64 \
             qemu-user-static \
-            ffmpeg:arm64 \
             ccache
+
+      # Pinned, source-built, V4L2M2M+DRM-enabled FFmpeg for aarch64 - see the
+      # matching step in ci.yml for the full rationale. This replaces
+      # `ffmpeg:arm64` from Ubuntu ports (FFmpeg 4.4.2, generic config, not
+      # guaranteed to have V4L2 M2M / DRM PRIME compiled in), which is the
+      # primary reason the previously-released Raspberry Pi build could work
+      # locally but show a blank screen on hardware decode / hang on "Show
+      # Info" when downloaded from a GitHub Release.
+      - name: Cache FFmpeg Build (Linux aarch64)
+        id: cache-ffmpeg-linux-aarch64
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/thirdparty/ffmpeg
+          key: ${{ runner.os }}-ffmpeg-8.1-ce3c09c101-linux-aarch64-v1
+
+      - name: Build FFmpeg from source (Linux aarch64 cross-compile)
+        if: steps.cache-ffmpeg-linux-aarch64.outputs.cache-hit != 'true'
+        env:
+          PKG_CONFIG_LIBDIR: "/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig"
+          PKG_CONFIG_SYSROOT_DIR: "/"
+        run: |
+          git clone https://github.com/FFmpeg/FFmpeg.git ffmpeg-src
+          cd ffmpeg-src
+          git checkout ce3c09c101
+          ./configure \
+            --prefix=${{ github.workspace }}/thirdparty/ffmpeg \
+            --enable-shared \
+            --disable-static \
+            --enable-programs \
+            --disable-doc \
+            --disable-avdevice \
+            --disable-avfilter \
+            --enable-cross-compile \
+            --cross-prefix=aarch64-linux-gnu- \
+            --arch=aarch64 \
+            --target-os=linux \
+            --cc=aarch64-linux-gnu-gcc \
+            --cxx=aarch64-linux-gnu-g++ \
+            --pkg-config=pkg-config \
+            --enable-libdrm \
+            --enable-v4l2-m2m
+          grep -q "#define CONFIG_V4L2_M2M 1" config.h || { echo "::error::FFmpeg (aarch64) configured WITHOUT V4L2 M2M support"; exit 1; }
+          grep -q "#define CONFIG_LIBDRM 1" config.h || { echo "::error::FFmpeg (aarch64) configured WITHOUT libdrm/DRM PRIME support"; exit 1; }
+          make -j$(nproc)
+          make install
 
       - name: Setup Compiler Cache (ccache)
         uses: hendrikmuhs/ccache-action@v1
@@ -375,7 +452,8 @@ jobs:
         env:
           CC: "ccache aarch64-linux-gnu-gcc"
           CXX: "ccache aarch64-linux-gnu-g++"
-          PKG_CONFIG_PATH: "/usr/lib/aarch64-linux-gnu/pkgconfig"
+          PKG_CONFIG_LIBDIR: "/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig"
+          PKG_CONFIG_SYSROOT_DIR: "/"
         run: |
           cmake -B build-linux-aarch64 \
             -DPLATFORM=LINUX \
@@ -385,7 +463,10 @@ jobs:
             -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ \
             -DTREAT_WARNINGS_AS_ERRORS=ON \
             -DCMAKE_BUILD_TYPE=Release \
-            -DENABLE_FFMPEG_AUTO_DOWNLOAD=OFF
+            -DENABLE_FFMPEG_AUTO_DOWNLOAD=OFF \
+            -DSDL_WAYLAND=ON \
+            -DSDL_X11=ON \
+            -DSDL_KMSDRM=ON
 
       - name: Build
         run: |
@@ -402,21 +483,29 @@ jobs:
           echo "=== CMake Version ===" > diagnostics-linux-aarch64/cmake_version.txt
           cmake --version >> diagnostics-linux-aarch64/cmake_version.txt 2>&1
 
-          echo "=== FFmpeg Version ===" > diagnostics-linux-aarch64/ffmpeg_version.txt
-          ffmpeg -version >> diagnostics-linux-aarch64/ffmpeg_version.txt 2>&1 || true
+          # Executed transparently via the qemu-user-static binfmt_misc
+          # handler installed above, so this reflects the real cross-compiled
+          # binary, not a guess from headers.
+          FFMPEG_BIN="thirdparty/ffmpeg/bin/ffmpeg"
+
+          echo "=== FFmpeg Version (qemu-aarch64: $FFMPEG_BIN) ===" > diagnostics-linux-aarch64/ffmpeg_version.txt
+          "$FFMPEG_BIN" -version >> diagnostics-linux-aarch64/ffmpeg_version.txt 2>&1 || echo "(qemu execution unavailable)" >> diagnostics-linux-aarch64/ffmpeg_version.txt
 
           echo "=== pkg-config versions ===" > diagnostics-linux-aarch64/pkg_config_versions.txt
-          export PKG_CONFIG_PATH="/usr/lib/aarch64-linux-gnu/pkgconfig:$(find build-linux-aarch64 -name "*.pc" -exec dirname {} \; | tr '\n' ':'):$PKG_CONFIG_PATH"
+          export PKG_CONFIG_LIBDIR="/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig"
+          export PKG_CONFIG_PATH="${{ github.workspace }}/thirdparty/ffmpeg/lib/pkgconfig:$(find build-linux-aarch64 -name "*.pc" -exec dirname {} \; | tr '\n' ':')"
           pkg-config --modversion libavcodec >> diagnostics-linux-aarch64/pkg_config_versions.txt 2>&1 || true
           pkg-config --modversion libavformat >> diagnostics-linux-aarch64/pkg_config_versions.txt 2>&1 || true
           pkg-config --modversion libavutil >> diagnostics-linux-aarch64/pkg_config_versions.txt 2>&1 || true
           pkg-config --modversion sdl3 >> diagnostics-linux-aarch64/pkg_config_versions.txt 2>&1 || true
 
           echo "=== FFmpeg hwaccels ===" > diagnostics-linux-aarch64/ffmpeg_hwaccels.txt
-          ffmpeg -hwaccels >> diagnostics-linux-aarch64/ffmpeg_hwaccels.txt 2>&1 || true
+          "$FFMPEG_BIN" -hwaccels >> diagnostics-linux-aarch64/ffmpeg_hwaccels.txt 2>&1 || echo "(qemu execution unavailable)" >> diagnostics-linux-aarch64/ffmpeg_hwaccels.txt
 
-          echo "=== FFmpeg decoders ===" > diagnostics-linux-aarch64/ffmpeg_decoders.txt
-          ffmpeg -decoders >> diagnostics-linux-aarch64/ffmpeg_decoders.txt 2>&1 || true
+          echo "=== FFmpeg decoders (v4l2m2m / drm filtered) ===" > diagnostics-linux-aarch64/ffmpeg_decoders.txt
+          "$FFMPEG_BIN" -decoders >> diagnostics-linux-aarch64/ffmpeg_decoders.txt 2>&1 || echo "(qemu execution unavailable)" >> diagnostics-linux-aarch64/ffmpeg_decoders.txt
+          echo "=== grep v4l2m2m ===" >> diagnostics-linux-aarch64/ffmpeg_decoders.txt
+          "$FFMPEG_BIN" -decoders 2>/dev/null | grep -i v4l2m2m >> diagnostics-linux-aarch64/ffmpeg_decoders.txt || echo "(none found / qemu unavailable)" >> diagnostics-linux-aarch64/ffmpeg_decoders.txt
 
           if [ -f build-linux-aarch64/NaikAVPlayer ]; then
             echo "=== ldd NaikAVPlayer ===" > diagnostics-linux-aarch64/ldd_NaikAVPlayer.txt
@@ -435,6 +524,9 @@ jobs:
           mkdir -p $PKG/lib
           cp build-linux-aarch64/NaikAVPlayer $PKG/
           find build-linux-aarch64 -name "libSDL3.so*" -exec cp -P {} $PKG/lib/ \;
+          # Bundle the exact (aarch64, V4L2M2M+DRM-enabled) FFmpeg .so's this
+          # binary was compiled/linked against.
+          cp -P thirdparty/ffmpeg/lib/libav*.so* thirdparty/ffmpeg/lib/libsw*.so* $PKG/lib/
           cp -r assets $PKG/
           rm -f $PKG/assets/hd_test_video_with_audio.mp4 $PKG/assets/screenshot.png
           cp -r licenses $PKG/
@@ -453,8 +545,8 @@ jobs:
 
           echo "=== Verifying Bundled Shared Libraries ==="
           ls -l "$PKG/lib/"
-          
-          REQUIRED_LIBS=("libSDL3.so")
+
+          REQUIRED_LIBS=("libSDL3.so" "libavcodec.so" "libavformat.so" "libavutil.so" "libswscale.so" "libswresample.so")
           for lib in "${REQUIRED_LIBS[@]}"; do
             if ! ls "$PKG/lib/" | grep -q "$lib"; then
               echo "::error::Missing bundled library: $lib"
@@ -462,21 +554,16 @@ jobs:
             fi
           done
 
-          # Ensure FFmpeg is NOT bundled (relies on system dynamic packages instead)
-          if ls "$PKG/lib/" | grep -q -E "libav|libsw"; then
-            echo "::error::FFmpeg libraries should not be bundled on Linux packages!"
-            exit 1
-          fi
-
           echo "=== Verifying Binary Dependencies ==="
           NEEDED_LIBS=$(aarch64-linux-gnu-readelf -d "$PKG/NaikAVPlayer" | grep NEEDED | awk -F'[' '{print $2}' | awk -F']' '{print $1}')
           echo "Needed libraries:"
           echo "$NEEDED_LIBS"
-          
-          # Check if SDL3 is dynamically linked to our bundled path
+
+          # Every FFmpeg/SDL3 NEEDED entry must resolve inside our bundled
+          # lib/ dir via the $ORIGIN/lib RPATH.
           for needed in $NEEDED_LIBS; do
             case "$needed" in
-              libSDL3*)
+              libSDL3*|libavcodec*|libavformat*|libavutil*|libswscale*|libswresample*)
                 if [ ! -f "$PKG/lib/$needed" ]; then
                   resolved_base=$(echo "$needed" | sed -E 's/\.so\..*/.so/')
                   if ! ls "$PKG/lib/" | grep -q "$resolved_base"; then
@@ -524,5 +611,5 @@ jobs:
           body: |
             ## Downloads
             - **Windows (x64):** self-contained — extract and run `NaikAVPlayer.exe`. All FFmpeg/SDL3/C++ runtime DLLs are bundled.
-            - **Linux (x64):** extract and run `NaikAVPlayer`. SDL3 is bundled. Relies on system FFmpeg.
-            - **Linux (aarch64):** extract and run `NaikAVPlayer`. SDL3 is bundled. Relies on system FFmpeg.
+            - **Linux (x64):** self-contained — extract and run `NaikAVPlayer`. FFmpeg (with V4L2 M2M + DRM PRIME hardware decode support) and SDL3 are bundled in `lib/`.
+            - **Linux (aarch64, e.g. Raspberry Pi 4/5):** self-contained — extract and run `NaikAVPlayer`. FFmpeg (built from source with V4L2 M2M + DRM PRIME hardware decode support) and SDL3 are bundled in `lib/`; no system FFmpeg install required or used.

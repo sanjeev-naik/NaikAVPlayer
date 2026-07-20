@@ -212,8 +212,20 @@ if(TARGET_PLATFORM_WINDOWS OR (TARGET_PLATFORM_LINUX AND (ENABLE_FFMPEG_AUTO_DOW
     if(EXISTS "${FFMPEG_DIR}/include/libavcodec/avcodec.h")
         if(TARGET_PLATFORM_WINDOWS AND EXISTS "${FFMPEG_DIR}/lib/avcodec.lib")
             set(FFMPEG_FOUND TRUE)
-        elseif(TARGET_PLATFORM_LINUX AND (EXISTS "${FFMPEG_DIR}/lib/libavcodec.so" OR EXISTS "${FFMPEG_DIR}/lib/libavcodec.so.61"))
-            set(FFMPEG_FOUND TRUE)
+        elseif(TARGET_PLATFORM_LINUX)
+            # Version-agnostic check: the SONAME suffix (.so.NN) tracks the
+            # FFmpeg ABI version and changes on every major bump (e.g. the
+            # n8.1.2 pin below produces libavcodec.so.62, not .so.61). A
+            # hardcoded suffix here would silently report "not found" after
+            # every version bump, causing CMake to blow away and re-download
+            # a perfectly good CI/locally-built FFmpeg (including one built
+            # from source with project-specific flags like --enable-v4l2-m2m)
+            # in favor of the generic downloaded binary. Glob instead.
+            file(GLOB _naikav_existing_libavcodec "${FFMPEG_DIR}/lib/libavcodec.so*")
+            if(_naikav_existing_libavcodec)
+                set(FFMPEG_FOUND TRUE)
+            endif()
+            unset(_naikav_existing_libavcodec)
         endif()
     endif()
 
