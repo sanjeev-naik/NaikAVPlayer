@@ -32,15 +32,49 @@ jobs:
             cppcheck \
             lcov \
             libdrm-dev \
-            libudev-dev
+            libudev-dev \
+            libwayland-dev \
+            libxkbcommon-dev \
+            wayland-protocols \
+            libx11-dev \
+            libxrandr-dev \
+            libxcursor-dev \
+            libxext-dev \
+            libxfixes-dev \
+            libxi-dev \
+            libxss-dev \
+            libgbm-dev \
+            libgles-dev \
+            libegl-dev \
+            libdbus-1-dev \
+            libpulse-dev \
+            libasound2-dev
 
-      # FFmpeg is NOT built from source here. CMake's ENABLE_FFMPEG_AUTO_DOWNLOAD
-      # (ON by default) fetches the exact same SHA256-pinned BtbN shared build
-      # that local developer builds use, so the CI-packaged libav* are
-      # bit-identical to a local build's. The previous source-build step was
-      # broken (--enable-udev is not a valid FFmpeg configure option, so a cold
-      # cache could never rebuild) and shipped a stale, unreproducible
-      # actions/cache blob whose v4l2m2m decoder stalls on Raspberry Pi.
+      - name: Cache FFmpeg Build (Linux x64)
+        id: cache-ffmpeg-linux-x64
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/thirdparty/ffmpeg
+          key: ${{ runner.os }}-ffmpeg-8.1-ce3c09c101-linux-x64-v1
+
+      - name: Build FFmpeg from source (Linux x64)
+        if: steps.cache-ffmpeg-linux-x64.outputs.cache-hit != 'true'
+        run: |
+          git clone https://github.com/FFmpeg/FFmpeg.git ffmpeg-src
+          cd ffmpeg-src
+          git checkout ce3c09c101
+          ./configure \
+            --prefix=${{ github.workspace }}/thirdparty/ffmpeg \
+            --enable-shared \
+            --disable-static \
+            --disable-programs \
+            --disable-doc \
+            --disable-avdevice \
+            --disable-avfilter \
+            --enable-v4l2-m2m \
+            --enable-libdrm
+          make -j$(nproc)
+          make install
 
       - name: Setup Compiler Cache (ccache)
         uses: hendrikmuhs/ccache-action@v1
@@ -55,7 +89,8 @@ jobs:
           cmake -B build-linux \
             -DCMAKE_BUILD_TYPE=Release \
             -DTREAT_WARNINGS_AS_ERRORS=ON \
-            -DPLATFORM=LINUX
+            -DPLATFORM=LINUX \
+            -DENABLE_FFMPEG_AUTO_DOWNLOAD=OFF
 
       - name: Build (Native Linux)
         run: |
@@ -97,7 +132,8 @@ jobs:
           cmake -B build-sanitizers \
             -DCMAKE_BUILD_TYPE=Debug \
             -DENABLE_SANITIZERS=ON \
-            -DPLATFORM=LINUX
+            -DPLATFORM=LINUX \
+            -DENABLE_FFMPEG_AUTO_DOWNLOAD=OFF
 
       - name: Build with Sanitizers (ASan/UBSan)
         run: |
@@ -119,7 +155,8 @@ jobs:
           cmake -B build-tsan \
             -DCMAKE_BUILD_TYPE=Debug \
             -DENABLE_TSAN=ON \
-            -DPLATFORM=LINUX
+            -DPLATFORM=LINUX \
+            -DENABLE_FFMPEG_AUTO_DOWNLOAD=OFF
 
       - name: Build with ThreadSanitizer (TSan)
         run: |
@@ -169,6 +206,48 @@ jobs:
           ls -la build-tsan/NaikAVPlayer 2>/dev/null || echo "Linux TSan Executable not found"
           echo "Files in workspace:"
           find . -maxdepth 3 -not -path '*/.*' -not -path './build*' -not -path './thirdparty*'
+
+      - name: Collect CI Diagnostics
+        if: always()
+        run: |
+          mkdir -p diagnostics-linux-x64
+          echo "=== Compiler Version ===" > diagnostics-linux-x64/compiler_version.txt
+          gcc --version >> diagnostics-linux-x64/compiler_version.txt 2>&1
+          g++ --version >> diagnostics-linux-x64/compiler_version.txt 2>&1
+
+          echo "=== CMake Version ===" > diagnostics-linux-x64/cmake_version.txt
+          cmake --version >> diagnostics-linux-x64/cmake_version.txt 2>&1
+
+          echo "=== FFmpeg Version ===" > diagnostics-linux-x64/ffmpeg_version.txt
+          if [ -f thirdparty/ffmpeg/include/libavcodec/version.h ]; then
+            echo "Built FFmpeg Headers version info:" >> diagnostics-linux-x64/ffmpeg_version.txt
+            grep -E "LIBAVCODEC_VERSION_" thirdparty/ffmpeg/include/libavcodec/version.h >> diagnostics-linux-x64/ffmpeg_version.txt || true
+          fi
+          ffmpeg -version >> diagnostics-linux-x64/ffmpeg_version.txt 2>&1 || true
+
+          echo "=== pkg-config versions ===" > diagnostics-linux-x64/pkg_config_versions.txt
+          export PKG_CONFIG_PATH="${{ github.workspace }}/thirdparty/ffmpeg/lib/pkgconfig:$(find build-linux -name "*.pc" -exec dirname {} \; | tr '\n' ':'):$PKG_CONFIG_PATH"
+          pkg-config --modversion libavcodec >> diagnostics-linux-x64/pkg_config_versions.txt 2>&1 || true
+          pkg-config --modversion libavformat >> diagnostics-linux-x64/pkg_config_versions.txt 2>&1 || true
+          pkg-config --modversion libavutil >> diagnostics-linux-x64/pkg_config_versions.txt 2>&1 || true
+          pkg-config --modversion sdl3 >> diagnostics-linux-x64/pkg_config_versions.txt 2>&1 || true
+
+          echo "=== FFmpeg hwaccels ===" > diagnostics-linux-x64/ffmpeg_hwaccels.txt
+          ffmpeg -hwaccels >> diagnostics-linux-x64/ffmpeg_hwaccels.txt 2>&1 || true
+
+          echo "=== FFmpeg decoders ===" > diagnostics-linux-x64/ffmpeg_decoders.txt
+          ffmpeg -decoders >> diagnostics-linux-x64/ffmpeg_decoders.txt 2>&1 || true
+
+          if [ -f build-linux/NaikAVPlayer ]; then
+            echo "=== ldd NaikAVPlayer ===" > diagnostics-linux-x64/ldd_NaikAVPlayer.txt
+            ldd build-linux/NaikAVPlayer >> diagnostics-linux-x64/ldd_NaikAVPlayer.txt 2>&1 || true
+
+            echo "=== readelf NaikAVPlayer ===" > diagnostics-linux-x64/readelf_NaikAVPlayer.txt
+            readelf -d build-linux/NaikAVPlayer >> diagnostics-linux-x64/readelf_NaikAVPlayer.txt 2>&1 || true
+
+            echo "=== objdump NaikAVPlayer ===" > diagnostics-linux-x64/objdump_NaikAVPlayer.txt
+            objdump -p build-linux/NaikAVPlayer >> diagnostics-linux-x64/objdump_NaikAVPlayer.txt 2>&1 || true
+          fi
 
       - name: Upload Test Report Artifact
         if: always()
@@ -223,8 +302,65 @@ jobs:
                 NaikAVPlayer-linux-x64/assets/screenshot.png
           cp -r licenses NaikAVPlayer-linux-x64/
           cp LICENSE README.md NaikAVPlayer-linux-x64/
-          tar czf NaikAVPlayer-linux-x64.tar.gz NaikAVPlayer-linux-x64
 
+      - name: Verify Package Closure
+        if: >-
+          success() && (
+            startsWith(github.ref, 'refs/heads/release/') ||
+            startsWith(github.ref, 'refs/tags/v') ||
+            startsWith(github.head_ref, 'release/')
+          )
+        run: |
+          PKG_DIR="NaikAVPlayer-linux-x64"
+          echo "=== Verifying RPATH/RUNPATH ==="
+          RUNPATH_CHECK=$(readelf -d "$PKG_DIR/NaikAVPlayer" | grep -E "R(UN)?PATH")
+          echo "$RUNPATH_CHECK"
+          if ! echo "$RUNPATH_CHECK" | grep -q '\$ORIGIN/lib'; then
+            echo "::error::RUNPATH is not set to \$ORIGIN/lib!"
+            exit 1
+          fi
+
+          echo "=== Verifying Bundled Shared Libraries ==="
+          ls -l "$PKG_DIR/lib/"
+          
+          REQUIRED_LIBS=("libSDL3.so" "libavcodec.so" "libavformat.so" "libavutil.so" "libswscale.so" "libswresample.so")
+          for lib in "${REQUIRED_LIBS[@]}"; do
+            if ! ls "$PKG_DIR/lib/" | grep -q "$lib"; then
+              echo "::error::Missing bundled library: $lib"
+              exit 1
+            fi
+          done
+
+          echo "=== Verifying Binary Dependencies ==="
+          NEEDED_LIBS=$(readelf -d "$PKG_DIR/NaikAVPlayer" | grep NEEDED | awk -F'[' '{print $2}' | awk -F']' '{print $1}')
+          echo "Needed libraries:"
+          echo "$NEEDED_LIBS"
+          
+          # Check if any needed library (specifically ffmpeg and sdl) is missing from lib/
+          for needed in $NEEDED_LIBS; do
+            case "$needed" in
+              libav*|libsw*|libSDL3*)
+                if [ ! -f "$PKG_DIR/lib/$needed" ]; then
+                  resolved_base=$(echo "$needed" | sed -E 's/\.so\..*/.so/')
+                  if ! ls "$PKG_DIR/lib/" | grep -q "$resolved_base"; then
+                    echo "::error::Binary needs $needed but it or its base is not in lib/"
+                    exit 1
+                  fi
+                fi
+                ;;
+            esac
+          done
+          echo "Package closure verification passed!"
+
+      - name: Create Linux Tarball Package
+        if: >-
+          success() && (
+            startsWith(github.ref, 'refs/heads/release/') ||
+            startsWith(github.ref, 'refs/tags/v') ||
+            startsWith(github.head_ref, 'release/')
+          )
+        run: |
+          tar czf NaikAVPlayer-linux-x64.tar.gz NaikAVPlayer-linux-x64
 
       - name: Upload Linux Executable Package
         if: >-
@@ -237,6 +373,13 @@ jobs:
         with:
           name: linux-release-package
           path: NaikAVPlayer-linux-x64.tar.gz
+
+      - name: Upload CI Diagnostics Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostics-linux-x64
+          path: diagnostics-linux-x64/
 
 
   cross-compile-windows:
@@ -301,7 +444,8 @@ jobs:
             -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc \
             -DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-g++ \
             -DTREAT_WARNINGS_AS_ERRORS=ON \
-            -DCMAKE_BUILD_TYPE=Release
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_FFMPEG_AUTO_DOWNLOAD=OFF
 
       - name: Build (Cross-Compile for Windows)
         run: |
@@ -337,7 +481,6 @@ jobs:
           cp -r licenses NaikAVPlayer-windows-x64/
           cp LICENSE README.md NaikAVPlayer-windows-x64/
           zip -r NaikAVPlayer-windows-x64.zip NaikAVPlayer-windows-x64
-
 
       - name: Upload Windows Executable Package
         if: >-
@@ -428,15 +571,58 @@ jobs:
             libvdpau-dev:arm64 \
             libdrm-dev:arm64 \
             libudev-dev:arm64 \
+            libwayland-dev:arm64 \
+            libxkbcommon-dev:arm64 \
+            wayland-protocols \
+            libx11-dev:arm64 \
+            libxrandr-dev:arm64 \
+            libxcursor-dev:arm64 \
+            libxext-dev:arm64 \
+            libxfixes-dev:arm64 \
+            libxi-dev:arm64 \
+            libgbm-dev:arm64 \
+            libgles-dev:arm64 \
+            libegl-dev:arm64 \
+            libdbus-1-dev:arm64 \
+            libpulse-dev:arm64 \
+            qemu-user-static \
+            ffmpeg:arm64 \
             ccache
 
-      # FFmpeg is NOT cross-built from source here. CMake's auto-download picks
-      # the SHA256-pinned BtbN linuxarm64 build (CMAKE_SYSTEM_PROCESSOR=aarch64
-      # selects the linuxarm64 URL), i.e. the exact libraries a local Raspberry
-      # Pi build links and ships in its lib/ directory. This is what makes the
-      # CI aarch64 package behave identically to a local Pi build, including
-      # h264_v4l2m2m hardware decode. See notes in the x64 job above for why
-      # the old source-build step was removed.
+      - name: Cache FFmpeg Build (Linux aarch64)
+        id: cache-ffmpeg-linux-aarch64
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/thirdparty/ffmpeg
+          key: ${{ runner.os }}-ffmpeg-8.1-ce3c09c101-linux-aarch64-v1
+
+      - name: Build FFmpeg from source (Linux aarch64)
+        if: steps.cache-ffmpeg-linux-aarch64.outputs.cache-hit != 'true'
+        run: |
+          git clone https://github.com/FFmpeg/FFmpeg.git ffmpeg-src
+          cd ffmpeg-src
+          git checkout ce3c09c101
+          PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig \
+          PKG_CONFIG_LIBDIR=/usr/lib/aarch64-linux-gnu/pkgconfig \
+          ./configure \
+            --prefix=${{ github.workspace }}/thirdparty/ffmpeg \
+            --enable-shared \
+            --disable-static \
+            --disable-programs \
+            --disable-doc \
+            --disable-avdevice \
+            --disable-avfilter \
+            --enable-cross-compile \
+            --cross-prefix=aarch64-linux-gnu- \
+            --arch=aarch64 \
+            --target-os=linux \
+            --cc=aarch64-linux-gnu-gcc \
+            --cxx=aarch64-linux-gnu-g++ \
+            --enable-v4l2-m2m \
+            --enable-libdrm \
+            --pkg-config=aarch64-linux-gnu-pkg-config
+          make -j$(nproc)
+          make install
 
       - name: Setup Compiler Cache (ccache)
         uses: hendrikmuhs/ccache-action@v1
@@ -456,7 +642,8 @@ jobs:
             -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
             -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ \
             -DTREAT_WARNINGS_AS_ERRORS=ON \
-            -DCMAKE_BUILD_TYPE=Release
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_FFMPEG_AUTO_DOWNLOAD=OFF
 
       - name: Build (Cross-Compile for Linux aarch64)
         run: |
@@ -469,6 +656,48 @@ jobs:
           echo "Current working directory: $(pwd)"
           echo "Executable output locations:"
           ls -la build-linux-aarch64/NaikAVPlayer 2>/dev/null || echo "Linux aarch64 Executable not found"
+
+      - name: Collect CI Diagnostics
+        if: always()
+        run: |
+          mkdir -p diagnostics-linux-aarch64
+          echo "=== Compiler Version ===" > diagnostics-linux-aarch64/compiler_version.txt
+          aarch64-linux-gnu-gcc --version >> diagnostics-linux-aarch64/compiler_version.txt 2>&1
+          aarch64-linux-gnu-g++ --version >> diagnostics-linux-aarch64/compiler_version.txt 2>&1
+
+          echo "=== CMake Version ===" > diagnostics-linux-aarch64/cmake_version.txt
+          cmake --version >> diagnostics-linux-aarch64/cmake_version.txt 2>&1
+
+          echo "=== FFmpeg Version ===" > diagnostics-linux-aarch64/ffmpeg_version.txt
+          if [ -f thirdparty/ffmpeg/include/libavcodec/version.h ]; then
+            echo "Built FFmpeg Headers version info:" >> diagnostics-linux-aarch64/ffmpeg_version.txt
+            grep -E "LIBAVCODEC_VERSION_" thirdparty/ffmpeg/include/libavcodec/version.h >> diagnostics-linux-aarch64/ffmpeg_version.txt || true
+          fi
+          ffmpeg -version >> diagnostics-linux-aarch64/ffmpeg_version.txt 2>&1 || true
+
+          echo "=== pkg-config versions ===" > diagnostics-linux-aarch64/pkg_config_versions.txt
+          export PKG_CONFIG_PATH="${{ github.workspace }}/thirdparty/ffmpeg/lib/pkgconfig:$(find build-linux-aarch64 -name "*.pc" -exec dirname {} \; | tr '\n' ':'):/usr/lib/aarch64-linux-gnu/pkgconfig:$PKG_CONFIG_PATH"
+          pkg-config --modversion libavcodec >> diagnostics-linux-aarch64/pkg_config_versions.txt 2>&1 || true
+          pkg-config --modversion libavformat >> diagnostics-linux-aarch64/pkg_config_versions.txt 2>&1 || true
+          pkg-config --modversion libavutil >> diagnostics-linux-aarch64/pkg_config_versions.txt 2>&1 || true
+          pkg-config --modversion sdl3 >> diagnostics-linux-aarch64/pkg_config_versions.txt 2>&1 || true
+
+          echo "=== FFmpeg hwaccels ===" > diagnostics-linux-aarch64/ffmpeg_hwaccels.txt
+          ffmpeg -hwaccels >> diagnostics-linux-aarch64/ffmpeg_hwaccels.txt 2>&1 || true
+
+          echo "=== FFmpeg decoders ===" > diagnostics-linux-aarch64/ffmpeg_decoders.txt
+          ffmpeg -decoders >> diagnostics-linux-aarch64/ffmpeg_decoders.txt 2>&1 || true
+
+          if [ -f build-linux-aarch64/NaikAVPlayer ]; then
+            echo "=== ldd NaikAVPlayer ===" > diagnostics-linux-aarch64/ldd_NaikAVPlayer.txt
+            aarch64-linux-gnu-readelf -d build-linux-aarch64/NaikAVPlayer | grep NEEDED >> diagnostics-linux-aarch64/ldd_NaikAVPlayer.txt 2>&1 || true
+
+            echo "=== readelf NaikAVPlayer ===" > diagnostics-linux-aarch64/readelf_NaikAVPlayer.txt
+            aarch64-linux-gnu-readelf -d build-linux-aarch64/NaikAVPlayer >> diagnostics-linux-aarch64/readelf_NaikAVPlayer.txt 2>&1 || true
+
+            echo "=== objdump NaikAVPlayer ===" > diagnostics-linux-aarch64/objdump_NaikAVPlayer.txt
+            aarch64-linux-gnu-objdump -p build-linux-aarch64/NaikAVPlayer >> diagnostics-linux-aarch64/objdump_NaikAVPlayer.txt 2>&1 || true
+          fi
 
       - name: Package Linux aarch64 Release Executable
         if: >-
@@ -489,6 +718,64 @@ jobs:
                 NaikAVPlayer-linux-aarch64/assets/screenshot.png
           cp -r licenses NaikAVPlayer-linux-aarch64/
           cp LICENSE README.md NaikAVPlayer-linux-aarch64/
+
+      - name: Verify Package Closure
+        if: >-
+          success() && (
+            startsWith(github.ref, 'refs/heads/release/') ||
+            startsWith(github.ref, 'refs/tags/v') ||
+            startsWith(github.head_ref, 'release/')
+          )
+        run: |
+          PKG_DIR="NaikAVPlayer-linux-aarch64"
+          echo "=== Verifying RPATH/RUNPATH ==="
+          RUNPATH_CHECK=$(aarch64-linux-gnu-readelf -d "$PKG_DIR/NaikAVPlayer" | grep -E "R(UN)?PATH")
+          echo "$RUNPATH_CHECK"
+          if ! echo "$RUNPATH_CHECK" | grep -q '\$ORIGIN/lib'; then
+            echo "::error::RUNPATH is not set to \$ORIGIN/lib!"
+            exit 1
+          fi
+
+          echo "=== Verifying Bundled Shared Libraries ==="
+          ls -l "$PKG_DIR/lib/"
+          
+          REQUIRED_LIBS=("libSDL3.so" "libavcodec.so" "libavformat.so" "libavutil.so" "libswscale.so" "libswresample.so")
+          for lib in "${REQUIRED_LIBS[@]}"; do
+            if ! ls "$PKG_DIR/lib/" | grep -q "$lib"; then
+              echo "::error::Missing bundled library: $lib"
+              exit 1
+            fi
+          done
+
+          echo "=== Verifying Binary Dependencies ==="
+          NEEDED_LIBS=$(aarch64-linux-gnu-readelf -d "$PKG_DIR/NaikAVPlayer" | grep NEEDED | awk -F'[' '{print $2}' | awk -F']' '{print $1}')
+          echo "Needed libraries:"
+          echo "$NEEDED_LIBS"
+          
+          # Check if any needed library (specifically ffmpeg and sdl) is missing from lib/
+          for needed in $NEEDED_LIBS; do
+            case "$needed" in
+              libav*|libsw*|libSDL3*)
+                if [ ! -f "$PKG_DIR/lib/$needed" ]; then
+                  resolved_base=$(echo "$needed" | sed -E 's/\.so\..*/.so/')
+                  if ! ls "$PKG_DIR/lib/" | grep -q "$resolved_base"; then
+                    echo "::error::Binary needs $needed but it or its base is not in lib/"
+                    exit 1
+                  fi
+                fi
+                ;;
+            esac
+          done
+          echo "Package closure verification passed!"
+
+      - name: Create Linux Tarball Package
+        if: >-
+          success() && (
+            startsWith(github.ref, 'refs/heads/release/') ||
+            startsWith(github.ref, 'refs/tags/v') ||
+            startsWith(github.head_ref, 'release/')
+          )
+        run: |
           tar czf NaikAVPlayer-linux-aarch64.tar.gz NaikAVPlayer-linux-aarch64
 
       - name: Upload Linux aarch64 Executable Package
@@ -503,5 +790,9 @@ jobs:
           name: linux-aarch64-release-package
           path: NaikAVPlayer-linux-aarch64.tar.gz
 
-
-
+      - name: Upload CI Diagnostics Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostics-linux-aarch64
+          path: diagnostics-linux-aarch64/
