@@ -32,7 +32,9 @@ jobs:
             cppcheck \
             lcov \
             libdrm-dev \
-            libudev-dev
+            libudev-dev \
+            nasm \
+            yasm
 
       - name: Cache FFmpeg Build
         id: cache-ffmpeg
@@ -273,7 +275,9 @@ jobs:
           sudo apt-get install -y \
             ffmpeg \
             mingw-w64 \
-            ccache
+            ccache \
+            nasm \
+            yasm
 
       - name: Cache FFmpeg Build (Windows)
         id: cache-ffmpeg-windows
