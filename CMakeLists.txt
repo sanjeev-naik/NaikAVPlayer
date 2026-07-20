@@ -154,6 +154,15 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(SDL3)
 
+# Link libssp (Stack Smashing Protector) to SDL3-shared on Windows MinGW/Clang builds
+if(TARGET_PLATFORM_WINDOWS)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        if(TARGET SDL3-shared)
+            target_link_libraries(SDL3-shared PRIVATE ssp)
+        endif()
+    endif()
+endif()
+
 # -------------------------------------------------------------
 # Fetch Dear ImGui
 # -------------------------------------------------------------
