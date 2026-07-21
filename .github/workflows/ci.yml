@@ -260,7 +260,8 @@ jobs:
           
           # Copy Libraries
           if [ "${{ matrix.os_name }}" = "windows" ]; then
-            cp build/*.dll package/
+            cp build/*.dll package/ 2>/dev/null || true
+            cp build/bin/*.dll package/ 2>/dev/null || true
           else
             cp build/lib/*.so* package/lib/ 2>/dev/null || true
           fi
