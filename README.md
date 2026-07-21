@@ -157,10 +157,20 @@ cmake -B build -DPLATFORM=LINUX
 ```
 
 **Opt-out of Auto-downloads (Recommended for Raspberry Pi & Local Linux Dev):**
-By default, the build system automatically downloads a prebuilt FFmpeg package. If you want to use the system-installed FFmpeg development packages instead (highly recommended on devices like the Raspberry Pi, where the system-wide packages are optimized and patched for hardware-accelerated V4L2M2M decoding), configure the project with `ENABLE_FFMPEG_AUTO_DOWNLOAD=OFF`:
+By default, the build system automatically downloads a prebuilt FFmpeg package. If you want to use the system-installed FFmpeg development packages instead (highly recommended on devices like the Raspberry Pi, where the system-wide packages are optimized and patched for hardware-accelerated V4L2M2M decoding), configure the project with `NAIKAV_FORCE_BUNDLED_FFMPEG=OFF`:
 ```bash
-cmake -B build -DPLATFORM=LINUX -DENABLE_FFMPEG_AUTO_DOWNLOAD=OFF
+cmake -B build -DPLATFORM=LINUX
 ```
+
+> [!NOTE]
+> **Raspberry Pi 4B CI Build Limitation & Hardware Decoding Notice:**
+> CI prebuilt binaries for Raspberry Pi 4B hardware acceleration are intentionally disabled because GitHub Actions cloud virtual environments lack physical V4L2 M2M video decoder devices (`/dev/video10` / `bcm2835-codec`) and Raspberry Pi kernel driver interfaces.
+> 
+> To enable hardware-accelerated V4L2 M2M decoding on Raspberry Pi 4B, please build the project **locally** (either directly on the Raspberry Pi or via local cross-compilation with system FFmpeg packages):
+> ```bash
+> cmake -B build -DPLATFORM=LINUX
+> cmake --build build -j$(nproc)
+> ```
 
 **Cross-Compile for Windows on Linux:**
 Configure targeting Windows using the cross-compiler toolchain:
