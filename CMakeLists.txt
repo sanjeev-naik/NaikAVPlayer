@@ -208,101 +208,149 @@ FetchContent_MakeAvailable(nativefiledialog-extended)
 
 
 # -------------------------------------------------------------
-# Configure FFmpeg (Download automatically if missing)
+# Configure FFmpeg
 # -------------------------------------------------------------
+# Two sources are supported:
+#
+#   1. SYSTEM (via pkg-config) - REQUIRED on Linux ARM64 (Raspberry Pi).
+#      The distro package (e.g. Raspberry Pi OS's libavcodec-dev) is built
+#      against the running kernel's headers and validated against the Pi's
+#      bcm2835-codec V4L2 M2M driver. BtbN's generic linuxarm64 build
+#      programs V4L2 buffer formats that the Pi driver does not accept the
+#      same way, causing hardware-decoded playback to hang inside a blocking
+#      VIDIOC_DQBUF / poll() in kernel-space. Do NOT bundle BtbN FFmpeg on
+#      ARM64 Linux.
+#
+#   2. BUNDLED (auto-downloaded from BtbN) - used on Windows and Linux x86_64,
+#      where V4L2 M2M is not the primary hardware acceleration path.
+#
+# Advanced override: -DNAIKAV_FORCE_BUNDLED_FFMPEG=ON forces the bundled
+# path even on ARM64 (only useful on non-Pi aarch64 boards where V4L2 M2M
+# isn't in play - do NOT set this on a Raspberry Pi).
+
+option(NAIKAV_FORCE_BUNDLED_FFMPEG
+    "Force auto-download of BtbN FFmpeg even on ARM64 Linux (breaks V4L2 M2M on Raspberry Pi)"
+    OFF)
+
+set(FFMPEG_USE_SYSTEM OFF)
+if(TARGET_PLATFORM_LINUX
+   AND CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64"
+   AND NOT NAIKAV_FORCE_BUNDLED_FFMPEG)
+    set(FFMPEG_USE_SYSTEM ON)
+endif()
+
 set(FFMPEG_DIR "${CMAKE_SOURCE_DIR}/thirdparty/ffmpeg")
 
-# Determine if we need to download FFmpeg
-set(FFMPEG_NEEDS_DOWNLOAD OFF)
-if(NOT EXISTS "${FFMPEG_DIR}/include/libavcodec/avcodec.h")
-    set(FFMPEG_NEEDS_DOWNLOAD ON)
-elseif(TARGET_PLATFORM_WINDOWS AND NOT EXISTS "${FFMPEG_DIR}/lib/avcodec.lib")
-    set(FFMPEG_NEEDS_DOWNLOAD ON)
-elseif(TARGET_PLATFORM_LINUX AND NOT EXISTS "${FFMPEG_DIR}/lib/libavcodec.so")
-    set(FFMPEG_NEEDS_DOWNLOAD ON)
-endif()
+if(FFMPEG_USE_SYSTEM)
+    message(STATUS "Linux ARM64 detected: using system FFmpeg via pkg-config "
+                   "(required for Raspberry Pi V4L2 M2M hardware decoding).")
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
+        libavcodec
+        libavformat
+        libavutil
+        libswscale
+        libswresample)
+    message(STATUS "  libavcodec version:    ${FFMPEG_libavcodec_VERSION}")
+    message(STATUS "  libavformat version:   ${FFMPEG_libavformat_VERSION}")
+    message(STATUS "  libavutil version:     ${FFMPEG_libavutil_VERSION}")
+    message(STATUS "  libswscale version:    ${FFMPEG_libswscale_VERSION}")
+    message(STATUS "  libswresample version: ${FFMPEG_libswresample_VERSION}")
+else()
+    # ---------- Bundled FFmpeg (Windows / Linux x86_64) ----------
+    # Determine if we need to download FFmpeg
+    set(FFMPEG_NEEDS_DOWNLOAD OFF)
+    if(NOT EXISTS "${FFMPEG_DIR}/include/libavcodec/avcodec.h")
+        set(FFMPEG_NEEDS_DOWNLOAD ON)
+    elseif(TARGET_PLATFORM_WINDOWS AND NOT EXISTS "${FFMPEG_DIR}/lib/avcodec.lib")
+        set(FFMPEG_NEEDS_DOWNLOAD ON)
+    elseif(TARGET_PLATFORM_LINUX AND NOT EXISTS "${FFMPEG_DIR}/lib/libavcodec.so")
+        set(FFMPEG_NEEDS_DOWNLOAD ON)
+    endif()
 
-if(FFMPEG_NEEDS_DOWNLOAD)
-    message(STATUS "FFmpeg headers/libraries not found in thirdparty/ffmpeg for this platform. Setting up automatically...")
-    
-    set(FFMPEG_BASE_URL "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-06-30-13-34")
-    
-    if(TARGET_PLATFORM_WINDOWS)
-        set(FFMPEG_FILENAME "ffmpeg-n8.1.2-21-gce3c09c101-win64-lgpl-shared-8.1.zip")
-        set(FFMPEG_SHA256 "27bcaf58b5140171dfe838a0b365d12c60607d71fc168424456410bad6a834da")
-    elseif(TARGET_PLATFORM_LINUX)
-        if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64")
-            set(FFMPEG_FILENAME "ffmpeg-n8.1.2-21-gce3c09c101-linuxarm64-lgpl-shared-8.1.tar.xz")
-            set(FFMPEG_SHA256 "")
-        else()
-            set(FFMPEG_FILENAME "ffmpeg-n8.1.2-21-gce3c09c101-linux64-lgpl-shared-8.1.tar.xz")
-            set(FFMPEG_SHA256 "")
+    if(FFMPEG_NEEDS_DOWNLOAD)
+        message(STATUS "FFmpeg headers/libraries not found in thirdparty/ffmpeg for this platform. Setting up automatically...")
+
+        set(FFMPEG_BASE_URL "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-06-30-13-34")
+
+        if(TARGET_PLATFORM_WINDOWS)
+            set(FFMPEG_FILENAME "ffmpeg-n8.1.2-21-gce3c09c101-win64-lgpl-shared-8.1.zip")
+            set(FFMPEG_SHA256 "27bcaf58b5140171dfe838a0b365d12c60607d71fc168424456410bad6a834da")
+        elseif(TARGET_PLATFORM_LINUX)
+            if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64")
+                # Only reachable when NAIKAV_FORCE_BUNDLED_FFMPEG=ON (advanced override).
+                set(FFMPEG_FILENAME "ffmpeg-n8.1.2-21-gce3c09c101-linuxarm64-lgpl-shared-8.1.tar.xz")
+                set(FFMPEG_SHA256 "")
+            else()
+                set(FFMPEG_FILENAME "ffmpeg-n8.1.2-21-gce3c09c101-linux64-lgpl-shared-8.1.tar.xz")
+                set(FFMPEG_SHA256 "")
+            endif()
         endif()
+
+        set(FFMPEG_ARCHIVE_URL "${FFMPEG_BASE_URL}/${FFMPEG_FILENAME}")
+        set(FFMPEG_ARCHIVE_PATH "${CMAKE_BINARY_DIR}/${FFMPEG_FILENAME}")
+        set(FFMPEG_EXTRACT_DIR "${CMAKE_BINARY_DIR}/ffmpeg_extracted")
+
+        message(STATUS "Downloading FFmpeg shared binaries from ${FFMPEG_ARCHIVE_URL}...")
+        if(FFMPEG_SHA256)
+            file(DOWNLOAD "${FFMPEG_ARCHIVE_URL}" "${FFMPEG_ARCHIVE_PATH}"
+                 SHOW_PROGRESS
+                 EXPECTED_HASH SHA256=${FFMPEG_SHA256}
+                 STATUS download_status)
+        else()
+            message(WARNING "FFMPEG_SHA256 is not set for ${FFMPEG_FILENAME} - downloaded FFmpeg archive will not be checksum-verified.")
+            file(DOWNLOAD "${FFMPEG_ARCHIVE_URL}" "${FFMPEG_ARCHIVE_PATH}"
+                 SHOW_PROGRESS
+                 STATUS download_status)
+        endif()
+
+        list(GET download_status 0 status_code)
+        list(GET download_status 1 status_msg)
+        if(NOT status_code EQUAL 0)
+            message(FATAL_ERROR "Failed to download FFmpeg (Code: ${status_code}): ${status_msg}")
+        endif()
+
+        message(STATUS "Extracting FFmpeg package...")
+        file(ARCHIVE_EXTRACT INPUT "${FFMPEG_ARCHIVE_PATH}" DESTINATION "${FFMPEG_EXTRACT_DIR}")
+
+        # Find the extracted folder name
+        file(GLOB EXTRACTED_FOLDERS "${FFMPEG_EXTRACT_DIR}/ffmpeg-*")
+        list(LENGTH EXTRACTED_FOLDERS folders_len)
+        if(folders_len EQUAL 0)
+            message(FATAL_ERROR "No extracted FFmpeg folder found. Extraction may have failed.")
+        endif()
+        list(GET EXTRACTED_FOLDERS 0 FFMPEG_SRC_DIR)
+
+        message(STATUS "Installing FFmpeg to thirdparty/ffmpeg...")
+        file(REMOVE_RECURSE "${FFMPEG_DIR}") # Clear clean install
+        file(MAKE_DIRECTORY "${FFMPEG_DIR}")
+
+        if(EXISTS "${FFMPEG_SRC_DIR}/bin")
+            file(COPY "${FFMPEG_SRC_DIR}/bin" DESTINATION "${FFMPEG_DIR}")
+        endif()
+        if(EXISTS "${FFMPEG_SRC_DIR}/include")
+            file(COPY "${FFMPEG_SRC_DIR}/include" DESTINATION "${FFMPEG_DIR}")
+        endif()
+        if(EXISTS "${FFMPEG_SRC_DIR}/lib")
+            file(COPY "${FFMPEG_SRC_DIR}/lib" DESTINATION "${FFMPEG_DIR}")
+        endif()
+
+        # Copy LICENSE and README if present
+        if(EXISTS "${FFMPEG_SRC_DIR}/LICENSE.txt")
+            file(COPY "${FFMPEG_SRC_DIR}/LICENSE.txt" DESTINATION "${FFMPEG_DIR}")
+        endif()
+        if(EXISTS "${FFMPEG_SRC_DIR}/README.txt")
+            file(COPY "${FFMPEG_SRC_DIR}/README.txt" DESTINATION "${FFMPEG_DIR}")
+        endif()
+
+        file(REMOVE "${FFMPEG_ARCHIVE_PATH}")
+        file(REMOVE_RECURSE "${FFMPEG_EXTRACT_DIR}")
+        message(STATUS "FFmpeg setup complete!")
     endif()
 
-    set(FFMPEG_ARCHIVE_URL "${FFMPEG_BASE_URL}/${FFMPEG_FILENAME}")
-    set(FFMPEG_ARCHIVE_PATH "${CMAKE_BINARY_DIR}/${FFMPEG_FILENAME}")
-    set(FFMPEG_EXTRACT_DIR "${CMAKE_BINARY_DIR}/ffmpeg_extracted")
-
-    message(STATUS "Downloading FFmpeg shared binaries from ${FFMPEG_ARCHIVE_URL}...")
-    if(FFMPEG_SHA256)
-        file(DOWNLOAD "${FFMPEG_ARCHIVE_URL}" "${FFMPEG_ARCHIVE_PATH}"
-             SHOW_PROGRESS
-             EXPECTED_HASH SHA256=${FFMPEG_SHA256}
-             STATUS download_status)
-    else()
-        message(WARNING "FFMPEG_SHA256 is not set for ${FFMPEG_FILENAME} - downloaded FFmpeg archive will not be checksum-verified.")
-        file(DOWNLOAD "${FFMPEG_ARCHIVE_URL}" "${FFMPEG_ARCHIVE_PATH}"
-             SHOW_PROGRESS
-             STATUS download_status)
-    endif()
-
-    list(GET download_status 0 status_code)
-    list(GET download_status 1 status_msg)
-    if(NOT status_code EQUAL 0)
-        message(FATAL_ERROR "Failed to download FFmpeg (Code: ${status_code}): ${status_msg}")
-    endif()
-
-    message(STATUS "Extracting FFmpeg package...")
-    file(ARCHIVE_EXTRACT INPUT "${FFMPEG_ARCHIVE_PATH}" DESTINATION "${FFMPEG_EXTRACT_DIR}")
-
-    # Find the extracted folder name
-    file(GLOB EXTRACTED_FOLDERS "${FFMPEG_EXTRACT_DIR}/ffmpeg-*")
-    list(LENGTH EXTRACTED_FOLDERS folders_len)
-    if(folders_len EQUAL 0)
-        message(FATAL_ERROR "No extracted FFmpeg folder found. Extraction may have failed.")
-    endif()
-    list(GET EXTRACTED_FOLDERS 0 FFMPEG_SRC_DIR)
-
-    message(STATUS "Installing FFmpeg to thirdparty/ffmpeg...")
-    file(REMOVE_RECURSE "${FFMPEG_DIR}") # Clear clean install
-    file(MAKE_DIRECTORY "${FFMPEG_DIR}")
-    
-    if(EXISTS "${FFMPEG_SRC_DIR}/bin")
-        file(COPY "${FFMPEG_SRC_DIR}/bin" DESTINATION "${FFMPEG_DIR}")
-    endif()
-    if(EXISTS "${FFMPEG_SRC_DIR}/include")
-        file(COPY "${FFMPEG_SRC_DIR}/include" DESTINATION "${FFMPEG_DIR}")
-    endif()
-    if(EXISTS "${FFMPEG_SRC_DIR}/lib")
-        file(COPY "${FFMPEG_SRC_DIR}/lib" DESTINATION "${FFMPEG_DIR}")
-    endif()
-    
-    # Copy LICENSE and README if present
-    if(EXISTS "${FFMPEG_SRC_DIR}/LICENSE.txt")
-        file(COPY "${FFMPEG_SRC_DIR}/LICENSE.txt" DESTINATION "${FFMPEG_DIR}")
-    endif()
-    if(EXISTS "${FFMPEG_SRC_DIR}/README.txt")
-        file(COPY "${FFMPEG_SRC_DIR}/README.txt" DESTINATION "${FFMPEG_DIR}")
-    endif()
-
-    file(REMOVE "${FFMPEG_ARCHIVE_PATH}")
-    file(REMOVE_RECURSE "${FFMPEG_EXTRACT_DIR}")
-    message(STATUS "FFmpeg setup complete!")
+    include_directories(SYSTEM "${FFMPEG_DIR}/include")
+    link_directories("${FFMPEG_DIR}/lib")
 endif()
-
-include_directories(SYSTEM "${FFMPEG_DIR}/include")
-link_directories("${FFMPEG_DIR}/lib")
 
 # -------------------------------------------------------------
 # Main Executable
@@ -325,13 +373,19 @@ add_executable(NaikAVPlayer
 target_link_libraries(NaikAVPlayer PRIVATE
     imgui
     SDL3::SDL3-shared
-    avcodec
-    avformat
-    avutil
-    swscale
-    swresample
     nfd
 )
+if(FFMPEG_USE_SYSTEM)
+    target_link_libraries(NaikAVPlayer PRIVATE PkgConfig::FFMPEG)
+else()
+    target_link_libraries(NaikAVPlayer PRIVATE
+        avcodec
+        avformat
+        avutil
+        swscale
+        swresample
+    )
+endif()
 
 # Ensure standard Win32 subsystems link correctly for MinGW only
 if(TARGET_PLATFORM_WINDOWS AND CMAKE_CXX_COMPILER_ID MATCHES "GNU")
@@ -346,7 +400,12 @@ endif()
 # Apply compiler warning flags to main application target
 target_compile_options(NaikAVPlayer PRIVATE ${PROJECT_WARNING_FLAGS})
 
-if(TARGET_PLATFORM_LINUX)
+# On Linux with bundled FFmpeg, ship .so files next to the executable under
+# lib/ and use $ORIGIN/lib rpath so the loader finds them without touching
+# the system linker cache. When linking against system FFmpeg (ARM64 Pi),
+# skip this - ld.so already resolves the distro packages, and adding an
+# $ORIGIN/lib rpath just adds a dead first-hit lookup path.
+if(TARGET_PLATFORM_LINUX AND NOT FFMPEG_USE_SYSTEM)
     set_target_properties(NaikAVPlayer PROPERTIES
         BUILD_RPATH "$ORIGIN/lib"
         INSTALL_RPATH "$ORIGIN/lib"
@@ -368,7 +427,7 @@ if(TARGET_PLATFORM_WINDOWS)
             $<TARGET_FILE_DIR:NaikAVPlayer>
         COMMENT "Copying SDL3.dll to output directory..."
     )
-elseif(TARGET_PLATFORM_LINUX)
+elseif(TARGET_PLATFORM_LINUX AND NOT FFMPEG_USE_SYSTEM)
     add_custom_command(TARGET NaikAVPlayer POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:NaikAVPlayer>/lib
         COMMAND ${CMAKE_COMMAND} -E copy_directory
@@ -382,6 +441,21 @@ elseif(TARGET_PLATFORM_LINUX)
             $<TARGET_FILE:SDL3::SDL3-shared>
             $<TARGET_FILE_DIR:NaikAVPlayer>/lib
         COMMENT "Copying SDL3 .so to lib/ directory..."
+    )
+elseif(TARGET_PLATFORM_LINUX AND FFMPEG_USE_SYSTEM)
+    # System FFmpeg is resolved via ld.so.cache; only SDL3 (built by FetchContent)
+    # still needs to travel with the executable. Ship it at $ORIGIN/lib so a
+    # future move to a self-contained install layout is a one-line rpath flip.
+    set_target_properties(NaikAVPlayer PROPERTIES
+        BUILD_RPATH "$ORIGIN/lib"
+        INSTALL_RPATH "$ORIGIN/lib"
+    )
+    add_custom_command(TARGET NaikAVPlayer POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:NaikAVPlayer>/lib
+        COMMAND ${CMAKE_COMMAND} -E copy
+            $<TARGET_FILE:SDL3::SDL3-shared>
+            $<TARGET_FILE_DIR:NaikAVPlayer>/lib
+        COMMENT "Copying SDL3 .so to lib/ directory (system FFmpeg is picked up via ld.so.cache)..."
     )
 endif()
 
@@ -429,14 +503,23 @@ endif()
 
 target_link_libraries(NaikAVPlayer_tests PRIVATE
     SDL3::SDL3-shared
-    avcodec
-    avformat
-    avutil
-    swscale
-    swresample
 )
+if(FFMPEG_USE_SYSTEM)
+    target_link_libraries(NaikAVPlayer_tests PRIVATE PkgConfig::FFMPEG)
+else()
+    target_link_libraries(NaikAVPlayer_tests PRIVATE
+        avcodec
+        avformat
+        avutil
+        swscale
+        swresample
+    )
+endif()
 
 if(TARGET_PLATFORM_LINUX)
+    # SDL3 is FetchContent-built so it always needs to travel with the binary;
+    # rpath is set here regardless of FFmpeg source (system libav* is resolved
+    # via ld.so.cache and doesn't rely on the rpath entry).
     set_target_properties(NaikAVPlayer_tests PROPERTIES
         BUILD_RPATH "$ORIGIN/lib"
         INSTALL_RPATH "$ORIGIN/lib"
@@ -462,7 +545,7 @@ if(TARGET_PLATFORM_WINDOWS)
             $<TARGET_FILE_DIR:NaikAVPlayer_tests>
         COMMENT "Copying SDL3.dll to tests output directory..."
     )
-elseif(TARGET_PLATFORM_LINUX)
+elseif(TARGET_PLATFORM_LINUX AND NOT FFMPEG_USE_SYSTEM)
     add_custom_command(TARGET NaikAVPlayer_tests POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:NaikAVPlayer_tests>/lib
         COMMAND ${CMAKE_COMMAND} -E copy_directory
@@ -476,6 +559,14 @@ elseif(TARGET_PLATFORM_LINUX)
             $<TARGET_FILE:SDL3::SDL3-shared>
             $<TARGET_FILE_DIR:NaikAVPlayer_tests>/lib
         COMMENT "Copying SDL3 .so to tests lib/ directory..."
+    )
+elseif(TARGET_PLATFORM_LINUX AND FFMPEG_USE_SYSTEM)
+    add_custom_command(TARGET NaikAVPlayer_tests POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:NaikAVPlayer_tests>/lib
+        COMMAND ${CMAKE_COMMAND} -E copy
+            $<TARGET_FILE:SDL3::SDL3-shared>
+            $<TARGET_FILE_DIR:NaikAVPlayer_tests>/lib
+        COMMENT "Copying SDL3 .so to tests lib/ directory (system FFmpeg via ld.so.cache)..."
     )
 endif()
 
