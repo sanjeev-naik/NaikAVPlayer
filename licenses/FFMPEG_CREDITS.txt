@@ -1,0 +1,27 @@
+FFmpeg Attribution and Source Code Notice
+=========================================
+
+This package distributes precompiled shared library (.dll) files for FFmpeg:
+- avcodec-61.dll
+- avformat-61.dll
+- avutil-58.dll
+- swscale-7.dll
+- swresample-4.dll
+
+These libraries are licensed under the GNU Lesser General Public License (LGPL)
+version 2.1 or later. The LGPL license text is included in this package as
+`licenses/LICENSE.lgpl-2.1`.
+
+The original, unmodified source code for FFmpeg used to build these binaries is
+available from:
+- FFmpeg Official Website: https://ffmpeg.org
+- Source Downloads: https://ffmpeg.org/download.html
+- Git Repository: https://github.com/FFmpeg/FFmpeg
+
+No modifications were made to the FFmpeg source code. The binaries were built
+using standard configure flags for LGPL distribution (such as disabling non-free/GPL
+components).
+
+Under Section 6 of the LGPL v2.1, you are permitted to replace these FFmpeg
+dynamic libraries with your own builds of the libraries, provided they maintain
+interface compatibility.

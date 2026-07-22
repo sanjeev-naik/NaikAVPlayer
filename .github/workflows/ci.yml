@@ -3,14 +3,14 @@ name: CI/CD Pipeline
 on:
   push:
     branches: [ "**" ]
+    tags: [ "v*" ]
   pull_request:
     branches: [ "**" ]
 
 jobs:
-  build-linux:
-    name: Linux Build & Test (GCC)
+  test-and-analysis:
+    name: Native Linux Testing & Analysis
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -23,24 +23,38 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            ffmpeg \
             libavcodec-dev \
             libavformat-dev \
             libavutil-dev \
             libswscale-dev \
             libswresample-dev \
-            libsdl2-dev \
             libgtk-3-dev \
+            libxss-dev \
             ccache \
             cppcheck \
             lcov
+
+      - name: Verify Documentation & License Repository Integrity
+        run: |
+          echo "Verifying presence of critical repository documentation and licenses..."
+          for file in README.md help.md LICENSE; do
+            if [ ! -f "$file" ]; then
+              echo "::error:: Required repository file '$file' is missing!"
+              exit 1
+            fi
+          done
+          if [ ! -d "licenses" ] || [ -z "$(ls -A licenses)" ]; then
+            echo "::error:: Source 'licenses/' directory is missing or empty!"
+            exit 1
+          fi
+          echo "Repository file integrity check passed."
 
       - name: Setup Compiler Cache (ccache)
         uses: hendrikmuhs/ccache-action@v1
         with:
           key: linux-gcc-ccache
 
-      - name: Configure CMake (Native Linux)
+      - name: Configure CMake (Native Linux Release)
         env:
           CC: "ccache gcc"
           CXX: "ccache g++"
@@ -50,14 +64,16 @@ jobs:
             -DTREAT_WARNINGS_AS_ERRORS=ON \
             -DPLATFORM=LINUX
 
-      - name: Build (Native Linux)
+      - name: Build (Native Linux Release)
         run: |
           cmake --build build-linux --config Release -j$(nproc)
 
-      - name: Run Tests (Native Linux)
+      - name: Run Tests (Native Linux Release)
+        env:
+          SDL_AUDIO_DRIVER: dummy
+          SDL_VIDEODRIVER: offscreen
         run: |
-          cd build-linux
-          ctest -T Test --output-on-failure
+          ctest --test-dir build-linux --output-on-failure
 
       - name: Capture and Filter Coverage
         run: |
@@ -82,7 +98,7 @@ jobs:
             --xml-version=2 \
             src/ tests/ 2> cppcheck_report.xml
 
-      - name: Configure CMake with Sanitizers (ASan/UBSan)
+      - name: Configure CMake with Sanitizers (ASan/UBSan Debug)
         env:
           CC: "ccache gcc"
           CXX: "ccache g++"
@@ -92,19 +108,20 @@ jobs:
             -DENABLE_SANITIZERS=ON \
             -DPLATFORM=LINUX
 
-      - name: Build with Sanitizers (ASan/UBSan)
+      - name: Build with Sanitizers (ASan/UBSan Debug)
         run: |
           cmake --build build-sanitizers --config Debug -j$(nproc)
 
-      - name: Run Tests with Sanitizers
+      - name: Run Tests with Sanitizers (ASan/UBSan)
         env:
           ASAN_OPTIONS: detect_leaks=1
           LSAN_OPTIONS: suppressions=${{ github.workspace }}/tests/lsan.supp
+          SDL_AUDIO_DRIVER: dummy
+          SDL_VIDEODRIVER: offscreen
         run: |
-          cd build-sanitizers
-          ctest -T Test --output-on-failure
+          ctest --test-dir build-sanitizers --output-on-failure
 
-      - name: Configure CMake with ThreadSanitizer (TSan)
+      - name: Configure CMake with ThreadSanitizer (TSan Debug)
         env:
           CC: "ccache gcc"
           CXX: "ccache g++"
@@ -114,16 +131,27 @@ jobs:
             -DENABLE_TSAN=ON \
             -DPLATFORM=LINUX
 
-      - name: Build with ThreadSanitizer (TSan)
+      - name: Build with ThreadSanitizer (TSan Debug)
         run: |
           cmake --build build-tsan --config Debug -j$(nproc)
 
       - name: Run Tests with ThreadSanitizer (TSan)
         env:
           TSAN_OPTIONS: "halt_on_error=1 history_size=7 suppressions=${{ github.workspace }}/tests/tsan.supp"
+          SDL_AUDIO_DRIVER: dummy
+          SDL_VIDEODRIVER: offscreen
         run: |
-          cd build-tsan
-          ctest -T Test --output-on-failure
+          ctest --test-dir build-tsan --output-on-failure
+
+      - name: Configure & Build RelWithDebInfo Check
+        env:
+          CC: "ccache gcc"
+          CXX: "ccache g++"
+        run: |
+          cmake -B build-reldeb \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DPLATFORM=LINUX
+          cmake --build build-reldeb --config RelWithDebInfo -j$(nproc)
 
       - name: Generate XLS Test Report
         if: always()
@@ -148,20 +176,6 @@ jobs:
           else
             echo "::warning:: build-sanitizers directory not found. ASan & UBSan reports will not be generated."
           fi
-
-      - name: Diagnostic Logging
-        if: always()
-        run: |
-          echo "=== Diagnostic Log ==="
-          echo "Current working directory: $(pwd)"
-          echo "Generated report locations:"
-          ls -la *.xlsx 2>/dev/null || echo "No .xlsx reports found in root"
-          echo "Executable output locations:"
-          ls -la build-linux/NaikAVPlayer 2>/dev/null || echo "Linux Release Executable not found"
-          ls -la build-sanitizers/NaikAVPlayer 2>/dev/null || echo "Linux Sanitizers Executable not found"
-          ls -la build-tsan/NaikAVPlayer 2>/dev/null || echo "Linux TSan Executable not found"
-          echo "Files in workspace:"
-          find . -maxdepth 3 -not -path '*/.*' -not -path './build*' -not -path './thirdparty*'
 
       - name: Upload Test Report Artifact
         if: always()
@@ -195,50 +209,174 @@ jobs:
           path: ubsan_report.xlsx
           if-no-files-found: warn
 
-  cross-compile-windows:
-    name: Windows Cross-Compilation (MinGW-w64 on Linux)
-    runs-on: ubuntu-latest
+  build-packages:
+    name: Build & Package (${{ matrix.target }})
+    runs-on: ${{ matrix.runs_on }}
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x86_64
+            runs_on: ubuntu-latest
+            os_name: linux
+            bin_dir: build
+            cmake_args: "-DPLATFORM=LINUX -DCMAKE_BUILD_TYPE=Release"
+            artifact_name: NaikAVPlayer-linux-x64
+            executable_name: NaikAVPlayer
+
+          # Windows is built with the NATIVE MSVC toolchain on a Windows runner
+          # (not MinGW cross-compiled on Ubuntu). MinGW PE binaries trip generic
+          # antivirus heuristics (e.g. Kaspersky VHO:Trojan.Win32.Diztakun.gen);
+          # MSVC output trips far fewer, supports Control Flow Guard, and is the
+          # expected form for a Windows release.
+          - target: windows-x86_64
+            runs_on: windows-latest
+            os_name: windows
+            bin_dir: build/Release
+            cmake_args: "-DPLATFORM=WINDOWS -DCMAKE_BUILD_TYPE=Release"
+            artifact_name: NaikAVPlayer-windows-x64
+            executable_name: NaikAVPlayer.exe
 
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Install Cross-Compiler
+      - name: Install System Dependencies (Linux)
+        if: matrix.os_name == 'linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            ffmpeg \
-            mingw-w64 \
-            ccache
+          sudo apt-get install -y libgtk-3-dev ccache
 
-      - name: Setup Compiler Cache (ccache)
+      - name: Setup Compiler Cache (ccache, Linux)
+        if: matrix.os_name == 'linux'
         uses: hendrikmuhs/ccache-action@v1
         with:
-          key: windows-mingw-ccache
+          key: ${{ matrix.target }}-ccache
 
-      - name: Configure CMake (Cross-Compile for Windows)
-        env:
-          CC: "ccache x86_64-w64-mingw32-gcc"
-          CXX: "ccache x86_64-w64-mingw32-g++"
+      - name: Configure CMake
         run: |
-          cmake -B build-windows \
-            -DPLATFORM=WINDOWS \
-            -DCMAKE_SYSTEM_NAME=Windows \
-            -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc \
-            -DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-g++ \
-            -DTREAT_WARNINGS_AS_ERRORS=ON \
-            -DCMAKE_BUILD_TYPE=Release
+          if [ "${{ matrix.os_name }}" = "linux" ]; then
+            CC="ccache gcc" CXX="ccache g++" \
+              cmake -B build ${{ matrix.cmake_args }} -DTREAT_WARNINGS_AS_ERRORS=ON
+          else
+            # No CC/CXX override: CMake selects the default Visual Studio
+            # generator + MSVC toolchain on the Windows runner.
+            cmake -B build ${{ matrix.cmake_args }} -DTREAT_WARNINGS_AS_ERRORS=ON
+          fi
 
-      - name: Build (Cross-Compile for Windows)
+      - name: Build
         run: |
-          cmake --build build-windows --config Release -j$(nproc)
+          cmake --build build --config Release --parallel
 
-      - name: Diagnostic Logging
-        if: always()
+      - name: Validate Binary
         run: |
-          echo "=== Diagnostic Log ==="
-          echo "Current working directory: $(pwd)"
-          echo "Executable output locations:"
-          ls -la build-windows/NaikAVPlayer.exe 2>/dev/null || echo "Windows Executable not found"
-          echo "Files in workspace:"
-          find . -maxdepth 3 -not -path '*/.*' -not -path './build*' -not -path './thirdparty*'
+          BIN="${{ matrix.bin_dir }}/${{ matrix.executable_name }}"
+          if [ ! -f "$BIN" ]; then
+            echo "::error:: Expected binary not found at $BIN"
+            exit 1
+          fi
+          if [ "${{ matrix.os_name }}" = "linux" ]; then
+            echo "Running ldd on native binary..."
+            ldd "$BIN" || true
+            echo "Checking RELRO/BIND_NOW hardening..."
+            readelf -d "$BIN" | grep -E 'BIND_NOW|FLAGS' || true
+          else
+            echo "Windows binary present:"
+            ls -la "$BIN"
+            file "$BIN" || true
+          fi
+
+      - name: Assemble Release Package
+        run: |
+          BIN_DIR="${{ matrix.bin_dir }}"
+          mkdir -p package/licenses
+          mkdir -p package/lib
+          mkdir -p package/assets
+
+          # Copy Binary
+          cp "$BIN_DIR/${{ matrix.executable_name }}" package/
+
+          # Copy Assets
+          cp -r assets/* package/assets/
+
+          # Copy Documentation
+          cp README.md package/
+          if [ -f "help.md" ]; then cp help.md package/; fi
+          if [ -f "HELP.md" ]; then cp HELP.md package/; fi
+
+          # Copy Project LICENSE
+          cp LICENSE package/
+
+          # Copy licenses/ directory and third-party license files
+          if [ -d "licenses" ]; then
+            cp -r licenses/* package/licenses/
+          fi
+          cp LICENSE package/licenses/
+          if [ -f "thirdparty/ffmpeg/LICENSE.txt" ]; then
+            cp thirdparty/ffmpeg/LICENSE.txt package/licenses/FFMPEG_LICENSE.txt
+          fi
+
+          # Ensure case-insensitive compatibility (both licenses/ and LICENSES/)
+          if [ ! -d "package/LICENSES" ]; then
+            cp -r package/licenses package/LICENSES
+          fi
+
+          # Copy runtime libraries. The CMake POST_BUILD step already places the
+          # FFmpeg + SDL3 shared libs next to the freshly built binary.
+          if [ "${{ matrix.os_name }}" = "windows" ]; then
+            # MSVC build uses the static CRT (/MT), so NO MinGW libwinpthread and
+            # NO VC++ redistributable are required - only the third-party DLLs.
+            cp "$BIN_DIR"/*.dll package/ 2>/dev/null || true
+          else
+            cp "$BIN_DIR"/lib/*.so* package/lib/ 2>/dev/null || true
+          fi
+
+      - name: Verify Package Compliance
+        run: |
+          echo "Verifying release package contents..."
+
+          if [ ! -f "package/${{ matrix.executable_name }}" ]; then
+            echo "::error:: Package compliance check failed: Executable package/${{ matrix.executable_name }} is missing!"
+            exit 1
+          fi
+          if [ ! -f "package/LICENSE" ]; then
+            echo "::error:: Package compliance check failed: Project LICENSE is missing!"
+            exit 1
+          fi
+          if [ ! -f "package/README.md" ] && [ ! -f "package/README" ]; then
+            echo "::error:: Package compliance check failed: README is missing!"
+            exit 1
+          fi
+          if [ ! -f "package/help.md" ] && [ ! -f "package/HELP.md" ]; then
+            echo "::error:: Package compliance check failed: help.md / HELP.md documentation is missing!"
+            exit 1
+          fi
+          if [ ! -d "package/licenses" ] || [ -z "$(ls -A package/licenses)" ]; then
+            echo "::error:: Package compliance check failed: licenses/ directory is missing or empty!"
+            exit 1
+          fi
+          if [ ! -d "package/LICENSES" ] || [ -z "$(ls -A package/LICENSES)" ]; then
+            echo "::error:: Package compliance check failed: LICENSES/ directory is missing or empty!"
+            exit 1
+          fi
+
+          echo "Release package verification passed successfully! Contents:"
+          ls -la package/
+          echo "Package licenses folder:"
+          ls -la package/licenses/
+
+      - name: Upload Artifact (Windows Only)
+        # Note: Linux release binary uploading is temporarily disabled due to binary compatibility issues
+        # (glibc and system runtime library version differences across older vs newer Linux distributions).
+        # Linux users are instructed to build from source on their target system until a portable packaging
+        # pipeline (e.g. AppImage or containerized build using an older GLIBC baseline) is implemented.
+        if: startsWith(github.ref, 'refs/heads/release') && matrix.os_name == 'windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: package/
+          if-no-files-found: error
+

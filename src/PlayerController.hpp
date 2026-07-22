@@ -131,6 +131,7 @@ public:
     int getVideoHeight() const;
     std::string getVideoCodecName() const;
     std::string getVideoPixelFormat() const;
+    ColorPipelineInfo getColorInfo() const;
     bool isVideoHardware() const;
     bool isSeeking() const;
     bool isCatchingUp() const { return m_catchupMode.load() != SeekCatchupMode::NONE; }

@@ -5,6 +5,11 @@ project(NaikAVPlayer C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Static MSVC runtime (/MT) so the Windows .exe is self-contained and needs
+# no Visual C++ Redistributable install. Requires CMP0091 (CMake >= 3.15).
+cmake_policy(SET CMP0091 NEW)
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
 # -------------------------------------------------------------
 # Platform Configuration
 # -------------------------------------------------------------
@@ -48,13 +53,23 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     )
 elseif(MSVC)
     # MSVC uses its own security flags instead of GCC/Clang warnings
-    add_compile_options(/GS)
+    add_compile_options(/GS /guard:cf)
 endif()
 if(TARGET_PLATFORM_WINDOWS)
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-        add_link_options(-Wl,--dynamicbase -Wl,--nxcompat)
+        # --high-entropy-va gives full 64-bit ASLR (MinGW omits it by default).
+        add_link_options("-Wl,--dynamicbase" "-Wl,--nxcompat" "-Wl,--high-entropy-va")
     elseif(MSVC)
-        add_link_options(/DYNAMICBASE /NXCOMPAT)
+        # /GUARD:CF = Control Flow Guard. /HIGHENTROPYVA is default on x64 but
+        # stated explicitly. /MANIFEST:NO lets the RT_MANIFEST from resource.rc
+        # be authoritative instead of the linker autogenerating a second one.
+        add_link_options(/DYNAMICBASE /NXCOMPAT /GUARD:CF /HIGHENTROPYVA /MANIFEST:NO)
+    endif()
+elseif(TARGET_PLATFORM_LINUX)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        # Full RELRO + BIND_NOW: the GOT is remapped read-only after relocation,
+        # closing GOT-overwrite attack vectors.
+        add_link_options("-Wl,-z,relro" "-Wl,-z,now")
     endif()
 endif()
 
@@ -144,15 +159,25 @@ set(SDL_POWER OFF CACHE BOOL "" FORCE)
 set(SDL_HIDAPI OFF CACHE BOOL "" FORCE)
 set(SDL_LOCALE OFF CACHE BOOL "" FORCE)
 set(SDL_MISC OFF CACHE BOOL "" FORCE)
+set(SDL_X11_XSCRNSAVER OFF CACHE BOOL "" FORCE)
 
 message(STATUS "Fetching SDL3...")
 FetchContent_Declare(
     SDL3
     GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
-    GIT_TAG release-3.4.0
+    GIT_TAG a962f40bbba175e9716557a25d5d7965f134a3d3  # release-3.4.0
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(SDL3)
+
+# Link libssp (Stack Smashing Protector) to SDL3-shared on Windows MinGW/Clang builds
+if(TARGET_PLATFORM_WINDOWS)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        if(TARGET SDL3-shared)
+            target_link_libraries(SDL3-shared PRIVATE ssp)
+        endif()
+    endif()
+endif()
 
 # -------------------------------------------------------------
 # Fetch Dear ImGui
@@ -161,7 +186,7 @@ message(STATUS "Fetching Dear ImGui...")
 FetchContent_Declare(
     imgui
     GIT_REPOSITORY https://github.com/ocornut/imgui.git
-    GIT_TAG v1.91.9
+    GIT_TAG 97428e8ac99e339ce05eee531cf55b77b29ea709  # v1.91.9
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(imgui)
@@ -192,55 +217,105 @@ set(NFD_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
     nativefiledialog-extended
     GIT_REPOSITORY https://github.com/btzy/nativefiledialog-extended.git
-    GIT_TAG        v1.2.1
+    GIT_TAG        86d5f2005fe1c00747348a12070fec493ea2407e  # v1.2.1
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(nativefiledialog-extended)
 
 
 # -------------------------------------------------------------
-# Configure FFmpeg (Download automatically if missing on Windows)
+# Configure FFmpeg
 # -------------------------------------------------------------
-if(TARGET_PLATFORM_WINDOWS)
-    set(FFMPEG_DIR "${CMAKE_SOURCE_DIR}/thirdparty/ffmpeg")
+# Two sources are supported:
+#
+#   1. SYSTEM (via pkg-config) - REQUIRED on Linux ARM64 (Raspberry Pi).
+#      The distro package (e.g. Raspberry Pi OS's libavcodec-dev) is built
+#      against the running kernel's headers and validated against the Pi's
+#      bcm2835-codec V4L2 M2M driver. BtbN's generic linuxarm64 build
+#      programs V4L2 buffer formats that the Pi driver does not accept the
+#      same way, causing hardware-decoded playback to hang inside a blocking
+#      VIDIOC_DQBUF / poll() in kernel-space. Do NOT bundle BtbN FFmpeg on
+#      ARM64 Linux.
+#
+#   2. BUNDLED (auto-downloaded from BtbN) - used on Windows and Linux x86_64,
+#      where V4L2 M2M is not the primary hardware acceleration path.
+#
+# Advanced override: -DNAIKAV_FORCE_BUNDLED_FFMPEG=ON forces the bundled
+# path even on ARM64 (only useful on non-Pi aarch64 boards where V4L2 M2M
+# isn't in play - do NOT set this on a Raspberry Pi).
 
-    if(NOT EXISTS "${FFMPEG_DIR}/include/libavcodec/avcodec.h" OR NOT EXISTS "${FFMPEG_DIR}/lib/avcodec.lib")
-        message(STATUS "FFmpeg headers/libraries not found in thirdparty/ffmpeg. Setting up automatically...")
-        
-        # NOTE: Dated BtbN release tags (autobuild-YYYY-MM-DD-HH-MM) do NOT use the
-        # "ffmpeg-master-latest-*" filename pattern - that pattern only exists under
-        # the floating "latest" tag. Dated tags publish git-describe-style names
-        # instead (e.g. ffmpeg-n8.1.2-21-gce3c09c101-win64-lgpl-shared-8.1.zip).
-        #
-        # BtbN retains dated tags for ~14 daily builds, but keeps the LAST build of
-        # each calendar month for ~2 years. This pin deliberately uses a month-end
-        # tag (2026-06-30) rather than a daily one, so it survives far longer before
-        # needing to be re-pinned. When it does need updating, use
-        # update_ffmpeg_pin.py --tag <new-month-end-tag> to get a fresh, verified
-        # URL + hash rather than editing this by hand.
-        #
-        # This URL also pins the FFmpeg 8.1 release branch (via the "-8.1" variant),
-        # so it won't silently drift to a different FFmpeg version either.
-        set(FFMPEG_ZIP_URL "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-06-30-13-34/ffmpeg-n8.1.2-21-gce3c09c101-win64-lgpl-shared-8.1.zip")
-        set(FFMPEG_ZIP_PATH "${CMAKE_BINARY_DIR}/ffmpeg_download.zip")
+option(NAIKAV_FORCE_BUNDLED_FFMPEG
+    "Force auto-download of BtbN FFmpeg even on ARM64 Linux (breaks V4L2 M2M on Raspberry Pi)"
+    OFF)
+
+set(FFMPEG_USE_SYSTEM OFF)
+if(TARGET_PLATFORM_LINUX
+   AND CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64"
+   AND NOT NAIKAV_FORCE_BUNDLED_FFMPEG)
+    set(FFMPEG_USE_SYSTEM ON)
+endif()
+
+set(FFMPEG_DIR "${CMAKE_SOURCE_DIR}/thirdparty/ffmpeg")
+
+if(FFMPEG_USE_SYSTEM)
+    message(STATUS "Linux ARM64 detected: using system FFmpeg via pkg-config "
+                   "(required for Raspberry Pi V4L2 M2M hardware decoding).")
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
+        libavcodec
+        libavformat
+        libavutil
+        libswscale
+        libswresample)
+    message(STATUS "  libavcodec version:    ${FFMPEG_libavcodec_VERSION}")
+    message(STATUS "  libavformat version:   ${FFMPEG_libavformat_VERSION}")
+    message(STATUS "  libavutil version:     ${FFMPEG_libavutil_VERSION}")
+    message(STATUS "  libswscale version:    ${FFMPEG_libswscale_VERSION}")
+    message(STATUS "  libswresample version: ${FFMPEG_libswresample_VERSION}")
+else()
+    # ---------- Bundled FFmpeg (Windows / Linux x86_64) ----------
+    # Determine if we need to download FFmpeg
+    set(FFMPEG_NEEDS_DOWNLOAD OFF)
+    if(NOT EXISTS "${FFMPEG_DIR}/include/libavcodec/avcodec.h")
+        set(FFMPEG_NEEDS_DOWNLOAD ON)
+    elseif(TARGET_PLATFORM_WINDOWS AND NOT EXISTS "${FFMPEG_DIR}/lib/avcodec.lib")
+        set(FFMPEG_NEEDS_DOWNLOAD ON)
+    elseif(TARGET_PLATFORM_LINUX AND NOT EXISTS "${FFMPEG_DIR}/lib/libavcodec.so")
+        set(FFMPEG_NEEDS_DOWNLOAD ON)
+    endif()
+
+    if(FFMPEG_NEEDS_DOWNLOAD)
+        message(STATUS "FFmpeg headers/libraries not found in thirdparty/ffmpeg for this platform. Setting up automatically...")
+
+        set(FFMPEG_BASE_URL "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-06-30-13-34")
+
+        if(TARGET_PLATFORM_WINDOWS)
+            set(FFMPEG_FILENAME "ffmpeg-n8.1.2-21-gce3c09c101-win64-lgpl-shared-8.1.zip")
+            set(FFMPEG_SHA256 "27bcaf58b5140171dfe838a0b365d12c60607d71fc168424456410bad6a834da")
+        elseif(TARGET_PLATFORM_LINUX)
+            if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64")
+                # Only reachable when NAIKAV_FORCE_BUNDLED_FFMPEG=ON (advanced override).
+                set(FFMPEG_FILENAME "ffmpeg-n8.1.2-21-gce3c09c101-linuxarm64-lgpl-shared-8.1.tar.xz")
+                set(FFMPEG_SHA256 "08a9639de779e0d024af5190ad4d0463c6c91b42ba79f00a51359fb4645e8ce7")
+            else()
+                set(FFMPEG_FILENAME "ffmpeg-n8.1.2-21-gce3c09c101-linux64-lgpl-shared-8.1.tar.xz")
+                set(FFMPEG_SHA256 "bc60572d89533c7987e7cfbb654eba4d35122a77885c6938483dd7ef8219cde9")
+            endif()
+        endif()
+
+        set(FFMPEG_ARCHIVE_URL "${FFMPEG_BASE_URL}/${FFMPEG_FILENAME}")
+        set(FFMPEG_ARCHIVE_PATH "${CMAKE_BINARY_DIR}/${FFMPEG_FILENAME}")
         set(FFMPEG_EXTRACT_DIR "${CMAKE_BINARY_DIR}/ffmpeg_extracted")
 
-        # Verified against the release's checksums.sha256 asset on 2026-07-18.
-        # If you bump FFMPEG_ZIP_URL to a newer release/version, re-derive this
-        # from that release's checksums.sha256 (or set it blank to skip
-        # verification, with a build-time warning).
-        set(FFMPEG_ZIP_SHA256 "27bcaf58b5140171dfe838a0b365d12c60607d71fc168424456410bad6a834da" CACHE STRING "Expected SHA256 of the pinned FFmpeg zip (see GitHub release assets page)")
-
-        message(STATUS "Downloading FFmpeg shared binaries from ${FFMPEG_ZIP_URL}...")
-        if(FFMPEG_ZIP_SHA256)
-            file(DOWNLOAD "${FFMPEG_ZIP_URL}" "${FFMPEG_ZIP_PATH}"
+        message(STATUS "Downloading FFmpeg shared binaries from ${FFMPEG_ARCHIVE_URL}...")
+        if(FFMPEG_SHA256)
+            file(DOWNLOAD "${FFMPEG_ARCHIVE_URL}" "${FFMPEG_ARCHIVE_PATH}"
                  SHOW_PROGRESS
-                 EXPECTED_HASH SHA256=${FFMPEG_ZIP_SHA256}
+                 EXPECTED_HASH SHA256=${FFMPEG_SHA256}
                  STATUS download_status)
         else()
-            message(WARNING "FFMPEG_ZIP_SHA256 is not set - downloaded FFmpeg archive will not be checksum-verified. "
-                             "Set -DFFMPEG_ZIP_SHA256=<hash> (from the release's assets page) for reproducible, verified builds.")
-            file(DOWNLOAD "${FFMPEG_ZIP_URL}" "${FFMPEG_ZIP_PATH}"
+            message(WARNING "FFMPEG_SHA256 is not set for ${FFMPEG_FILENAME} - downloaded FFmpeg archive will not be checksum-verified.")
+            file(DOWNLOAD "${FFMPEG_ARCHIVE_URL}" "${FFMPEG_ARCHIVE_PATH}"
                  SHOW_PROGRESS
                  STATUS download_status)
         endif()
@@ -252,7 +327,7 @@ if(TARGET_PLATFORM_WINDOWS)
         endif()
 
         message(STATUS "Extracting FFmpeg package...")
-        file(ARCHIVE_EXTRACT INPUT "${FFMPEG_ZIP_PATH}" DESTINATION "${FFMPEG_EXTRACT_DIR}")
+        file(ARCHIVE_EXTRACT INPUT "${FFMPEG_ARCHIVE_PATH}" DESTINATION "${FFMPEG_EXTRACT_DIR}")
 
         # Find the extracted folder name
         file(GLOB EXTRACTED_FOLDERS "${FFMPEG_EXTRACT_DIR}/ffmpeg-*")
@@ -265,11 +340,17 @@ if(TARGET_PLATFORM_WINDOWS)
         message(STATUS "Installing FFmpeg to thirdparty/ffmpeg...")
         file(REMOVE_RECURSE "${FFMPEG_DIR}") # Clear clean install
         file(MAKE_DIRECTORY "${FFMPEG_DIR}")
-        
-        file(COPY "${FFMPEG_SRC_DIR}/bin" DESTINATION "${FFMPEG_DIR}")
-        file(COPY "${FFMPEG_SRC_DIR}/include" DESTINATION "${FFMPEG_DIR}")
-        file(COPY "${FFMPEG_SRC_DIR}/lib" DESTINATION "${FFMPEG_DIR}")
-        
+
+        if(EXISTS "${FFMPEG_SRC_DIR}/bin")
+            file(COPY "${FFMPEG_SRC_DIR}/bin" DESTINATION "${FFMPEG_DIR}")
+        endif()
+        if(EXISTS "${FFMPEG_SRC_DIR}/include")
+            file(COPY "${FFMPEG_SRC_DIR}/include" DESTINATION "${FFMPEG_DIR}")
+        endif()
+        if(EXISTS "${FFMPEG_SRC_DIR}/lib")
+            file(COPY "${FFMPEG_SRC_DIR}/lib" DESTINATION "${FFMPEG_DIR}")
+        endif()
+
         # Copy LICENSE and README if present
         if(EXISTS "${FFMPEG_SRC_DIR}/LICENSE.txt")
             file(COPY "${FFMPEG_SRC_DIR}/LICENSE.txt" DESTINATION "${FFMPEG_DIR}")
@@ -278,13 +359,11 @@ if(TARGET_PLATFORM_WINDOWS)
             file(COPY "${FFMPEG_SRC_DIR}/README.txt" DESTINATION "${FFMPEG_DIR}")
         endif()
 
-        file(REMOVE "${FFMPEG_ZIP_PATH}")
+        file(REMOVE "${FFMPEG_ARCHIVE_PATH}")
         file(REMOVE_RECURSE "${FFMPEG_EXTRACT_DIR}")
         message(STATUS "FFmpeg setup complete!")
     endif()
 
-    include_directories(SYSTEM "${FFMPEG_DIR}/include")
-    link_directories("${FFMPEG_DIR}/lib")
 endif()
 
 # -------------------------------------------------------------
@@ -298,27 +377,41 @@ set(PLAYER_LOGIC_SOURCES
     src/AudioDecoder.cpp
 )
 
+set(WINDOWS_RESOURCE_FILE "")
+if(TARGET_PLATFORM_WINDOWS)
+    set(WINDOWS_RESOURCE_FILE src/resource.rc)
+endif()
+
 add_executable(NaikAVPlayer 
     src/main.cpp 
     src/PlayerUI.cpp
     ${PLAYER_LOGIC_SOURCES}
+    ${WINDOWS_RESOURCE_FILE}
 )
 
 # Link libraries to our executable
 target_link_libraries(NaikAVPlayer PRIVATE
     imgui
     SDL3::SDL3-shared
-    avcodec
-    avformat
-    avutil
-    swscale
-    swresample
     nfd
 )
+if(FFMPEG_USE_SYSTEM)
+    target_link_libraries(NaikAVPlayer PRIVATE PkgConfig::FFMPEG)
+else()
+    target_include_directories(NaikAVPlayer SYSTEM PRIVATE "${FFMPEG_DIR}/include")
+    target_link_directories(NaikAVPlayer PRIVATE "${FFMPEG_DIR}/lib")
+    target_link_libraries(NaikAVPlayer PRIVATE
+        avcodec
+        avformat
+        avutil
+        swscale
+        swresample
+    )
+endif()
 
-# Ensure standard Win32 subsystems link correctly for MinGW only
-if(TARGET_PLATFORM_WINDOWS AND CMAKE_CXX_COMPILER_ID MATCHES "GNU")
-    target_link_libraries(NaikAVPlayer PRIVATE mingw32)
+if(TARGET_PLATFORM_WINDOWS AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_link_options(NaikAVPlayer PRIVATE -static-libgcc -static-libstdc++)
+    set_target_properties(NaikAVPlayer PROPERTIES WIN32_EXECUTABLE TRUE)
 endif()
 
 # Link Linux specific libraries
@@ -329,29 +422,53 @@ endif()
 # Apply compiler warning flags to main application target
 target_compile_options(NaikAVPlayer PRIVATE ${PROJECT_WARNING_FLAGS})
 
-# Copy FFmpeg and SDL DLLs to executable output directory so it runs smoothly on Windows
-if(TARGET_PLATFORM_WINDOWS)
-    add_custom_command(TARGET NaikAVPlayer POST_BUILD
+# Helper function to configure target RPATH and copy runtime dependencies
+function(setup_target_dependencies TARGET_NAME)
+    if(TARGET_PLATFORM_WINDOWS)
+        add_custom_command(TARGET ${TARGET_NAME} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_directory
+                "${FFMPEG_DIR}/bin"
+                $<TARGET_FILE_DIR:${TARGET_NAME}>
+            COMMENT "Copying FFmpeg DLLs for ${TARGET_NAME}..."
+        )
+
+        add_custom_command(TARGET ${TARGET_NAME} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy
+                $<TARGET_FILE:SDL3::SDL3-shared>
+                $<TARGET_FILE_DIR:${TARGET_NAME}>
+            COMMENT "Copying SDL3.dll for ${TARGET_NAME}..."
+        )
+    elseif(TARGET_PLATFORM_LINUX)
+        set_target_properties(${TARGET_NAME} PROPERTIES
+            BUILD_RPATH "$ORIGIN/lib"
+            INSTALL_RPATH "$ORIGIN/lib"
+        )
+        add_custom_command(TARGET ${TARGET_NAME} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:${TARGET_NAME}>/lib
+            COMMAND ${CMAKE_COMMAND} -E copy
+                $<TARGET_FILE:SDL3::SDL3-shared>
+                $<TARGET_FILE_DIR:${TARGET_NAME}>/lib
+            COMMENT "Copying SDL3 .so to lib/ directory for ${TARGET_NAME}..."
+        )
+        if(NOT FFMPEG_USE_SYSTEM)
+            add_custom_command(TARGET ${TARGET_NAME} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_directory
+                    "${FFMPEG_DIR}/lib"
+                    $<TARGET_FILE_DIR:${TARGET_NAME}>/lib
+                COMMENT "Copying FFmpeg .so files to lib/ directory for ${TARGET_NAME}..."
+            )
+        endif()
+    endif()
+
+    add_custom_command(TARGET ${TARGET_NAME} POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_directory
-            "${FFMPEG_DIR}/bin"
-            $<TARGET_FILE_DIR:NaikAVPlayer>
-        COMMENT "Copying FFmpeg DLLs to output directory..."
+            "${CMAKE_SOURCE_DIR}/assets/fonts"
+            "$<TARGET_FILE_DIR:${TARGET_NAME}>/assets/fonts"
+        COMMENT "Copying Noto Sans fonts for ${TARGET_NAME}..."
     )
+endfunction()
 
-    add_custom_command(TARGET NaikAVPlayer POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy
-            $<TARGET_FILE:SDL3::SDL3-shared>
-            $<TARGET_FILE_DIR:NaikAVPlayer>
-        COMMENT "Copying SDL3.dll to output directory..."
-    )
-endif()
-
-add_custom_command(TARGET NaikAVPlayer POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_directory
-        "${CMAKE_SOURCE_DIR}/assets/fonts"
-        "$<TARGET_FILE_DIR:NaikAVPlayer>/assets/fonts"
-    COMMENT "Copying Noto Sans fonts to output directory..."
-)
+setup_target_dependencies(NaikAVPlayer)
 
 # -------------------------------------------------------------
 # Test Target
@@ -362,18 +479,8 @@ add_executable(NaikAVPlayer_tests
 
 option(ENABLE_COVERAGE "Enable code coverage instrumentation" ON)
 
-# GCC's gcov (--coverage) counters are incremented non-atomically, so any
-# instrumented function reached concurrently from multiple threads (e.g.
-# std::atomic<bool>::load, used by VideoDecoder::isSeeking()/Demuxer's
-# worker thread) trips ThreadSanitizer on the counter itself rather than on
-# real application state. Coverage and TSan are therefore mutually
-# exclusive here, same as ENABLE_SANITIZERS/ENABLE_TSAN above.
 if(ENABLE_COVERAGE AND NOT ENABLE_TSAN)
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-        # Enable GCC/Clang code coverage flags for tests
-        # Tests are always -O0 (coverage accuracy); glibc's _FORTIFY_SOURCE emits a
-        # #warning without optimization, which -Werror escalates. Undefine it here -
-        # this target-level flag comes after the global -D and takes precedence.
         target_compile_options(NaikAVPlayer_tests PRIVATE --coverage -O0 -g -U_FORTIFY_SOURCE)
         target_link_options(NaikAVPlayer_tests PRIVATE --coverage)
     elseif(MSVC)
@@ -390,43 +497,33 @@ endif()
 
 target_link_libraries(NaikAVPlayer_tests PRIVATE
     SDL3::SDL3-shared
-    avcodec
-    avformat
-    avutil
-    swscale
-    swresample
 )
+if(FFMPEG_USE_SYSTEM)
+    target_link_libraries(NaikAVPlayer_tests PRIVATE PkgConfig::FFMPEG)
+else()
+    target_include_directories(NaikAVPlayer_tests SYSTEM PRIVATE "${FFMPEG_DIR}/include")
+    target_link_directories(NaikAVPlayer_tests PRIVATE "${FFMPEG_DIR}/lib")
+    target_link_libraries(NaikAVPlayer_tests PRIVATE
+        avcodec
+        avformat
+        avutil
+        swscale
+        swresample
+    )
+endif()
 
 if(TARGET_PLATFORM_LINUX)
     target_link_libraries(NaikAVPlayer_tests PRIVATE pthread dl)
 endif()
 
+if(TARGET_PLATFORM_WINDOWS AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_link_options(NaikAVPlayer_tests PRIVATE -static-libgcc -static-libstdc++)
+endif()
+
 # Apply compiler warning flags to test suite target
 target_compile_options(NaikAVPlayer_tests PRIVATE ${PROJECT_WARNING_FLAGS})
 
-# Copy FFmpeg and SDL DLLs to tests output directory on Windows
-if(TARGET_PLATFORM_WINDOWS)
-    add_custom_command(TARGET NaikAVPlayer_tests POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_directory
-            "${FFMPEG_DIR}/bin"
-            $<TARGET_FILE_DIR:NaikAVPlayer_tests>
-        COMMENT "Copying FFmpeg DLLs to tests output directory..."
-    )
-
-    add_custom_command(TARGET NaikAVPlayer_tests POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy
-            $<TARGET_FILE:SDL3::SDL3-shared>
-            $<TARGET_FILE_DIR:NaikAVPlayer_tests>
-        COMMENT "Copying SDL3.dll to tests output directory..."
-    )
-endif()
-
-add_custom_command(TARGET NaikAVPlayer_tests POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_directory
-        "${CMAKE_SOURCE_DIR}/assets/fonts"
-        "$<TARGET_FILE_DIR:NaikAVPlayer_tests>/assets/fonts"
-    COMMENT "Copying Noto Sans fonts to tests output directory..."
-)
+setup_target_dependencies(NaikAVPlayer_tests)
 
 # -------------------------------------------------------------
 # Install Rules
