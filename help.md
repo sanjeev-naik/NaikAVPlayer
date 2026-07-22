@@ -4,42 +4,89 @@ This document describes how to configure, compile, install, run, profile, and tr
 
 ---
 
-## 1. Prerequisites & Dependencies
+## 1. Linux Binary Compatibility Limitation & Prerequisites
+
+> [!IMPORTANT]
+> **Linux Binary Compatibility Limitation:**
+> Linux executables built in the CI environment (on modern Ubuntu runners) are **not uploaded to official GitHub Release artifacts**. 
+> 
+> Because CI binaries depend on modern C runtime symbol versions (`glibc` requirements such as `GLIBC_2.34`+), C++ standard library runtimes (`libstdc++.so.6`), and dynamic system libraries (e.g., GTK3), binaries compiled in CI may fail to run on older Linux distributions (such as Ubuntu 20.04/22.04 LTS or older Debian/RHEL systems).
+> 
+> **Linux users should build NaikAVPlayer from source directly on their target operating system.** This ensures the resulting binary matches the target environment's local library versions and GLIBC ABI.
+> 
+> **Future Portable Builds Roadmap:**
+> Linux release artifact uploads will be resumed once a portable, universally compatible packaging workflow (such as an older baseline toolchain container build, AppImage bundle, or Flatpak package) is established.
+
+### Host Platform Prerequisites & Toolchain Setup
 
 NaikAVPlayer requires a C++17 compliant compiler and CMake 3.16+.
 
-### Windows (Native MinGW-w64)
-- **CMake (version 3.16+)**: Build system generator.
-- **MinGW-w64 GCC / Clang**: Native Windows compiler toolchain.
-- **FFmpeg**: Bundled prebuilt shared libraries (v8.1 / n8.1.2) automatically downloaded into `thirdparty/ffmpeg/` during CMake configure step.
-- **SDL3, Dear ImGui, nativefiledialog-extended (NFD)**: Automatically downloaded and compiled from source via CMake `FetchContent`.
+#### Linux (Ubuntu / Debian)
+```bash
+sudo apt-get update
+sudo apt-get install -y \
+  build-essential \
+  cmake \
+  pkg-config \
+  libavcodec-dev \
+  libavformat-dev \
+  libavutil-dev \
+  libswscale-dev \
+  libswresample-dev \
+  libgtk-3-dev \
+  libxss-dev \
+  ccache
+```
 
-### Linux (x86_64 / aarch64 / Raspberry Pi)
-- **GCC / Clang**: C++17 compiler.
-- **FFmpeg Development Packages**: `libavcodec-dev`, `libavformat-dev`, `libavutil-dev`, `libswscale-dev`, `libswresample-dev` (required when using system FFmpeg or on ARM64 Linux for V4L2 M2M hardware decoding).
-- **GTK3 Development Headers**: `libgtk-3-dev` (required for native file dialog integration).
-- **SDL3, Dear ImGui, nativefiledialog-extended (NFD)**: Automatically retrieved and built from source via CMake `FetchContent`.
+#### Linux (Fedora / RHEL)
+```bash
+sudo dnf install -y \
+  gcc-c++ \
+  cmake \
+  pkg-config \
+  ffmpeg-free-devel \
+  gtk3-devel \
+  libXScrnSaver-devel \
+  ccache
+```
+
+#### Linux (Arch Linux)
+```bash
+sudo pacman -S --needed \
+  base-devel \
+  cmake \
+  pkgconf \
+  ffmpeg \
+  gtk3 \
+  ccache
+```
+
+#### Windows (Native MinGW-w64 / MSVC)
+- **CMake (version 3.16+)**: Build generator.
+- **MinGW-w64 GCC / Clang / MSVC**: C++17 compiler toolchain.
+- **FFmpeg**: Prebuilt shared libraries are automatically downloaded into `thirdparty/ffmpeg/` during CMake configure.
+- **SDL3, Dear ImGui, nativefiledialog-extended (NFD)**: Automatically fetched and built from source via CMake `FetchContent`.
 
 ---
 
-## 2. Compilation Guide
+## 2. Compilation & Local Cross-Compilation Guide
 
-NaikAVPlayer officially supports two build workflows:
-1. **Development Build (`Debug`)**: Intended for active daily development, debugging with GDB/LLDB, and running unit tests.
-2. **Release Build (`Release`)**: Intended for production packaging, distribution, and official releases.
+NaikAVPlayer supports native builds on your local system as well as local cross-compilation across architectures.
 
 ---
 
-### Workflow 1: Development Build (Recommended for Developers)
+### Workflow 1: Development Build (`Debug`)
+
+Intended for active daily development, debugging with GDB/LLDB, and running unit tests:
 
 ```bash
 # 1. Configure for local development (Debug mode)
 cmake -B build-debug -DCMAKE_BUILD_TYPE=Debug
 
-# 2. Build all development targets (executable & test suite)
+# 2. Build executable & unit test runner
 cmake --build build-debug -j$(nproc)
 
-# 3. Run test suite
+# 3. Run unit tests
 ctest --test-dir build-debug --output-on-failure
 ```
 
@@ -51,14 +98,22 @@ cmake --build build-debug
 
 ---
 
-### Workflow 2: Release Build (Production & Packaging)
+### Workflow 2: Production Release Build (`Release`)
+
+Generates optimized release binaries (`-O3`) configured specifically for your host system:
 
 ```bash
-# 1. Configure for release
-cmake -B build -DCMAKE_BUILD_TYPE=Release
+# 1. Configure for production release
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DPLATFORM=LINUX
 
-# 2. Compile release binaries
+# 2. Compile release binary
 cmake --build build -j$(nproc)
+```
+
+*Windows (MSVC Native):*
+```cmd
+cmake -B build -G "Visual Studio 17 2022" -A x64 -DPLATFORM=WINDOWS
+cmake --build build --config Release
 ```
 
 *Windows (MinGW):*
@@ -69,25 +124,47 @@ cmake --build build
 
 ---
 
-### Platform Configurations & Advanced Options
+### Local Cross-Compilation Guides
 
-- **Raspberry Pi (System FFmpeg)**:
-  ```bash
-  cmake -B build -DPLATFORM=LINUX -DNAIKAV_FORCE_BUNDLED_FFMPEG=OFF
-  cmake --build build -j$(nproc)
-  ```
+#### A. Cross-Compiling for ARM64 / Raspberry Pi (`aarch64-linux-gnu`)
 
-- **Cross-Compile Windows on Linux (MinGW-w64)**:
-  ```bash
-  cmake -B build-windows \
-    -DPLATFORM=WINDOWS \
-    -DCMAKE_SYSTEM_NAME=Windows \
-    -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc \
-    -DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-g++
-  cmake --build build-windows -j$(nproc)
-  ```
+To build binaries for ARM64 target platforms (e.g., Raspberry Pi 4/5) from an x86_64 Linux host machine:
 
-> **Advanced Options**: CMake options like `-DENABLE_SANITIZERS=ON` (ASan/UBSan), `-DENABLE_TSAN=ON` (ThreadSanitizer), `RelWithDebInfo`, and `MinSizeRel` remain supported for specialized static analysis or profiling.
+1. Install cross-compiler on host:
+   ```bash
+   sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+   ```
+2. Configure and cross-compile:
+   ```bash
+   cmake -B build-arm64 \
+     -DCMAKE_SYSTEM_NAME=Linux \
+     -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+     -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
+     -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ \
+     -DPLATFORM=LINUX \
+     -DNAIKAV_FORCE_BUNDLED_FFMPEG=OFF
+   cmake --build build-arm64 -j$(nproc)
+   ```
+
+#### B. Cross-Compiling for Windows on Linux (MinGW-w64)
+
+To build Windows 64-bit executables from a Linux development machine:
+
+1. Install MinGW cross-toolchain:
+   ```bash
+   sudo apt-get install -y mingw-w64
+   ```
+2. Configure and cross-compile:
+   ```bash
+   cmake -B build-windows \
+     -DPLATFORM=WINDOWS \
+     -DCMAKE_SYSTEM_NAME=Windows \
+     -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc \
+     -DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-g++
+   cmake --build build-windows -j$(nproc)
+   ```
+
+> **Advanced Build Options**: Specialized build options such as `-DENABLE_SANITIZERS=ON` (ASan/UBSan), `-DENABLE_TSAN=ON` (ThreadSanitizer), `RelWithDebInfo`, and `MinSizeRel` remain supported across all configurations.
 
 ---
 
@@ -172,7 +249,8 @@ GitHub Actions workflows ([ci.yml](.github/workflows/ci.yml)) perform:
 - **Warning Enforcement**: Builds are compiled with `-Werror` (`-DTREAT_WARNINGS_AS_ERRORS=ON`).
 - **Sanitizers**: ASan, UBSan, and TSan automated test runs.
 - **Cross-Compilation**: MinGW cross-compilation testing.
-- **Package Verification**: Automated `Verify Package Compliance` step asserts presence of executable, dynamic libraries, `LICENSE`, `README.md`, and non-empty `licenses/` / `LICENSES/` directories before uploading release artifacts.
+- **Package Verification**: Automated `Verify Package Compliance` step asserts presence of executable, dynamic libraries, `LICENSE`, `README.md`, and non-empty `licenses/` / `LICENSES/` directories.
+- **Release Artifact Publishing**: Publishes Windows release packages (`NaikAVPlayer-windows-x64`). Linux release artifact uploads are currently suspended until a portable build strategy is implemented.
 
 ---
 

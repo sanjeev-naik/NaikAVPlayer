@@ -368,10 +368,15 @@ jobs:
           echo "Package licenses folder:"
           ls -la package/licenses/
 
-      - name: Upload Artifact
-        if: startsWith(github.ref, 'refs/heads/release')
+      - name: Upload Artifact (Windows Only)
+        # Note: Linux release binary uploading is temporarily disabled due to binary compatibility issues
+        # (glibc and system runtime library version differences across older vs newer Linux distributions).
+        # Linux users are instructed to build from source on their target system until a portable packaging
+        # pipeline (e.g. AppImage or containerized build using an older GLIBC baseline) is implemented.
+        if: startsWith(github.ref, 'refs/heads/release') && matrix.os_name == 'windows'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact_name }}
           path: package/
           if-no-files-found: error
+
