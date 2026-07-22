@@ -3,6 +3,7 @@ name: CI/CD Pipeline
 on:
   push:
     branches: [ "**" ]
+    tags: [ "v*" ]
   pull_request:
     branches: [ "**" ]
 
@@ -22,18 +23,37 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            libsdl2-dev \
+            libavcodec-dev \
+            libavformat-dev \
+            libavutil-dev \
+            libswscale-dev \
+            libswresample-dev \
             libgtk-3-dev \
             ccache \
             cppcheck \
             lcov
+
+      - name: Verify Documentation & License Repository Integrity
+        run: |
+          echo "Verifying presence of critical repository documentation and licenses..."
+          for file in README.md help.md LICENSE; do
+            if [ ! -f "$file" ]; then
+              echo "::error:: Required repository file '$file' is missing!"
+              exit 1
+            fi
+          done
+          if [ ! -d "licenses" ] || [ -z "$(ls -A licenses)" ]; then
+            echo "::error:: Source 'licenses/' directory is missing or empty!"
+            exit 1
+          fi
+          echo "Repository file integrity check passed."
 
       - name: Setup Compiler Cache (ccache)
         uses: hendrikmuhs/ccache-action@v1
         with:
           key: linux-gcc-ccache
 
-      - name: Configure CMake (Native Linux)
+      - name: Configure CMake (Native Linux Release)
         env:
           CC: "ccache gcc"
           CXX: "ccache g++"
@@ -43,14 +63,13 @@ jobs:
             -DTREAT_WARNINGS_AS_ERRORS=ON \
             -DPLATFORM=LINUX
 
-      - name: Build (Native Linux)
+      - name: Build (Native Linux Release)
         run: |
           cmake --build build-linux --config Release -j$(nproc)
 
-      - name: Run Tests (Native Linux)
+      - name: Run Tests (Native Linux Release)
         run: |
-          cd build-linux
-          ctest -T Test --output-on-failure
+          ctest --test-dir build-linux --output-on-failure
 
       - name: Capture and Filter Coverage
         run: |
@@ -75,7 +94,7 @@ jobs:
             --xml-version=2 \
             src/ tests/ 2> cppcheck_report.xml
 
-      - name: Configure CMake with Sanitizers (ASan/UBSan)
+      - name: Configure CMake with Sanitizers (ASan/UBSan Debug)
         env:
           CC: "ccache gcc"
           CXX: "ccache g++"
@@ -85,19 +104,18 @@ jobs:
             -DENABLE_SANITIZERS=ON \
             -DPLATFORM=LINUX
 
-      - name: Build with Sanitizers (ASan/UBSan)
+      - name: Build with Sanitizers (ASan/UBSan Debug)
         run: |
           cmake --build build-sanitizers --config Debug -j$(nproc)
 
-      - name: Run Tests with Sanitizers
+      - name: Run Tests with Sanitizers (ASan/UBSan)
         env:
           ASAN_OPTIONS: detect_leaks=1
           LSAN_OPTIONS: suppressions=${{ github.workspace }}/tests/lsan.supp
         run: |
-          cd build-sanitizers
-          ctest -T Test --output-on-failure
+          ctest --test-dir build-sanitizers --output-on-failure
 
-      - name: Configure CMake with ThreadSanitizer (TSan)
+      - name: Configure CMake with ThreadSanitizer (TSan Debug)
         env:
           CC: "ccache gcc"
           CXX: "ccache g++"
@@ -107,7 +125,7 @@ jobs:
             -DENABLE_TSAN=ON \
             -DPLATFORM=LINUX
 
-      - name: Build with ThreadSanitizer (TSan)
+      - name: Build with ThreadSanitizer (TSan Debug)
         run: |
           cmake --build build-tsan --config Debug -j$(nproc)
 
@@ -115,8 +133,17 @@ jobs:
         env:
           TSAN_OPTIONS: "halt_on_error=1 history_size=7 suppressions=${{ github.workspace }}/tests/tsan.supp"
         run: |
-          cd build-tsan
-          ctest -T Test --output-on-failure
+          ctest --test-dir build-tsan --output-on-failure
+
+      - name: Configure & Build RelWithDebInfo Check
+        env:
+          CC: "ccache gcc"
+          CXX: "ccache g++"
+        run: |
+          cmake -B build-reldeb \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DPLATFORM=LINUX
+          cmake --build build-reldeb --config RelWithDebInfo -j$(nproc)
 
       - name: Generate XLS Test Report
         if: always()
@@ -185,7 +212,7 @@ jobs:
             os_name: linux
             cc: ccache gcc
             cxx: ccache g++
-            apt_packages: "libsdl2-dev libgtk-3-dev ccache"
+            apt_packages: "libgtk-3-dev ccache"
             cmake_args: "-DPLATFORM=LINUX -DCMAKE_BUILD_TYPE=Release"
             artifact_name: NaikAVPlayer-linux-x64
             executable_name: NaikAVPlayer
@@ -226,20 +253,19 @@ jobs:
         run: |
           cmake --build build --config Release -j$(nproc)
 
-      - name: Validate Linux Binaries (ldd/readelf)
-        if: matrix.os_name == 'linux'
+      - name: Validate Binaries (ldd / readelf)
         run: |
           if [ "${{ matrix.is_native }}" = "true" ]; then
             echo "Running ldd on native binary..."
             ldd build/${{ matrix.executable_name }}
           else
-            echo "Running readelf on cross-compiled binary..."
-            aarch64-linux-gnu-readelf -d build/${{ matrix.executable_name }}
+            echo "Running readelf on binary..."
+            readelf -d build/${{ matrix.executable_name }}
           fi
 
       - name: Assemble Release Package
         run: |
-          mkdir -p package/LICENSES
+          mkdir -p package/licenses
           mkdir -p package/lib
           mkdir -p package/assets
           
@@ -249,22 +275,79 @@ jobs:
           # Copy Assets
           cp -r assets/* package/assets/
           
-          # Copy README
+          # Copy Documentation
           cp README.md package/
+          if [ -f "help.md" ]; then cp help.md package/; fi
+          if [ -f "HELP.md" ]; then cp HELP.md package/; fi
           
-          # Copy Licenses
-          cp LICENSE package/LICENSES/
-          if [ -f "thirdparty/ffmpeg/LICENSE.txt" ]; then
-            cp thirdparty/ffmpeg/LICENSE.txt package/LICENSES/FFMPEG_LICENSE.txt
+          # Copy Project LICENSE
+          cp LICENSE package/
+          
+          # Copy licenses/ directory and third-party license files
+          if [ -d "licenses" ]; then
+            cp -r licenses/* package/licenses/
           fi
+          cp LICENSE package/licenses/
+          if [ -f "thirdparty/ffmpeg/LICENSE.txt" ]; then
+            cp thirdparty/ffmpeg/LICENSE.txt package/licenses/FFMPEG_LICENSE.txt
+          fi
+
+          # Ensure case-insensitive compatibility (both licenses/ and LICENSES/)
+          cp -r package/licenses package/LICENSES
           
           # Copy Libraries
           if [ "${{ matrix.os_name }}" = "windows" ]; then
             cp build/*.dll package/ 2>/dev/null || true
             cp build/bin/*.dll package/ 2>/dev/null || true
+            find /usr/x86_64-w64-mingw32 /usr/lib/gcc/x86_64-w64-mingw32 -name "*.dll" -exec cp {} package/ \; 2>/dev/null || true
           else
             cp build/lib/*.so* package/lib/ 2>/dev/null || true
           fi
+
+      - name: Verify Package Compliance
+        run: |
+          echo "Verifying release package contents..."
+
+          # 1. Executable check
+          if [ ! -f "package/${{ matrix.executable_name }}" ]; then
+            echo "::error:: Package compliance check failed: Executable package/${{ matrix.executable_name }} is missing!"
+            exit 1
+          fi
+
+          # 2. Main LICENSE check
+          if [ ! -f "package/LICENSE" ]; then
+            echo "::error:: Package compliance check failed: Project LICENSE is missing!"
+            exit 1
+          fi
+
+          # 3. README check
+          if [ ! -f "package/README.md" ] && [ ! -f "package/README" ]; then
+            echo "::error:: Package compliance check failed: README is missing!"
+            exit 1
+          fi
+
+          # 4. HELP documentation check
+          if [ ! -f "package/help.md" ] && [ ! -f "package/HELP.md" ]; then
+            echo "::error:: Package compliance check failed: help.md / HELP.md documentation is missing!"
+            exit 1
+          fi
+
+          # 5. licenses/ directory check (must exist and be non-empty)
+          if [ ! -d "package/licenses" ] || [ -z "$(ls -A package/licenses)" ]; then
+            echo "::error:: Package compliance check failed: licenses/ directory is missing or empty!"
+            exit 1
+          fi
+
+          # 6. LICENSES/ directory check (must exist and be non-empty)
+          if [ ! -d "package/LICENSES" ] || [ -z "$(ls -A package/LICENSES)" ]; then
+            echo "::error:: Package compliance check failed: LICENSES/ directory is missing or empty!"
+            exit 1
+          fi
+
+          echo "Release package verification passed successfully! Contents:"
+          ls -la package/
+          echo "Package licenses folder:"
+          ls -la package/licenses/
 
       - name: Upload Artifact
         if: startsWith(github.ref, 'refs/heads/release')

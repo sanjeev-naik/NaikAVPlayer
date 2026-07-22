@@ -52,7 +52,7 @@ elseif(MSVC)
 endif()
 if(TARGET_PLATFORM_WINDOWS)
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-        add_link_options(-Wl,--dynamicbase -Wl,--nxcompat)
+        add_link_options("-Wl,--dynamicbase" "-Wl,--nxcompat")
     elseif(MSVC)
         add_link_options(/DYNAMICBASE /NXCOMPAT)
     endif()
@@ -348,8 +348,6 @@ else()
         message(STATUS "FFmpeg setup complete!")
     endif()
 
-    include_directories(SYSTEM "${FFMPEG_DIR}/include")
-    link_directories("${FFMPEG_DIR}/lib")
 endif()
 
 # -------------------------------------------------------------
@@ -378,6 +376,8 @@ target_link_libraries(NaikAVPlayer PRIVATE
 if(FFMPEG_USE_SYSTEM)
     target_link_libraries(NaikAVPlayer PRIVATE PkgConfig::FFMPEG)
 else()
+    target_include_directories(NaikAVPlayer SYSTEM PRIVATE "${FFMPEG_DIR}/include")
+    target_link_directories(NaikAVPlayer PRIVATE "${FFMPEG_DIR}/lib")
     target_link_libraries(NaikAVPlayer PRIVATE
         avcodec
         avformat
@@ -387,9 +387,8 @@ else()
     )
 endif()
 
-# Ensure standard Win32 subsystems link correctly for MinGW only
-if(TARGET_PLATFORM_WINDOWS AND CMAKE_CXX_COMPILER_ID MATCHES "GNU")
-    target_link_libraries(NaikAVPlayer PRIVATE mingw32)
+if(TARGET_PLATFORM_WINDOWS AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_link_options(NaikAVPlayer PRIVATE -static-libgcc -static-libstdc++)
 endif()
 
 # Link Linux specific libraries
@@ -400,71 +399,53 @@ endif()
 # Apply compiler warning flags to main application target
 target_compile_options(NaikAVPlayer PRIVATE ${PROJECT_WARNING_FLAGS})
 
-# On Linux with bundled FFmpeg, ship .so files next to the executable under
-# lib/ and use $ORIGIN/lib rpath so the loader finds them without touching
-# the system linker cache. When linking against system FFmpeg (ARM64 Pi),
-# skip this - ld.so already resolves the distro packages, and adding an
-# $ORIGIN/lib rpath just adds a dead first-hit lookup path.
-if(TARGET_PLATFORM_LINUX AND NOT FFMPEG_USE_SYSTEM)
-    set_target_properties(NaikAVPlayer PROPERTIES
-        BUILD_RPATH "$ORIGIN/lib"
-        INSTALL_RPATH "$ORIGIN/lib"
-    )
-endif()
+# Helper function to configure target RPATH and copy runtime dependencies
+function(setup_target_dependencies TARGET_NAME)
+    if(TARGET_PLATFORM_WINDOWS)
+        add_custom_command(TARGET ${TARGET_NAME} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_directory
+                "${FFMPEG_DIR}/bin"
+                $<TARGET_FILE_DIR:${TARGET_NAME}>
+            COMMENT "Copying FFmpeg DLLs for ${TARGET_NAME}..."
+        )
 
-# Copy dependencies to executable output directory so it runs smoothly
-if(TARGET_PLATFORM_WINDOWS)
-    add_custom_command(TARGET NaikAVPlayer POST_BUILD
+        add_custom_command(TARGET ${TARGET_NAME} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy
+                $<TARGET_FILE:SDL3::SDL3-shared>
+                $<TARGET_FILE_DIR:${TARGET_NAME}>
+            COMMENT "Copying SDL3.dll for ${TARGET_NAME}..."
+        )
+    elseif(TARGET_PLATFORM_LINUX)
+        set_target_properties(${TARGET_NAME} PROPERTIES
+            BUILD_RPATH "$ORIGIN/lib"
+            INSTALL_RPATH "$ORIGIN/lib"
+        )
+        add_custom_command(TARGET ${TARGET_NAME} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:${TARGET_NAME}>/lib
+            COMMAND ${CMAKE_COMMAND} -E copy
+                $<TARGET_FILE:SDL3::SDL3-shared>
+                $<TARGET_FILE_DIR:${TARGET_NAME}>/lib
+            COMMENT "Copying SDL3 .so to lib/ directory for ${TARGET_NAME}..."
+        )
+        if(NOT FFMPEG_USE_SYSTEM)
+            add_custom_command(TARGET ${TARGET_NAME} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_directory
+                    "${FFMPEG_DIR}/lib"
+                    $<TARGET_FILE_DIR:${TARGET_NAME}>/lib
+                COMMENT "Copying FFmpeg .so files to lib/ directory for ${TARGET_NAME}..."
+            )
+        endif()
+    endif()
+
+    add_custom_command(TARGET ${TARGET_NAME} POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_directory
-            "${FFMPEG_DIR}/bin"
-            $<TARGET_FILE_DIR:NaikAVPlayer>
-        COMMENT "Copying FFmpeg DLLs to output directory..."
+            "${CMAKE_SOURCE_DIR}/assets/fonts"
+            "$<TARGET_FILE_DIR:${TARGET_NAME}>/assets/fonts"
+        COMMENT "Copying Noto Sans fonts for ${TARGET_NAME}..."
     )
+endfunction()
 
-    add_custom_command(TARGET NaikAVPlayer POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy
-            $<TARGET_FILE:SDL3::SDL3-shared>
-            $<TARGET_FILE_DIR:NaikAVPlayer>
-        COMMENT "Copying SDL3.dll to output directory..."
-    )
-elseif(TARGET_PLATFORM_LINUX AND NOT FFMPEG_USE_SYSTEM)
-    add_custom_command(TARGET NaikAVPlayer POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:NaikAVPlayer>/lib
-        COMMAND ${CMAKE_COMMAND} -E copy_directory
-            "${FFMPEG_DIR}/lib"
-            $<TARGET_FILE_DIR:NaikAVPlayer>/lib
-        COMMENT "Copying FFmpeg .so files to lib/ directory..."
-    )
-
-    add_custom_command(TARGET NaikAVPlayer POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy
-            $<TARGET_FILE:SDL3::SDL3-shared>
-            $<TARGET_FILE_DIR:NaikAVPlayer>/lib
-        COMMENT "Copying SDL3 .so to lib/ directory..."
-    )
-elseif(TARGET_PLATFORM_LINUX AND FFMPEG_USE_SYSTEM)
-    # System FFmpeg is resolved via ld.so.cache; only SDL3 (built by FetchContent)
-    # still needs to travel with the executable. Ship it at $ORIGIN/lib so a
-    # future move to a self-contained install layout is a one-line rpath flip.
-    set_target_properties(NaikAVPlayer PROPERTIES
-        BUILD_RPATH "$ORIGIN/lib"
-        INSTALL_RPATH "$ORIGIN/lib"
-    )
-    add_custom_command(TARGET NaikAVPlayer POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:NaikAVPlayer>/lib
-        COMMAND ${CMAKE_COMMAND} -E copy
-            $<TARGET_FILE:SDL3::SDL3-shared>
-            $<TARGET_FILE_DIR:NaikAVPlayer>/lib
-        COMMENT "Copying SDL3 .so to lib/ directory (system FFmpeg is picked up via ld.so.cache)..."
-    )
-endif()
-
-add_custom_command(TARGET NaikAVPlayer POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_directory
-        "${CMAKE_SOURCE_DIR}/assets/fonts"
-        "$<TARGET_FILE_DIR:NaikAVPlayer>/assets/fonts"
-    COMMENT "Copying Noto Sans fonts to output directory..."
-)
+setup_target_dependencies(NaikAVPlayer)
 
 # -------------------------------------------------------------
 # Test Target
@@ -475,18 +456,8 @@ add_executable(NaikAVPlayer_tests
 
 option(ENABLE_COVERAGE "Enable code coverage instrumentation" ON)
 
-# GCC's gcov (--coverage) counters are incremented non-atomically, so any
-# instrumented function reached concurrently from multiple threads (e.g.
-# std::atomic<bool>::load, used by VideoDecoder::isSeeking()/Demuxer's
-# worker thread) trips ThreadSanitizer on the counter itself rather than on
-# real application state. Coverage and TSan are therefore mutually
-# exclusive here, same as ENABLE_SANITIZERS/ENABLE_TSAN above.
 if(ENABLE_COVERAGE AND NOT ENABLE_TSAN)
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-        # Enable GCC/Clang code coverage flags for tests
-        # Tests are always -O0 (coverage accuracy); glibc's _FORTIFY_SOURCE emits a
-        # #warning without optimization, which -Werror escalates. Undefine it here -
-        # this target-level flag comes after the global -D and takes precedence.
         target_compile_options(NaikAVPlayer_tests PRIVATE --coverage -O0 -g -U_FORTIFY_SOURCE)
         target_link_options(NaikAVPlayer_tests PRIVATE --coverage)
     elseif(MSVC)
@@ -507,6 +478,8 @@ target_link_libraries(NaikAVPlayer_tests PRIVATE
 if(FFMPEG_USE_SYSTEM)
     target_link_libraries(NaikAVPlayer_tests PRIVATE PkgConfig::FFMPEG)
 else()
+    target_include_directories(NaikAVPlayer_tests SYSTEM PRIVATE "${FFMPEG_DIR}/include")
+    target_link_directories(NaikAVPlayer_tests PRIVATE "${FFMPEG_DIR}/lib")
     target_link_libraries(NaikAVPlayer_tests PRIVATE
         avcodec
         avformat
@@ -517,65 +490,17 @@ else()
 endif()
 
 if(TARGET_PLATFORM_LINUX)
-    # SDL3 is FetchContent-built so it always needs to travel with the binary;
-    # rpath is set here regardless of FFmpeg source (system libav* is resolved
-    # via ld.so.cache and doesn't rely on the rpath entry).
-    set_target_properties(NaikAVPlayer_tests PROPERTIES
-        BUILD_RPATH "$ORIGIN/lib"
-        INSTALL_RPATH "$ORIGIN/lib"
-    )
     target_link_libraries(NaikAVPlayer_tests PRIVATE pthread dl)
+endif()
+
+if(TARGET_PLATFORM_WINDOWS AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_link_options(NaikAVPlayer_tests PRIVATE -static-libgcc -static-libstdc++)
 endif()
 
 # Apply compiler warning flags to test suite target
 target_compile_options(NaikAVPlayer_tests PRIVATE ${PROJECT_WARNING_FLAGS})
 
-# Copy dependencies to tests output directory so it runs smoothly
-if(TARGET_PLATFORM_WINDOWS)
-    add_custom_command(TARGET NaikAVPlayer_tests POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_directory
-            "${FFMPEG_DIR}/bin"
-            $<TARGET_FILE_DIR:NaikAVPlayer_tests>
-        COMMENT "Copying FFmpeg DLLs to tests output directory..."
-    )
-
-    add_custom_command(TARGET NaikAVPlayer_tests POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy
-            $<TARGET_FILE:SDL3::SDL3-shared>
-            $<TARGET_FILE_DIR:NaikAVPlayer_tests>
-        COMMENT "Copying SDL3.dll to tests output directory..."
-    )
-elseif(TARGET_PLATFORM_LINUX AND NOT FFMPEG_USE_SYSTEM)
-    add_custom_command(TARGET NaikAVPlayer_tests POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:NaikAVPlayer_tests>/lib
-        COMMAND ${CMAKE_COMMAND} -E copy_directory
-            "${FFMPEG_DIR}/lib"
-            $<TARGET_FILE_DIR:NaikAVPlayer_tests>/lib
-        COMMENT "Copying FFmpeg .so files to tests lib/ directory..."
-    )
-
-    add_custom_command(TARGET NaikAVPlayer_tests POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy
-            $<TARGET_FILE:SDL3::SDL3-shared>
-            $<TARGET_FILE_DIR:NaikAVPlayer_tests>/lib
-        COMMENT "Copying SDL3 .so to tests lib/ directory..."
-    )
-elseif(TARGET_PLATFORM_LINUX AND FFMPEG_USE_SYSTEM)
-    add_custom_command(TARGET NaikAVPlayer_tests POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:NaikAVPlayer_tests>/lib
-        COMMAND ${CMAKE_COMMAND} -E copy
-            $<TARGET_FILE:SDL3::SDL3-shared>
-            $<TARGET_FILE_DIR:NaikAVPlayer_tests>/lib
-        COMMENT "Copying SDL3 .so to tests lib/ directory (system FFmpeg via ld.so.cache)..."
-    )
-endif()
-
-add_custom_command(TARGET NaikAVPlayer_tests POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_directory
-        "${CMAKE_SOURCE_DIR}/assets/fonts"
-        "$<TARGET_FILE_DIR:NaikAVPlayer_tests>/assets/fonts"
-    COMMENT "Copying Noto Sans fonts to tests output directory..."
-)
+setup_target_dependencies(NaikAVPlayer_tests)
 
 # -------------------------------------------------------------
 # Install Rules
