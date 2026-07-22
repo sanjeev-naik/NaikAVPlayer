@@ -5,6 +5,11 @@ project(NaikAVPlayer C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Static MSVC runtime (/MT) so the Windows .exe is self-contained and needs
+# no Visual C++ Redistributable install. Requires CMP0091 (CMake >= 3.15).
+cmake_policy(SET CMP0091 NEW)
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
 # -------------------------------------------------------------
 # Platform Configuration
 # -------------------------------------------------------------
@@ -48,13 +53,23 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     )
 elseif(MSVC)
     # MSVC uses its own security flags instead of GCC/Clang warnings
-    add_compile_options(/GS)
+    add_compile_options(/GS /guard:cf)
 endif()
 if(TARGET_PLATFORM_WINDOWS)
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-        add_link_options("-Wl,--dynamicbase" "-Wl,--nxcompat")
+        # --high-entropy-va gives full 64-bit ASLR (MinGW omits it by default).
+        add_link_options("-Wl,--dynamicbase" "-Wl,--nxcompat" "-Wl,--high-entropy-va")
     elseif(MSVC)
-        add_link_options(/DYNAMICBASE /NXCOMPAT)
+        # /GUARD:CF = Control Flow Guard. /HIGHENTROPYVA is default on x64 but
+        # stated explicitly. /MANIFEST:NO lets the RT_MANIFEST from resource.rc
+        # be authoritative instead of the linker autogenerating a second one.
+        add_link_options(/DYNAMICBASE /NXCOMPAT /GUARD:CF /HIGHENTROPYVA /MANIFEST:NO)
+    endif()
+elseif(TARGET_PLATFORM_LINUX)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        # Full RELRO + BIND_NOW: the GOT is remapped read-only after relocation,
+        # closing GOT-overwrite attack vectors.
+        add_link_options("-Wl,-z,relro" "-Wl,-z,now")
     endif()
 endif()
 
