@@ -286,7 +286,14 @@ inline int mock_av_read_frame(AVFormatContext* s, AVPacket* pkt) {
 
 inline bool mock_SDL_Init(SDL_InitFlags flags) {
     if (force_sdl_init_fail) return false;
-    return SDL_Init(flags);
+    bool ret = SDL_Init(flags);
+    if (!ret) {
+        // Fallback for headless CI/container environments without physical audio hardware
+        SDL_SetHint("SDL_AUDIO_DRIVER", "dummy");
+        SDL_SetHint("SDL_VIDEO_DRIVER", "offscreen");
+        ret = SDL_Init(flags);
+    }
+    return ret;
 }
 #define SDL_Init mock_SDL_Init
 

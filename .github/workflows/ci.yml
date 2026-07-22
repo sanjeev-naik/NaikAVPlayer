@@ -69,6 +69,9 @@ jobs:
           cmake --build build-linux --config Release -j$(nproc)
 
       - name: Run Tests (Native Linux Release)
+        env:
+          SDL_AUDIO_DRIVER: dummy
+          SDL_VIDEODRIVER: offscreen
         run: |
           ctest --test-dir build-linux --output-on-failure
 
@@ -113,6 +116,8 @@ jobs:
         env:
           ASAN_OPTIONS: detect_leaks=1
           LSAN_OPTIONS: suppressions=${{ github.workspace }}/tests/lsan.supp
+          SDL_AUDIO_DRIVER: dummy
+          SDL_VIDEODRIVER: offscreen
         run: |
           ctest --test-dir build-sanitizers --output-on-failure
 
@@ -133,6 +138,8 @@ jobs:
       - name: Run Tests with ThreadSanitizer (TSan)
         env:
           TSAN_OPTIONS: "halt_on_error=1 history_size=7 suppressions=${{ github.workspace }}/tests/tsan.supp"
+          SDL_AUDIO_DRIVER: dummy
+          SDL_VIDEODRIVER: offscreen
         run: |
           ctest --test-dir build-tsan --output-on-failure
 
@@ -260,8 +267,8 @@ jobs:
             echo "Running ldd on native binary..."
             ldd build/${{ matrix.executable_name }}
           else
-            echo "Running readelf on binary..."
-            readelf -d build/${{ matrix.executable_name }}
+            echo "Running PE binary inspection..."
+            x86_64-w64-mingw32-readelf -d build/${{ matrix.executable_name }} || file build/${{ matrix.executable_name }}
           fi
 
       - name: Assemble Release Package
