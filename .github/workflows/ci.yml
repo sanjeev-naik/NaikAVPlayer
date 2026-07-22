@@ -29,6 +29,7 @@ jobs:
             libswscale-dev \
             libswresample-dev \
             libgtk-3-dev \
+            libxss-dev \
             ccache \
             cppcheck \
             lcov
