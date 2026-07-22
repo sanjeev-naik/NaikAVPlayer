@@ -361,10 +361,16 @@ set(PLAYER_LOGIC_SOURCES
     src/AudioDecoder.cpp
 )
 
+set(WINDOWS_RESOURCE_FILE "")
+if(TARGET_PLATFORM_WINDOWS)
+    set(WINDOWS_RESOURCE_FILE src/resource.rc)
+endif()
+
 add_executable(NaikAVPlayer 
     src/main.cpp 
     src/PlayerUI.cpp
     ${PLAYER_LOGIC_SOURCES}
+    ${WINDOWS_RESOURCE_FILE}
 )
 
 # Link libraries to our executable
@@ -389,6 +395,7 @@ endif()
 
 if(TARGET_PLATFORM_WINDOWS AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_link_options(NaikAVPlayer PRIVATE -static-libgcc -static-libstdc++)
+    set_target_properties(NaikAVPlayer PROPERTIES WIN32_EXECUTABLE TRUE)
 endif()
 
 # Link Linux specific libraries

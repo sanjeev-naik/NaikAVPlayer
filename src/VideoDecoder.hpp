@@ -1,5 +1,6 @@
 #pragma once
 
+#include <string>
 #include <atomic>
 #include <algorithm>
 #include "ThreadSafeQueue.hpp"
@@ -57,6 +58,18 @@ inline void getTargetDimensions(ResolutionOption option, int nativeW, int native
     if (targetW < 2) targetW = 2;
     if (targetH < 2) targetH = 2;
 }
+
+struct ColorPipelineInfo {
+    std::string colorSpace = "Unspecified";
+    std::string colorPrimaries = "Unspecified";
+    std::string transferChar = "Unspecified";
+    std::string colorRange = "Unspecified";
+    std::string chromaSubsampling = "Unknown";
+    std::string pixelFormat = "Unknown";
+    int bitDepth = 8;
+    std::string hdrType = "SDR";
+    bool isHDR = false;
+};
 
 class VideoDecoder {
 private:
@@ -127,6 +140,7 @@ public:
     void setSeeking(bool seeking) { m_seeking.store(seeking); }
     std::string getPixelFormatName() const;
     bool isHardware() const { return m_codecCtx ? isHardwareDecoder(m_codecCtx->codec) : false; }
+    ColorPipelineInfo getColorInfo() const;
 };
 
 extern bool g_disableHardwareDecoders;

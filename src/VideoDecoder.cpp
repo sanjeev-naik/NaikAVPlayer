@@ -471,97 +471,69 @@ bool VideoDecoder::convertFrame(ResolutionOption option) {
   }
 
   // Fallback / scaling path: use sws_scale to convert and resize to YUV420P
-  // Check if the source frame's dimensions/format changed, or if output target size changed
   if (srcFrame->width != m_allocatedWidth ||
       srcFrame->height != m_allocatedHeight ||
       srcFrame->format != m_allocatedFormat ||
-      m_yuvFrame->width != targetW ||
-      m_yuvFrame->height != targetH ||
-      m_yuvFrame->data[0] != m_yuvBuffer ||
-      m_yuvFrame->format != AV_PIX_FMT_YUV420P) {
+      !m_swsCtx) {
 
-    // Free old scaling context
-    if (m_swsCtx) {
-      sws_freeContext(m_swsCtx);
-      m_swsCtx = nullptr;
-    }
-
-    // Reallocate YUV buffer if target dimensions or buffer location changed
-    if (m_yuvFrame->width != targetW ||
-        m_yuvFrame->height != targetH ||
-        m_yuvFrame->data[0] != m_yuvBuffer) {
-      if (m_yuvBuffer) {
-        av_free(m_yuvBuffer);
-        m_yuvBuffer = nullptr;
-      }
-
-      // Reallocate YUV buffer for the new dimensions
-      m_yuvBufferSize = av_image_get_buffer_size(
-          AV_PIX_FMT_YUV420P, targetW, targetH, 1);
-      m_yuvBuffer = static_cast<uint8_t *>(av_malloc(m_yuvBufferSize));
-      if (!m_yuvBuffer) {
-        std::cerr
-            << "Error: Could not allocate YUV buffer after resolution change"
-            << std::endl;
-        if (tempCpuFrame) {
-          av_frame_free(&tempCpuFrame);
-        }
-        return false;
-      }
-    }
-
-    av_frame_unref(m_yuvFrame);
-    m_yuvFrame->format = AV_PIX_FMT_YUV420P;
-    m_yuvFrame->width = targetW;
-    m_yuvFrame->height = targetH;
-
-    // Associate the new buffer with the YUV frame
-    int ret = av_image_fill_arrays(m_yuvFrame->data, m_yuvFrame->linesize,
-                                   m_yuvBuffer, AV_PIX_FMT_YUV420P,
-                                   targetW, targetH, 1);
-    if (ret < 0) {
-      std::cerr
-          << "Error: Could not associate YUV buffer on resolution change"
-          << std::endl;
-      av_free(m_yuvBuffer);
-      m_yuvBuffer = nullptr;
+    SwsContext *newSwsCtx =
+        sws_getContext(srcFrame->width, srcFrame->height,
+                       static_cast<AVPixelFormat>(srcFrame->format),
+                       targetW, targetH, AV_PIX_FMT_YUV420P,
+                       SWS_BICUBIC, nullptr, nullptr, nullptr);
+    if (!newSwsCtx) {
+      std::cerr << "Error: Could not allocate scaling context" << std::endl;
       if (tempCpuFrame) {
         av_frame_free(&tempCpuFrame);
       }
       return false;
     }
 
+    if (m_swsCtx) {
+      sws_freeContext(m_swsCtx);
+    }
+    m_swsCtx = newSwsCtx;
     m_allocatedWidth = srcFrame->width;
     m_allocatedHeight = srcFrame->height;
     m_allocatedFormat = static_cast<AVPixelFormat>(srcFrame->format);
   }
 
-  if (!m_swsCtx) {
-    // SWS_BICUBIC for high quality scaling
-    m_swsCtx =
-        sws_getContext(srcFrame->width, srcFrame->height,
-                       static_cast<AVPixelFormat>(srcFrame->format),
-                       targetW, targetH, AV_PIX_FMT_YUV420P,
-                       SWS_BICUBIC, nullptr, nullptr, nullptr);
-    if (!m_swsCtx) {
-      std::cerr
-          << "Error: Could not allocate scaling context"
-          << std::endl;
-      if (tempCpuFrame) {
-        av_frame_free(&tempCpuFrame);
-      }
-      return false;
+  m_yuvBufferSize = av_image_get_buffer_size(AV_PIX_FMT_YUV420P, targetW, targetH, 1);
+
+  AVFrame *scaledFrame = av_frame_alloc();
+  if (!scaledFrame) {
+    if (tempCpuFrame) {
+      av_frame_free(&tempCpuFrame);
     }
+    return false;
   }
 
-  // Preserve colorspace properties on the output frame
-  m_yuvFrame->color_range = srcFrame->color_range;
-  m_yuvFrame->colorspace = srcFrame->colorspace;
-  m_yuvFrame->color_primaries = srcFrame->color_primaries;
-  m_yuvFrame->color_trc = srcFrame->color_trc;
+  scaledFrame->format = AV_PIX_FMT_YUV420P;
+  scaledFrame->width = targetW;
+  scaledFrame->height = targetH;
+  scaledFrame->pts = srcFrame->pts;
+  scaledFrame->pkt_dts = srcFrame->pkt_dts;
+  scaledFrame->color_range = srcFrame->color_range;
+  scaledFrame->colorspace = srcFrame->colorspace;
+  scaledFrame->color_primaries = srcFrame->color_primaries;
+  scaledFrame->color_trc = srcFrame->color_trc;
+
+  int ret = av_frame_get_buffer(scaledFrame, 32);
+  if (ret < 0) {
+    std::cerr << "Error: Could not allocate buffer for scaled frame: " << ret << std::endl;
+    av_frame_free(&scaledFrame);
+    if (tempCpuFrame) {
+      av_frame_free(&tempCpuFrame);
+    }
+    return false;
+  }
 
   sws_scale(m_swsCtx, srcFrame->data, srcFrame->linesize, 0, srcFrame->height,
-            m_yuvFrame->data, m_yuvFrame->linesize);
+            scaledFrame->data, scaledFrame->linesize);
+
+  av_frame_unref(m_yuvFrame);
+  av_frame_move_ref(m_yuvFrame, scaledFrame);
+  av_frame_free(&scaledFrame);
 
   if (tempCpuFrame) {
     av_frame_free(&tempCpuFrame);
@@ -725,4 +697,132 @@ std::string VideoDecoder::getPixelFormatName() const {
     }
   }
   return "unknown";
+}
+
+ColorPipelineInfo VideoDecoder::getColorInfo() const {
+  ColorPipelineInfo info;
+
+  AVColorSpace cs = AVCOL_SPC_UNSPECIFIED;
+  AVColorPrimaries cp = AVCOL_PRI_UNSPECIFIED;
+  AVColorTransferCharacteristic trc = AVCOL_TRC_UNSPECIFIED;
+  AVColorRange cr = AVCOL_RANGE_UNSPECIFIED;
+  AVPixelFormat pixFmt = AV_PIX_FMT_NONE;
+
+  if (m_decodedFrame && m_decodedFrame->width > 0) {
+    cs = m_decodedFrame->colorspace;
+    cp = m_decodedFrame->color_primaries;
+    trc = m_decodedFrame->color_trc;
+    cr = m_decodedFrame->color_range;
+    pixFmt = static_cast<AVPixelFormat>(m_decodedFrame->format);
+  } else if (m_codecCtx) {
+    cs = m_codecCtx->colorspace;
+    cp = m_codecCtx->color_primaries;
+    trc = m_codecCtx->color_trc;
+    cr = m_codecCtx->color_range;
+    pixFmt = m_codecCtx->pix_fmt;
+  } else if (m_codecParams) {
+    cs = m_codecParams->color_space;
+    cp = m_codecParams->color_primaries;
+    trc = m_codecParams->color_trc;
+    cr = m_codecParams->color_range;
+    pixFmt = static_cast<AVPixelFormat>(m_codecParams->format);
+  }
+
+  if (m_allocatedFormat != AV_PIX_FMT_NONE) {
+    pixFmt = m_allocatedFormat;
+  }
+
+  // 1. Color Space
+  const char *csName = av_color_space_name(cs);
+  info.colorSpace = (csName && cs != AVCOL_SPC_UNSPECIFIED) ? csName : "Unspecified";
+
+  // 2. Color Primaries
+  const char *cpName = av_color_primaries_name(cp);
+  info.colorPrimaries = (cpName && cp != AVCOL_PRI_UNSPECIFIED) ? cpName : "Unspecified";
+
+  // 3. Transfer Characteristic
+  const char *trcName = av_color_transfer_name(trc);
+  if (trcName && trc != AVCOL_TRC_UNSPECIFIED) {
+    info.transferChar = trcName;
+  } else {
+    info.transferChar = "Unspecified";
+  }
+
+  // Friendly alias formatting for common TRCs
+  if (trc == AVCOL_TRC_SMPTE2084) {
+    info.transferChar = "PQ (ST 2084)";
+  } else if (trc == AVCOL_TRC_ARIB_STD_B67) {
+    info.transferChar = "HLG";
+  } else if (trc == AVCOL_TRC_IEC61966_2_1) {
+    info.transferChar = "sRGB";
+  }
+
+  // 4. Color Range
+  if (cr == AVCOL_RANGE_MPEG) {
+    info.colorRange = "Limited (16-235)";
+  } else if (cr == AVCOL_RANGE_JPEG) {
+    info.colorRange = "Full (0-255)";
+  } else {
+    info.colorRange = "Unspecified";
+  }
+
+  // 5. Pixel Format, Bit Depth & Chroma Subsampling
+  if (pixFmt != AV_PIX_FMT_NONE) {
+    const char *fmtName = av_get_pix_fmt_name(pixFmt);
+    info.pixelFormat = fmtName ? fmtName : "Unknown";
+
+    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(pixFmt);
+    if (desc) {
+      if (desc->nb_components > 0) {
+        info.bitDepth = desc->comp[0].depth;
+      }
+
+      if (desc->flags & AV_PIX_FMT_FLAG_HWACCEL) {
+        info.chromaSubsampling = "HW Surface";
+      } else if (desc->nb_components == 1 || desc->nb_components == 2) {
+        info.chromaSubsampling = "4:0:0 (Mono)";
+      } else if (desc->log2_chroma_w == 0 && desc->log2_chroma_h == 0) {
+        info.chromaSubsampling = "4:4:4";
+      } else if (desc->log2_chroma_w == 1 && desc->log2_chroma_h == 0) {
+        info.chromaSubsampling = "4:2:2";
+      } else if (desc->log2_chroma_w == 1 && desc->log2_chroma_h == 1) {
+        info.chromaSubsampling = "4:2:0";
+      } else if (desc->log2_chroma_w == 2 && desc->log2_chroma_h == 0) {
+        info.chromaSubsampling = "4:1:1";
+      }
+    }
+  }
+
+  // 6. HDR Metadata Inspection
+  info.isHDR = false;
+  info.hdrType = "SDR";
+
+  if (trc == AVCOL_TRC_SMPTE2084) {
+    info.isHDR = true;
+    info.hdrType = "HDR10 (PQ)";
+  } else if (trc == AVCOL_TRC_ARIB_STD_B67) {
+    info.isHDR = true;
+    info.hdrType = "HLG";
+  }
+
+  if (m_decodedFrame) {
+    for (int i = 0; i < m_decodedFrame->nb_side_data; i++) {
+      const AVFrameSideData *sd = m_decodedFrame->side_data[i];
+      if (!sd)
+        continue;
+      if (sd->type == AV_FRAME_DATA_DYNAMIC_HDR_PLUS) {
+        info.isHDR = true;
+        info.hdrType = "HDR10+";
+      } else if (sd->type == AV_FRAME_DATA_DOVI_METADATA) {
+        info.isHDR = true;
+        info.hdrType = "Dolby Vision";
+      } else if (sd->type == AV_FRAME_DATA_MASTERING_DISPLAY_METADATA &&
+                 !info.isHDR) {
+        info.isHDR = true;
+        info.hdrType = "HDR10";
+      }
+    }
+  }
+
+  return info;
 }

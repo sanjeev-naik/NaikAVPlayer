@@ -1,3 +1,4 @@
+#define NAIKAV_UNIT_TESTING 1
 #include <iostream>
 #include <cassert>
 #include <chrono>
@@ -164,7 +165,7 @@ inline struct SwsContext* mock_sws_getContext(int srcW, int srcH, enum AVPixelFo
                                               int flags, SwsFilter *srcFilter,
                                               SwsFilter *dstFilter, const double *param) {
     if (force_sws_context_fail) return nullptr;
-    return sws_getContext(srcW, srcH, srcFormat, dstW, dstH, dstFormat, flags, srcFilter, dstFilter, param);
+    return (sws_getContext)(srcW, srcH, srcFormat, dstW, dstH, dstFormat, flags, srcFilter, dstFilter, param);
 }
 #define sws_getContext mock_sws_getContext
 
@@ -260,6 +261,12 @@ inline int mock_av_hwframe_transfer_data(AVFrame* dst, const AVFrame* src, int f
     return 0;
 }
 #define av_hwframe_transfer_data mock_av_hwframe_transfer_data
+
+inline int mock_av_frame_get_buffer(AVFrame* frame, int align) {
+    if (force_malloc_fail || force_image_fill_fail) return -1;
+    return av_frame_get_buffer(frame, align);
+}
+#define av_frame_get_buffer mock_av_frame_get_buffer
 
 inline int mock_av_read_frame(AVFormatContext* s, AVPacket* pkt) {
     if (force_read_eof) return AVERROR_EOF;
@@ -451,16 +458,17 @@ int real_main(int argc, char* argv[]) {
             force_image_fill_fail = false;
 
             // Test case 3: Dynamic resolution change fails because sws_getContext fails (force_sws_context_fail = true)
-            testDecoder.m_decodedFrame->width = 320;
-            testDecoder.m_decodedFrame->height = 240;
+            testDecoder.m_decodedFrame->width = 480;
+            testDecoder.m_decodedFrame->height = 360;
             testDecoder.m_decodedFrame->format = AV_PIX_FMT_RGB24;
+            std::vector<uint8_t> dummySrcBuffer3(480 * 360 * 4, 0);
             av_image_fill_arrays(
                 testDecoder.m_decodedFrame->data,
                 testDecoder.m_decodedFrame->linesize,
-                dummySrcBuffer2.data(),
+                dummySrcBuffer3.data(),
                 AV_PIX_FMT_RGB24,
-                320,
-                240,
+                480,
+                360,
                 1
             );
             force_sws_context_fail = true;
@@ -491,11 +499,11 @@ int real_main(int argc, char* argv[]) {
             testDecoder.m_decodedFrame->width = 320;
             testDecoder.m_decodedFrame->height = 240;
             testDecoder.m_decodedFrame->format = AV_PIX_FMT_RGB24;
-            std::vector<uint8_t> dummySrcBuffer3(320 * 240 * 4, 0);
+            std::vector<uint8_t> dummySrcBuffer4(320 * 240 * 4, 0);
             av_image_fill_arrays(
                 testDecoder.m_decodedFrame->data,
                 testDecoder.m_decodedFrame->linesize,
-                dummySrcBuffer3.data(),
+                dummySrcBuffer4.data(),
                 AV_PIX_FMT_RGB24,
                 320,
                 240,
@@ -1855,6 +1863,19 @@ int main(int argc, char* argv[]) {
             }
 
             std::cout << "Pipeline Metrics & MetricRing Tests (T1 - T8) passed!" << std::endl;
+        }
+
+        // ColorPipelineInfo Metadata Extraction Test
+        {
+            ColorPipelineInfo info;
+            test_assert(info.colorSpace == "Unspecified", "ColorInfo default space");
+            test_assert(info.colorPrimaries == "Unspecified", "ColorInfo default primaries");
+            test_assert(info.transferChar == "Unspecified", "ColorInfo default TRC");
+            test_assert(info.colorRange == "Unspecified", "ColorInfo default range");
+            test_assert(info.bitDepth == 8, "ColorInfo default bit depth");
+            test_assert(!info.isHDR, "ColorInfo default HDR flag");
+            test_assert(info.hdrType == "SDR", "ColorInfo default HDR type");
+            std::cout << "ColorPipelineInfo Unit Test passed!" << std::endl;
         }
 
         std::cout << "Additional code coverage tests PASSED!" << std::endl;

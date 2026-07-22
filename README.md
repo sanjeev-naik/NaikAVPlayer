@@ -19,7 +19,7 @@ NaikAVPlayer is a native, multi-threaded C++17 media engine and video player bui
 - **Software Volume Attenuation:** Scalable audio output level adjustments with memcpy/memset bypasses for 100% and 0% volume states.
 - **Loop Playback:** Wraparound seek to 0.0 upon reaching end-of-file for continuous playback.
 - **Native File Picker:** Cross-platform native file picker integration using `nativefiledialog-extended` (NFD) on Win32 and GTK3/Portal backends.
-- **Pipeline Diagnostics & System Info HUD:** Real-time overlay (`--metrics` or `D` key) displaying active player states, media telemetry (native vs. playback resolution, pixel format, hardware vs. software decoder type), pipeline queue depth levels, decode/render frame pacing budgets, and rolling clock synchronization offsets.
+- **Pipeline Diagnostics & System Info HUD:** Real-time overlay (`--metrics` or `D` key) displaying active player states, media telemetry (native vs. playback resolution, pixel format, hardware vs. software decoder type), Color & HDR pipeline characteristics (Color Space, Primaries, TRC, Range, Chroma Subsampling, Bit Depth, HDR10/HDR10+/Dolby Vision/HLG standard), pipeline queue depth levels, decode/render frame pacing budgets, and rolling clock synchronization offsets.
 - **Translucent User Interface:** ImGui-based desktop interface using bundled Noto Sans typography.
 
 ---
