@@ -320,7 +320,9 @@ jobs:
           fi
 
           # Ensure case-insensitive compatibility (both licenses/ and LICENSES/)
-          cp -r package/licenses package/LICENSES
+          if [ ! -d "package/LICENSES" ]; then
+            cp -r package/licenses package/LICENSES
+          fi
 
           # Copy runtime libraries. The CMake POST_BUILD step already places the
           # FFmpeg + SDL3 shared libs next to the freshly built binary.
