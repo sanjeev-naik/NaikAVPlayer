@@ -307,7 +307,8 @@ jobs:
           if [ "${{ matrix.os_name }}" = "windows" ]; then
             cp build/*.dll package/ 2>/dev/null || true
             cp build/bin/*.dll package/ 2>/dev/null || true
-            find /usr/x86_64-w64-mingw32 /usr/lib/gcc/x86_64-w64-mingw32 -name "*.dll" -exec cp {} package/ \; 2>/dev/null || true
+           # Only the one MinGW runtime DLL actually required (libgcc/libstdc++ are static).
+find /usr/x86_64-w64-mingw32 -name "libwinpthread-1.dll" -exec cp {} package/ \; 2>/dev/null || true
           else
             cp build/lib/*.so* package/lib/ 2>/dev/null || true
           fi

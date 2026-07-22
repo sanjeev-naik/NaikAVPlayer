@@ -150,7 +150,7 @@ message(STATUS "Fetching SDL3...")
 FetchContent_Declare(
     SDL3
     GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
-    GIT_TAG release-3.4.0
+    GIT_TAG a962f40bbba175e9716557a25d5d7965f134a3d3  # release-3.4.0
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(SDL3)
@@ -171,7 +171,7 @@ message(STATUS "Fetching Dear ImGui...")
 FetchContent_Declare(
     imgui
     GIT_REPOSITORY https://github.com/ocornut/imgui.git
-    GIT_TAG v1.91.9
+    GIT_TAG 97428e8ac99e339ce05eee531cf55b77b29ea709  # v1.91.9
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(imgui)
@@ -202,7 +202,7 @@ set(NFD_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
     nativefiledialog-extended
     GIT_REPOSITORY https://github.com/btzy/nativefiledialog-extended.git
-    GIT_TAG        v1.2.1
+    GIT_TAG        86d5f2005fe1c00747348a12070fec493ea2407e  # v1.2.1
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(nativefiledialog-extended)
@@ -281,10 +281,10 @@ else()
             if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64")
                 # Only reachable when NAIKAV_FORCE_BUNDLED_FFMPEG=ON (advanced override).
                 set(FFMPEG_FILENAME "ffmpeg-n8.1.2-21-gce3c09c101-linuxarm64-lgpl-shared-8.1.tar.xz")
-                set(FFMPEG_SHA256 "")
+                set(FFMPEG_SHA256 "08a9639de779e0d024af5190ad4d0463c6c91b42ba79f00a51359fb4645e8ce7")
             else()
                 set(FFMPEG_FILENAME "ffmpeg-n8.1.2-21-gce3c09c101-linux64-lgpl-shared-8.1.tar.xz")
-                set(FFMPEG_SHA256 "")
+                set(FFMPEG_SHA256 "bc60572d89533c7987e7cfbb654eba4d35122a77885c6938483dd7ef8219cde9")
             endif()
         endif()
 
