@@ -190,27 +190,37 @@ void PlayerController::seek(double seconds) {
     // lock: getCurrentTime() can itself trigger a loop-restart seek.
     double current = isCatchingUp() ? m_catchupPos.load() : getCurrentTime();
 
-    std::unique_lock<std::mutex> lock(m_catchupMutex);
+    bool catchupActive = false;
+    bool playing = false;
+    double delta = 0.0;
 
-    bool catchupActive = (m_catchupMode.load() != SeekCatchupMode::NONE);
-    if (catchupActive) {
-        current = m_catchupPos.load();
+    {
+        std::lock_guard<std::mutex> lock(m_catchupMutex);
+        catchupActive = (m_catchupMode.load() != SeekCatchupMode::NONE);
+        if (catchupActive) {
+            current = m_catchupPos.load();
+        }
+        playing = (m_state == PlayerState::PLAYING);
+        delta = seconds - current;
     }
-    bool playing = (m_state == PlayerState::PLAYING);
-    double delta = seconds - current;
 
     // The catch-up scan is driven by the background video thread. Without it
     // (tests), without video, while not playing, or for negligible jumps,
     // the classic instant seek is the right behavior.
     if (!m_hasVideo || !m_videoThreadEnabled || (!playing && !catchupActive) ||
         std::fabs(delta) < kMinCatchupGap) {
-        lock.unlock();
         instantSeek(seconds);
         return;
     }
 
-    if (!catchupActive) {
-        m_resumeAfterCatchup.store(playing);
+    {
+        std::lock_guard<std::mutex> lock(m_catchupMutex);
+        if (!catchupActive) {
+            m_resumeAfterCatchup.store(playing);
+        }
+        m_catchupTarget.store(seconds);
+        m_catchupPos.store(seconds);
+        m_catchupMode.store(SeekCatchupMode::LANDING);
     }
 
     // Mute audio for the duration of the catch-up phase; it resumes in sync
@@ -219,14 +229,6 @@ void PlayerController::seek(double seconds) {
         m_audioDecoder->pause();
         m_audioDecoder->flush();
     }
-
-    m_catchupTarget.store(seconds);
-
-    // Reposition the demuxer at the target right away and LAND silently in
-    // both directions: frames between the seek keyframe and the target are
-    // decoded but never shown, so the jump appears instantaneous. Report the
-    // target immediately so the UI timeline snaps there.
-    m_catchupPos.store(seconds);
 
     m_seeking.store(true);
     m_demuxer->setCatchup(SeekCatchupMode::LANDING, seconds);
@@ -245,7 +247,6 @@ void PlayerController::seek(double seconds) {
         }
     }
     m_seeking.store(false);
-    m_catchupMode.store(SeekCatchupMode::LANDING);
     uint64_t activeEpoch = m_catchupEpoch.fetch_add(1) + 1;
     if (m_metrics->m_profilingEnabled.load(std::memory_order_relaxed)) {
         m_seekStartTime = std::chrono::steady_clock::now();
@@ -322,8 +323,12 @@ void PlayerController::stop() {
     m_resumeAfterCatchup.store(false);
     m_catchupPos.store(0.0);
 
+    // Abort all queues first so any thread waiting on push or pop is unblocked immediately
+    m_decodedFrameQueue.abort();
+    m_videoQueue.abort();
+    m_audioQueue.abort();
+
     m_videoThreadRunning = false;
-    m_decodedFrameQueue.abort(); // Wake up video thread if blocked on push
     if (m_videoThread.joinable()) {
         m_videoThread.join();
     }
