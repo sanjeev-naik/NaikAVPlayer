@@ -835,7 +835,7 @@ void PlayerUI::drawDiagnosticsHUD(int windowWidth, int windowHeight) {
   // Floating stats card on the top right
   float cardWidth = 340.0f;
   float cardHeight = windowHeight - 80.0f;
-  if (cardHeight < 650.0f) cardHeight = 650.0f;
+  if (cardHeight < 720.0f) cardHeight = 720.0f;
   if (cardHeight > 1050.0f) cardHeight = 1050.0f;
 
   ImGui::SetNextWindowPos(ImVec2(windowWidth - cardWidth - 20.0f, 60.0f));
@@ -914,6 +914,40 @@ void PlayerUI::drawDiagnosticsHUD(int windowWidth, int windowHeight) {
     ImGui::TextColored(isHW ? ImVec4(0.0f, 0.83f, 0.4f, 1.0f)
                             : ImVec4(0.9f, 0.7f, 0.0f, 1.0f),
                        "%s", isHW ? "Hardware" : "Software");
+
+    ColorPipelineInfo colorInfo = m_controller.getColorInfo();
+
+    ImGui::Spacing();
+    ImGui::TextColored(ImVec4(0.00f, 0.83f, 0.88f, 1.00f), "Color & HDR Pipeline");
+    ImGui::Separator();
+
+    ImGui::Text("Chroma & Depth: ");
+    ImGui::SameLine();
+    ImGui::TextColored(ImVec4(0.95f, 0.95f, 0.95f, 1.00f), "%s (%d-bit, %s)",
+                       colorInfo.pixelFormat.c_str(),
+                       colorInfo.bitDepth,
+                       colorInfo.chromaSubsampling.c_str());
+
+    ImGui::Text("Color Space: ");
+    ImGui::SameLine();
+    ImGui::TextColored(ImVec4(0.95f, 0.95f, 0.95f, 1.00f), "%s",
+                       colorInfo.colorSpace.c_str());
+
+    ImGui::Text("Primaries / TRC: ");
+    ImGui::SameLine();
+    ImGui::TextColored(ImVec4(0.95f, 0.95f, 0.95f, 1.00f), "%s / %s",
+                       colorInfo.colorPrimaries.c_str(),
+                       colorInfo.transferChar.c_str());
+
+    ImGui::Text("Color Range: ");
+    ImGui::SameLine();
+    ImGui::TextColored(ImVec4(0.95f, 0.95f, 0.95f, 1.00f), "%s",
+                       colorInfo.colorRange.c_str());
+
+    ImGui::Text("HDR Standard: ");
+    ImGui::SameLine();
+    ImVec4 hdrColor = colorInfo.isHDR ? ImVec4(1.0f, 0.75f, 0.0f, 1.0f) : ImVec4(0.7f, 0.7f, 0.7f, 1.0f);
+    ImGui::TextColored(hdrColor, "%s", colorInfo.hdrType.c_str());
   } else {
     ImGui::Text("Media Type: ");
     ImGui::SameLine();

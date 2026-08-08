@@ -734,3 +734,10 @@ size_t PlayerController::getAudioFrameQueueSize() const {
     }
     return 0;
 }
+
+ColorPipelineInfo PlayerController::getColorInfo() const {
+    if (m_videoDecoder) {
+        return m_videoDecoder->getColorInfo();
+    }
+    return ColorPipelineInfo{};
+}

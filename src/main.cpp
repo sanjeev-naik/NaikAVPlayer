@@ -356,10 +356,8 @@ int main(int argc, char *argv[]) {
         // (OPENED/PAUSED), we allow popping the first frame even if its PTS is
         // slightly in the future to show a first frame.
         if (nextFrame.pts > timeNow && !seekCatchup) {
-          if (!currentFrame.frame && !hasTarget &&
-              (controller.getState() == PlayerState::OPENED ||
-               controller.getState() == PlayerState::PAUSED)) {
-            // Allow popping the first frame
+          if (!currentFrame.frame && !hasTarget) {
+            // Allow popping the first frame whenever no frame is currently displayed (e.g. after seek or loop)
           } else {
             break;
           }
