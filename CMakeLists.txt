@@ -135,6 +135,42 @@ if(ENABLE_TSAN)
 endif()
 
 # -------------------------------------------------------------
+# Linux Audio Backend Preflight Check
+# -------------------------------------------------------------
+# SDL3's own CMake build silently disables ALSA/PipeWire/PulseAudio support
+# whenever their pkg-config files are missing at configure time, falling
+# back to its dummy/disk-only audio drivers with no warning. The resulting
+# binary still links and runs -- it just fails at runtime with "Could not
+# initialize SDL3: No available audio device". That failure mode is
+# Linux-only: Windows audio (WASAPI) ships inside the OS SDK, so no
+# equivalent dev package can ever be "missing" there. Catch it here, before
+# it reaches a user as a confusing runtime error.
+if(TARGET_PLATFORM_LINUX)
+    find_package(PkgConfig QUIET)
+    set(NAIKAV_HAS_AUDIO_BACKEND OFF)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(NAIKAV_ALSA QUIET alsa)
+        pkg_check_modules(NAIKAV_PIPEWIRE QUIET libpipewire-0.3)
+        pkg_check_modules(NAIKAV_PULSE QUIET libpulse)
+        if(NAIKAV_ALSA_FOUND OR NAIKAV_PIPEWIRE_FOUND OR NAIKAV_PULSE_FOUND)
+            set(NAIKAV_HAS_AUDIO_BACKEND ON)
+        endif()
+    endif()
+
+    if(NOT NAIKAV_HAS_AUDIO_BACKEND)
+        message(FATAL_ERROR
+            "No Linux audio backend development package was found via pkg-config "
+            "(checked: alsa, libpipewire-0.3, libpulse). Without one, SDL3 builds "
+            "with only its dummy/disk audio drivers and NaikAVPlayer will fail at "
+            "runtime with \"Could not initialize SDL3: No available audio device\".\n"
+            "Install at least one of the following, then reconfigure:\n"
+            "  Ubuntu/Debian (incl. Raspberry Pi OS): sudo apt-get install -y libasound2-dev libpipewire-0.3-dev\n"
+            "  Fedora/RHEL:                           sudo dnf install -y alsa-lib-devel pipewire-devel\n"
+            "  Arch Linux:                             sudo pacman -S --needed alsa-lib libpipewire")
+    endif()
+endif()
+
+# -------------------------------------------------------------
 # Fetch SDL3
 # -------------------------------------------------------------
 include(FetchContent)
@@ -150,6 +186,13 @@ set(SDL_AUDIO ON CACHE BOOL "" FORCE)
 set(SDL_EVENTS ON CACHE BOOL "" FORCE)
 set(SDL_THREADS ON CACHE BOOL "" FORCE)
 set(SDL_RENDER ON CACHE BOOL "" FORCE)
+
+if(TARGET_PLATFORM_LINUX)
+    # Explicitly request the real Linux audio backends so a silent
+    # dummy-only fallback (see preflight check above) can't happen again.
+    set(SDL_ALSA ON CACHE BOOL "" FORCE)
+    set(SDL_PIPEWIRE ON CACHE BOOL "" FORCE)
+endif()
 
 # Disable all other unused subsystems
 set(SDL_JOYSTICK OFF CACHE BOOL "" FORCE)

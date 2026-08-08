@@ -21,7 +21,7 @@ This document describes how to configure, compile, install, run, profile, and tr
 
 NaikAVPlayer requires a C++17 compliant compiler and CMake 3.16+.
 
-#### Linux (Ubuntu / Debian)
+#### Linux (Ubuntu / Debian, including Raspberry Pi OS)
 ```bash
 sudo apt-get update
 sudo apt-get install -y \
@@ -35,8 +35,13 @@ sudo apt-get install -y \
   libswresample-dev \
   libgtk-3-dev \
   libxss-dev \
+  libasound2-dev \
+  libpipewire-0.3-dev \
   ccache
 ```
+
+> [!IMPORTANT]
+> `libasound2-dev` and `libpipewire-0.3-dev` (or `libpulse-dev` as an alternative to either) are **required**, not optional. SDL3 detects audio backends via `pkg-config` at CMake configure time; without at least one of these, it silently builds with only its `dummy`/`disk` drivers, and NaikAVPlayer fails at launch with `Could not initialize SDL3: No available audio device`. This only affects Linux — Windows audio (WASAPI) ships in the OS SDK, so there's no equivalent package to miss. See [Section 9: Troubleshooting](#9-troubleshooting) for the configure-time check that now guards against this.
 
 #### Linux (Fedora / RHEL)
 ```bash
@@ -47,6 +52,8 @@ sudo dnf install -y \
   ffmpeg-free-devel \
   gtk3-devel \
   libXScrnSaver-devel \
+  alsa-lib-devel \
+  pipewire-devel \
   ccache
 ```
 
@@ -58,6 +65,8 @@ sudo pacman -S --needed \
   pkgconf \
   ffmpeg \
   gtk3 \
+  alsa-lib \
+  libpipewire \
   ccache
 ```
 
@@ -232,6 +241,7 @@ The user interface uses Dear ImGui with frosted translucency overlay.
 - **Windows Decoders:** Tries `h264_d3d11va`, `h264_dxva2`, `h264_qsv`, `h264_cuvid`.
 - **Linux Decoders:** Tries `h264_v4l2m2m` (V4L2 M2M), `h264_vaapi`, `h264_qsv`, `h264_cuvid`.
 - **Dynamic Software Fallback:** If hardware decoder initialization fails or encounters runtime surface mapping errors, the decoder pipeline releases the hardware context, configures software `h264`, and resubmits pending packets seamlessly without crashing or dropping playback state.
+- **Raspberry Pi 5 note:** The BCM2712 SoC has no hardware H.264 M2M decode block (only HEVC, via `rpi-hevc-dec`), so `h264_v4l2m2m` always fails to open for H.264 content on Pi 5 and the pipeline falls back to software `h264` decoding by design — see [Section 9](#9-troubleshooting).
 
 ---
 
@@ -270,3 +280,19 @@ The execution pipeline tracks 9 metrics using lock-free Single Producer Single C
 | **M7** | `av_clock_offset_ms` | `main.cpp:main()` | Main / Render thread | MetricRing<256> (SPSC) | gated |
 | **M8** | `frames_dropped_count` | `main.cpp:main()` | Main / Render thread | std::atomic<uint64_t> (Counter) | Always-On |
 | **M9** | `seek_latency_ms` | `PlayerController.cpp:seek()` & `finishCatchup()` | Video Decoder & Main thread | MetricRing<256> (SPSC) | gated |
+
+---
+
+## 9. Troubleshooting
+
+### `Could not initialize SDL3: No available audio device` (Linux only)
+
+**Cause:** SDL3 detects its Linux audio backends (ALSA, PipeWire, PulseAudio) via `pkg-config` at CMake configure time. If none of `libasound2-dev`, `libpipewire-0.3-dev`, or `libpulse-dev` are installed, SDL3's build silently falls back to its `dummy`/`disk`-only audio drivers — the configure and build steps report no error, but the resulting binary has no real audio output and fails at launch.
+
+**Why only Linux (and not Windows):** SDL3's Windows audio backend (WASAPI) is a native Win32 API bundled with the OS SDK, so MSVC/MinGW builds always have a working backend with no separate dev package to install. Only the Linux build path depends on `pkg-config`-discovered system libraries, which is why this failure is specific to Linux hosts such as Raspberry Pi OS.
+
+**Fix:** Install the packages listed in [Section 1](#1-linux-binary-compatibility-limitation--prerequisites) for your distribution, then reconfigure (`cmake -B build ...`) — not just rebuild — so SDL3's `pkg-config` detection re-runs. `CMakeLists.txt` now performs this same check itself before fetching SDL3: on Linux, if none of `alsa`, `libpipewire-0.3`, or `libpulse` are found via `pkg-config`, configuration stops immediately with a `FATAL_ERROR` naming the exact packages to install, rather than producing a build that only fails later at runtime.
+
+### `Hardware decoder h264_v4l2m2m unavailable, trying next...` on Raspberry Pi 5
+
+**Cause:** This is expected, not an error. Raspberry Pi 5's SoC (BCM2712) only implements a hardware **HEVC/H.265** decode block (kernel driver `rpi-hevc-dec`, exposed as `/dev/video19`) — unlike the Pi 4 (BCM2711), it has no hardware M2M path for H.264. FFmpeg's `h264_v4l2m2m` decoder cannot find a matching V4L2 device for H.264 streams, so it reports "Could not find a valid device" and NaikAVPlayer's dynamic fallback (Section 5) correctly moves on to software `h264` decoding — playback is unaffected, it just isn't hardware-accelerated. HEVC content on Pi 5 is unaffected by this and can still use hardware decode.

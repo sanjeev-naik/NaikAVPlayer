@@ -135,7 +135,7 @@ NaikAVPlayer supports building natively from source across host operating system
 
 #### Dependency Installation
 
-**Ubuntu / Debian:**
+**Ubuntu / Debian (including Raspberry Pi OS):**
 ```bash
 sudo apt-get update
 sudo apt-get install -y \
@@ -149,9 +149,14 @@ sudo apt-get install -y \
   libswresample-dev \
   libgtk-3-dev \
   libxss-dev \
+  libasound2-dev \
+  libpipewire-0.3-dev \
   ccache
 ```
 *(SDL3 v3.4.0, Dear ImGui v1.91.9, and nativefiledialog-extended v1.2.1 are automatically fetched and compiled from source via CMake FetchContent).*
+
+> [!IMPORTANT]
+> **`libasound2-dev` / `libpipewire-0.3-dev` are required, not optional.** SDL3 detects available audio backends via `pkg-config` at CMake configure time. If neither package (nor `libpulse-dev`) is installed, SDL3 silently builds with only its `dummy`/`disk` audio drivers — the build succeeds, but the app fails at launch with `Could not initialize SDL3: No available audio device`. This is a Linux-only failure mode: Windows audio (WASAPI) ships inside the OS SDK, so there is no equivalent dev package to forget. CMake now checks for this at configure time (see [Troubleshooting](#troubleshooting) below) and fails fast with instructions instead of producing a silently broken build.
 
 **Fedora / RHEL:**
 ```bash
@@ -162,6 +167,8 @@ sudo dnf install -y \
   ffmpeg-free-devel \
   gtk3-devel \
   libXScrnSaver-devel \
+  alsa-lib-devel \
+  pipewire-devel \
   ccache
 ```
 
@@ -173,6 +180,8 @@ sudo pacman -S --needed \
   pkgconf \
   ffmpeg \
   gtk3 \
+  alsa-lib \
+  libpipewire \
   ccache
 ```
 
@@ -318,6 +327,18 @@ sudo cmake --build build --target uninstall
 | **`L`** | Toggle Loop Mode |
 | **`D`** | Toggle Diagnostics HUD & Telemetry Metrics |
 | **`Escape`** | Exit Application |
+
+---
+
+## Troubleshooting
+
+### `Could not initialize SDL3: No available audio device` (Linux)
+
+This means SDL3 was compiled with only its `dummy`/`disk` audio drivers, because `libasound2-dev` / `libpipewire-0.3-dev` (or `libpulse-dev`) weren't present when the project was configured — see the [Dependency Installation](#dependency-installation) note above. CMake now catches this itself: configuring on Linux without any of those `pkg-config` modules available fails immediately with instructions, instead of producing a build that only breaks at runtime. If you hit this on an existing build tree, install the missing package(s) and reconfigure (`cmake -B build ...` again) so SDL3's own dependency detection re-runs; a plain `cmake --build` does not re-check `pkg-config`.
+
+### `h264_v4l2m2m unavailable` / falls back to software decode on Raspberry Pi 5
+
+This is expected on Raspberry Pi 5 and is not a bug. The Pi 5's SoC (BCM2712) only exposes a hardware **HEVC/H.265** decode block (`rpi-hevc-dec`, visible as `/dev/video19`); unlike the Pi 4 (BCM2711), it has **no hardware H.264 M2M decoder**. FFmpeg's `h264_v4l2m2m` decoder therefore can't find a matching V4L2 device, and `NaikAVPlayer`'s [Dynamic Hardware Decoder Fallback](#dynamic-hardware-decoder-fallback) correctly drops to software `h264` decoding, as logged. The Pi 5's Cortex-A76 cores decode 1080p H.264 in software without issue; only very high bitrate/resolution H.264 content may need to be transcoded to HEVC to make use of hardware decode.
 
 ---
 
