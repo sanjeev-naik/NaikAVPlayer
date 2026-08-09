@@ -676,11 +676,14 @@ int real_main(int argc, char* argv[]) {
             catchupController.play();
 
             // Consume decoded frames like the render loop would, tracking the
-            // earliest frame timestamp delivered since the last reset.
+            // earliest frame timestamp delivered since the last reset and how
+            // many frames have come through since the last reset.
             double minPoppedPts = 1e18;
-            auto drainFrames = [&catchupController, &minPoppedPts]() {
+            size_t framesDrainedTotal = 0;
+            auto drainFrames = [&catchupController, &minPoppedPts, &framesDrainedTotal]() {
                 DecodedFrame df;
                 while (catchupController.getDecodedFrameQueue().try_pop(df)) {
+                    framesDrainedTotal++;
                     if (df.pts < minPoppedPts) {
                         minPoppedPts = df.pts;
                     }
@@ -740,6 +743,64 @@ int real_main(int argc, char* argv[]) {
             catchupController.seek(backTarget + 2.0);
             test_assert(!catchupController.isCatchingUp(), "Paused seek uses the instant path");
             catchupController.play();
+
+            // -------------------------------------------------------------
+            // D2b. Rapid consecutive seeks must self-recover, no extra nudge
+            // -------------------------------------------------------------
+            // Regression test for a deadlock where the demuxer thread -- the
+            // single thread that reads both the video and audio streams --
+            // could block forever pushing a packet into the audio queue
+            // while nothing was draining it (audio is muted for the whole
+            // catch-up scan, and also stays paused for as long as the user
+            // leaves playback paused). Once blocked there, it never called
+            // av_read_frame again for either stream: the video packet queue
+            // drained to 0 and stayed there, and so did the frame queue.
+            // The bug only "recovered" because issuing another seek forced
+            // a queue clear() that happened to wake the blocked push.
+            // This drives many back-to-back seeks with no settling time in
+            // between (mimicking a dragged seekbar or a held seek key) and
+            // then asserts the pipeline comes back to life entirely on its
+            // own afterward, with no further seek to bail it out.
+            {
+                std::cout << "Testing rapid consecutive seek recovery (no settling)..." << std::endl;
+                double lo = std::max(0.2, dur * 0.1);
+                double hi = std::max(lo + 0.5, dur * 0.8);
+
+                // Storm while playing: back-to-back seeks, no draining and no
+                // waiting for catch-up to land between them, so any audio
+                // packets that pile up while muted have nowhere to go until
+                // the storm stops.
+                for (int i = 0; i < 15; i++) {
+                    catchupController.seek((i % 2 == 0) ? hi : lo);
+                }
+                waitForCatchup(20.0);
+                test_assert(!catchupController.isCatchingUp(),
+                            "Rapid seek storm (playing) settles without another nudge");
+                framesDrainedTotal = 0;
+                driveFor(1.0);
+                test_assert(framesDrainedTotal > 0,
+                            "Video frames are being produced again after the playing seek storm");
+                test_assert(catchupController.getState() == PlayerState::PLAYING,
+                            "Playback is still PLAYING after the playing seek storm");
+
+                // Storm while paused: audio stays paused across every one of
+                // these, so this is the scenario most likely to fill the
+                // audio queue with nothing draining it at all.
+                catchupController.pause();
+                for (int i = 0; i < 15; i++) {
+                    catchupController.seek((i % 2 == 0) ? lo : hi);
+                }
+                catchupController.play();
+                waitForCatchup(20.0);
+                test_assert(!catchupController.isCatchingUp(),
+                            "Rapid seek storm (paused) settles without another nudge");
+                framesDrainedTotal = 0;
+                driveFor(1.0);
+                test_assert(framesDrainedTotal > 0,
+                            "Video frames are being produced again after the paused seek storm");
+                test_assert(catchupController.getState() == PlayerState::PLAYING,
+                            "Playback resumes normally after the paused seek storm");
+            }
 
             // Repeated consecutive forward/backward seeks must not knock the
             // decoder off hardware: a transient hardware decode failure used
@@ -1842,13 +1903,73 @@ int main(int argc, char* argv[]) {
             {
                 ThreadSafeQueue<int> queue(10);
                 queue.attachDepthMirror(nullptr);
-                
+
                 test_assert(queue.push(1), "T7: push works without depth mirror");
                 int val;
                 test_assert(queue.pop(val) && val == 1, "T7: pop works without depth mirror");
                 test_assert(queue.push(2), "T7: push works");
                 queue.clear();
                 test_assert(queue.empty(), "T7: clear works");
+            }
+
+            // T7b: push_drop_oldest() and push_wait_or_drop() must never block
+            // on a full queue with nothing draining it. This is the exact
+            // mechanism behind a deadlock where the demuxer thread -- the
+            // single thread reading both the video and audio streams -- could
+            // block forever inside a plain push() to the audio queue while
+            // the audio device sat paused (during a seek catch-up, or simply
+            // while the user had playback paused). Once blocked there it
+            // never read another packet for either stream, so the video
+            // packet queue drained to 0 and stayed there. These two methods
+            // are the fix: they must always return promptly even when
+            // nothing is popping.
+            {
+                ThreadSafeQueue<int> queue(3);
+                for (int i = 0; i < 3; i++) {
+                    test_assert(queue.push(i), "T7b: fill queue to capacity");
+                }
+                test_assert(queue.size() == 3, "T7b: queue is at capacity");
+
+                // Nothing pops from `queue` for the rest of this block --
+                // simulating a paused/idle consumer.
+                auto start = std::chrono::steady_clock::now();
+                bool pushed = queue.push_drop_oldest(99);
+                double elapsedSec = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+                test_assert(pushed, "T7b: push_drop_oldest succeeds on a full, undrained queue");
+                test_assert(elapsedSec < 0.05, "T7b: push_drop_oldest returns immediately, never blocks");
+                test_assert(queue.size() == 3, "T7b: push_drop_oldest keeps the queue at capacity");
+
+                start = std::chrono::steady_clock::now();
+                pushed = queue.push_wait_or_drop(100, std::chrono::milliseconds(50));
+                elapsedSec = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+                test_assert(pushed, "T7b: push_wait_or_drop succeeds on a full, undrained queue");
+                test_assert(elapsedSec < 0.5, "T7b: push_wait_or_drop returns at its timeout, not forever");
+                test_assert(elapsedSec >= 0.045, "T7b: push_wait_or_drop actually waits close to its timeout before dropping");
+            }
+
+            // T7c: documents the failure mode T7b fixes -- a plain,
+            // unbounded push() on a full queue genuinely blocks until
+            // something else drains it. Raced against a background thread
+            // that pops exactly once after a delay: push() must not return
+            // before that pop happens.
+            {
+                ThreadSafeQueue<int> queue(1);
+                test_assert(queue.push(0), "T7c: fill queue to capacity");
+
+                std::atomic<bool> popped{false};
+                std::thread popper([&queue, &popped]() {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(80));
+                    int val;
+                    queue.pop(val);
+                    popped.store(true);
+                });
+
+                auto start = std::chrono::steady_clock::now();
+                test_assert(queue.push(1), "T7c: plain push eventually succeeds once drained");
+                double elapsedSec = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+                popper.join();
+                test_assert(popped.load(), "T7c: push only returned after the pop happened");
+                test_assert(elapsedSec >= 0.075, "T7c: plain push genuinely blocked until the queue was drained");
             }
 
             // T8: setProfilingEnabled(true) -> ring writes occur; back to false -> writes stop (toggle round-trip)

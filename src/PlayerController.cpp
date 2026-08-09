@@ -94,6 +94,9 @@ bool PlayerController::openFile(const std::string& filename) {
         m_hasAudio = m_audioDecoder->init();
         if (m_hasAudio) {
             m_audioDecoder->setVolume(m_volume);
+            // Must happen before m_demuxer->start(): the read loop is not
+            // synchronized with this pointer assignment.
+            m_demuxer->attachAudioPausedFlag(&m_audioDecoder->pausedFlag());
         }
     }
 
@@ -614,8 +617,18 @@ void PlayerController::videoThreadLoop() {
                         df.pts = framePts;
                         df.width = frameWidth;
                         df.height = frameHeight;
-                        // Push will block if m_decodedFrameQueue size is maxed, or return false if aborted.
-                        if (!m_decodedFrameQueue.push(df)) {
+                        // Bounded wait, not an unconditional block: this
+                        // thread also owns draining m_videoQueue, so an
+                        // indefinite block here (e.g. the render thread
+                        // stalling for any reason) would silently stop this
+                        // thread from consuming any more video packets,
+                        // which in turn backs up the demuxer. Past the
+                        // timeout, drop the oldest buffered frame and keep
+                        // decoding instead of ever getting stuck.
+                        if (!m_decodedFrameQueue.push_wait_or_drop(df, std::chrono::milliseconds(500),
+                                                                    [](DecodedFrame& d) {
+                                                                        if (d.frame) av_frame_free(&d.frame);
+                                                                    })) {
                             av_frame_free(&df.frame);
                         }
                     } else {

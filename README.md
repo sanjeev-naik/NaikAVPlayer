@@ -13,6 +13,7 @@ NaikAVPlayer is a native, multi-threaded C++17 media engine and video player bui
 ## Key Features
 
 - **Symmetric Low-Latency Seeking:** Rapid keyframe seek operations flushing packet queues and decoding pipelines under 80ms.
+- **Stall-Proof Pipeline Backpressure:** Producer threads never block indefinitely on a full queue — bounded-wait pushes fall back to dropping the oldest queued item once a timeout elapses, so a paused audio device, a stalled render loop, or a wedged decoder can never freeze the single demuxer thread that feeds both the video and audio queues.
 - **Dynamic Hardware Decoder Fallback:** Tries platform-specific hardware decoders (D3D11VA, DXVA2, QSV, CUVID on Windows; V4L2M2M, VAAPI, QSV, CUVID on Linux), falling back dynamically to software H.264 decoding if hardware context allocation fails or encounters runtime surface mapping errors.
 - **Sub-10ms Audio-Video Synchronization:** Reconstructs the audio clock sample-accurately from PCM sample offsets to maintain A/V drift under 10ms.
 - **Dynamic Resolution Scaling:** Real-time playback scaling supporting dynamic output resolution selection (Original source, 360p, 480p, 720p, 1080p, 1440p, 4K) from the UI dropdown to optimize GPU upload bandwidth.
@@ -72,8 +73,8 @@ NaikAVPlayer follows a multi-threaded media player design with decoupled worker 
   └──────────────────────────────────────────────────────────┘
 ```
 
-- **Demuxer Thread**: Reads raw packets via `av_read_frame` and routes them into bounded `ThreadSafeQueue<AVPacket*>` instances (video capacity: 100 packets, audio capacity: 150 packets).
-- **Video Decoder Thread**: Background worker thread that pops packets from the video queue, decodes them (via hardware or software fallback), converts frames, and pushes them into the bounded `m_decodedFrameQueue` (capacity: 8 frames).
+- **Demuxer Thread**: Reads raw packets via `av_read_frame` and routes them into bounded `ThreadSafeQueue<AVPacket*>` instances (video capacity: 100 packets, audio capacity: 150 packets). Pushes never block indefinitely — see [Stall-Proof Queue Backpressure](#stall-proof-queue-backpressure-deadlock-prevention) below.
+- **Video Decoder Thread**: Background worker thread that pops packets from the video queue, decodes them (via hardware or software fallback), converts frames, and pushes them into the bounded `m_decodedFrameQueue` (capacity: 8 frames), using the same bounded-wait backpressure.
 - **Audio Decoding**: Executed sample-accurately inside the SDL3 Audio Stream callback thread. It pulls packets from the audio queue, decodes them to PCM, resamples as necessary via `swr_convert`, and feeds the output stream buffer.
 - **Main / Render Thread**: Dequeues decoded frames from `m_decodedFrameQueue` whose PTS matches the master clock time, updates the SDL YUV texture on the GPU, and renders the Dear ImGui interface overlay.
 
@@ -82,6 +83,13 @@ Instead of performing CPU-side YUV-to-RGB color space conversion, the video deco
 
 #### Dynamic Hardware Decoder Fallback
 At initialization, the video decoder queries native hardware codecs (`h264_d3d11va`, `h264_dxva2`, `h264_qsv`, `h264_cuvid` on Windows; `h264_vaapi`, `h264_v4l2m2m` on Linux). If hardware initialization fails or encounters runtime frame mapping errors (e.g. running inside headless or virtualized environments), the system intercepts the error, releases the hardware context, configures software `h264`, and resubmits pending packets seamlessly.
+
+#### Stall-Proof Queue Backpressure (Deadlock Prevention)
+The demuxer thread is the single reader for both the video and audio packet queues, so a producer that blocks indefinitely on either one would silently stop delivery to both — for example, the audio queue has no active consumer while the audio device is paused (during a seek catch-up, or simply while the user has playback paused). `ThreadSafeQueue` addresses this with two non-blocking-forever push variants used throughout the pipeline instead of a plain blocking `push()`:
+- **`push_wait_or_drop(value, timeout)`**: waits briefly for room, then drops the oldest queued item and pushes anyway once the timeout elapses. Used by the demuxer for both packet queues and by the video decoder thread for the decoded frame queue, so a paused consumer, a stalled render loop, or a wedged hardware decoder can never block a producer thread forever.
+- **`push_drop_oldest(value)`**: never waits — drops the oldest item immediately if the queue is full. Used for audio packets while the audio device is known to be idle (paused, or mid seek catch-up), since there's no point waiting on a consumer that isn't running at all.
+
+Both variants keep the pipeline making forward progress under any stall condition, and self-recover without needing an external nudge (such as another seek) to unblock a wedged queue.
 
 ### Audio-Master Clock Synchronization
 
@@ -339,6 +347,10 @@ This means SDL3 was compiled with only its `dummy`/`disk` audio drivers, because
 ### `h264_v4l2m2m unavailable` / falls back to software decode on Raspberry Pi 5
 
 This is expected on Raspberry Pi 5 and is not a bug. The Pi 5's SoC (BCM2712) only exposes a hardware **HEVC/H.265** decode block (`rpi-hevc-dec`, visible as `/dev/video19`); unlike the Pi 4 (BCM2711), it has **no hardware H.264 M2M decoder**. FFmpeg's `h264_v4l2m2m` decoder therefore can't find a matching V4L2 device, and `NaikAVPlayer`'s [Dynamic Hardware Decoder Fallback](#dynamic-hardware-decoder-fallback) correctly drops to software `h264` decoding, as logged. The Pi 5's Cortex-A76 cores decode 1080p H.264 in software without issue; only very high bitrate/resolution H.264 content may need to be transcoded to HEVC to make use of hardware decode.
+
+### Playback freezes / whole system appears to hang after rapid seeking or seeking while paused
+
+Fixed. This was caused by the demuxer thread — the single thread that reads both the video and audio streams — blocking indefinitely on a plain `push()` into the audio packet queue whenever nothing was draining it (audio is muted during a seek catch-up, and stays paused for as long as playback is paused). Once blocked there, it stopped calling `av_read_frame` entirely, so the video packet queue and decoded frame queue also drained to empty and playback appeared to hang. The only thing that used to "fix" it was issuing another seek, which happened to force a queue `clear()` that woke the blocked push. See [Stall-Proof Queue Backpressure](#stall-proof-queue-backpressure-deadlock-prevention) above for the fix — the pipeline now self-recovers from rapid seek storms and paused-seek sequences without any further nudge.
 
 ---
 

@@ -15,7 +15,7 @@ extern "C" {
 // Coordinates the seek catch-up phase between PlayerController and the
 // Demuxer. LANDING: the player repositions immediately and decodes up to the
 // target silently - only the target frame is shown. While it is active the
-// demuxer drops pre-target audio and throttles read-ahead past the target.
+// demuxer drops pre-target audio.
 enum class SeekCatchupMode { NONE = 0, LANDING };
 
 class Demuxer {
@@ -46,17 +46,21 @@ private:
     std::mutex m_seekMutex;
     std::atomic<bool> m_eof;
 
-    // Seek catch-up coordination: while active, audio packets from before the
-    // target are dropped and video read-ahead past the target is throttled.
+    // Seek catch-up coordination: while active, audio packets from before
+    // the target are dropped.
     std::atomic<SeekCatchupMode> m_catchupMode;
     std::atomic<double> m_catchupTarget;
     MetricRing<256>& m_demuxTimeRing;
     std::atomic<bool>& m_profilingEnabled;
 
+    // Set once the AudioDecoder exists (see attachAudioPausedFlag). Lets the
+    // read loop tell whether the audio packet queue currently has a consumer
+    // draining it, so it never blocks pushing to a queue nothing is popping.
+    std::atomic<bool>* m_audioPausedFlag = nullptr;
+
     void threadLoop();
     void performSeek();
     double packetTimeSeconds(const AVPacket* pkt, int streamIdx) const;
-    void throttleCatchupReadahead(double videoPtsSec);
 
 public:
     Demuxer(const std::string& filename, 
@@ -78,6 +82,11 @@ public:
 
     // Enter/leave seek catch-up mode (see SeekCatchupMode)
     void setCatchup(SeekCatchupMode mode, double targetSeconds);
+
+    // Give the demuxer a live view of AudioDecoder's paused flag. Must be
+    // called before start(), since the read loop is not synchronized with
+    // this pointer assignment.
+    void attachAudioPausedFlag(std::atomic<bool>* flag) { m_audioPausedFlag = flag; }
 
     // Getters
     int getVideoStreamIndex() const { return m_videoStreamIdx; }

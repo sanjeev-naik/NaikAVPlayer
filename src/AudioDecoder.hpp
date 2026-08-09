@@ -82,4 +82,9 @@ public:
     void setVolume(float volume); // 0.0 to 1.0
 
     int getAudioStreamQueuedBytes() const;
+
+    // Live reference to the paused flag, toggled by pause()/resume()/start().
+    // Lets the demuxer check whether anything is currently draining the
+    // audio packet queue before deciding whether it's safe to block on it.
+    std::atomic<bool>& pausedFlag() { return m_paused; }
 };
