@@ -216,6 +216,7 @@ void PlayerController::seek(double seconds) {
         return;
     }
 
+    uint64_t activeEpoch = 0;
     {
         std::lock_guard<std::mutex> lock(m_catchupMutex);
         if (!catchupActive) {
@@ -224,6 +225,16 @@ void PlayerController::seek(double seconds) {
         m_catchupTarget.store(seconds);
         m_catchupPos.store(seconds);
         m_catchupMode.store(SeekCatchupMode::LANDING);
+        // Bump the epoch together with the new target, not later: a frame
+        // already mid-decode from before this seek captures its epoch
+        // snapshot up front (see threadLoop()) but only gets checked against
+        // m_catchupEpoch after decode finishes, which can be well after this
+        // point. If the epoch bump were delayed (as it used to be, until
+        // after the demuxer seek/queue clears below), such a frame could
+        // still match the old epoch, get compared against the *already
+        // updated* m_catchupTarget above, and spuriously call finishCatchup()
+        // with a stale pts -- stomping the target this call just set.
+        activeEpoch = m_catchupEpoch.fetch_add(1) + 1;
     }
 
     // Mute audio for the duration of the catch-up phase; it resumes in sync
@@ -250,7 +261,6 @@ void PlayerController::seek(double seconds) {
         }
     }
     m_seeking.store(false);
-    uint64_t activeEpoch = m_catchupEpoch.fetch_add(1) + 1;
     if (m_metrics->m_profilingEnabled.load(std::memory_order_relaxed)) {
         m_seekStartTime = std::chrono::steady_clock::now();
         m_seekStartEpoch = activeEpoch;
