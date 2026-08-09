@@ -283,6 +283,10 @@ int main(int argc, char *argv[]) {
                "arrow keys to seek 10s."
             << std::endl;
 
+  // cppcheck-suppress knownConditionTrueFalse
+  // isSignalQuitRequested() is a hardcoded `return false` stub on Windows
+  // (only POSIX gets real signal-handling via g_signalQuit) -- always-true
+  // here is intentional cross-platform behavior, not a bug.
   while (!quit && !isSignalQuitRequested()) {
     double currentSecs = SDL_GetTicks() / 1000.0;
 

@@ -776,8 +776,14 @@ int real_main(int argc, char* argv[]) {
                 waitForCatchup(20.0);
                 test_assert(!catchupController.isCatchingUp(),
                             "Rapid seek storm (playing) settles without another nudge");
+                // cppcheck-suppress knownConditionTrueFalse
+                // False positive: driveFor() calls drainFrames(), which
+                // increments framesDrainedTotal by reference two lambda
+                // layers away from this scope. cppcheck's value flow doesn't
+                // follow the mutation through that indirection.
                 framesDrainedTotal = 0;
                 driveFor(1.0);
+                // cppcheck-suppress knownConditionTrueFalse
                 test_assert(framesDrainedTotal > 0,
                             "Video frames are being produced again after the playing seek storm");
                 test_assert(catchupController.getState() == PlayerState::PLAYING,
@@ -794,8 +800,12 @@ int real_main(int argc, char* argv[]) {
                 waitForCatchup(20.0);
                 test_assert(!catchupController.isCatchingUp(),
                             "Rapid seek storm (paused) settles without another nudge");
+                // cppcheck-suppress knownConditionTrueFalse
+                // Same false positive as above (driveFor -> drainFrames
+                // mutates framesDrainedTotal through nested lambda capture).
                 framesDrainedTotal = 0;
                 driveFor(1.0);
+                // cppcheck-suppress knownConditionTrueFalse
                 test_assert(framesDrainedTotal > 0,
                             "Video frames are being produced again after the paused seek storm");
                 test_assert(catchupController.getState() == PlayerState::PLAYING,
