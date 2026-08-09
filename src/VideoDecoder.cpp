@@ -58,18 +58,40 @@ bool VideoDecoder::init() {
   AVCodecContext *codecCtx = nullptr;
   const AVCodec *codec = nullptr;
 
-  if (m_codecParams->codec_id == AV_CODEC_ID_H264 && !g_disableHardwareDecoders) {
-    const char *candidates[] = {
+  const char **candidates = nullptr;
+  size_t numCandidates = 0;
+
+  const char *h264Candidates[] = {
 #ifdef _WIN32
-        "h264_d3d11va", "h264_dxva2", "h264_qsv", "h264_cuvid",
+      "h264_d3d11va", "h264_dxva2", "h264_qsv", "h264_cuvid",
 #endif
-
 #ifdef __linux__
-        "h264_v4l2m2m", "h264_vaapi", "h264_qsv", "h264_cuvid",
+      "h264_vaapi", "h264_qsv", "h264_cuvid", "h264_v4l2m2m",
 #endif
-    };
+  };
 
-    for (const char *name : candidates) {
+  const char *hevcCandidates[] = {
+#ifdef _WIN32
+      "hevc_d3d11va", "hevc_dxva2", "hevc_qsv", "hevc_cuvid",
+#endif
+#ifdef __linux__
+      "hevc_v4l2m2m", "hevc_vaapi", "hevc_qsv", "hevc_cuvid",
+#endif
+  };
+
+  if (!g_disableHardwareDecoders) {
+    if (m_codecParams->codec_id == AV_CODEC_ID_H264) {
+      candidates = h264Candidates;
+      numCandidates = sizeof(h264Candidates) / sizeof(h264Candidates[0]);
+    } else if (m_codecParams->codec_id == AV_CODEC_ID_HEVC) {
+      candidates = hevcCandidates;
+      numCandidates = sizeof(hevcCandidates) / sizeof(hevcCandidates[0]);
+    }
+  }
+
+  if (candidates && numCandidates > 0) {
+    for (size_t i = 0; i < numCandidates; ++i) {
+      const char *name = candidates[i];
       const AVCodec *candidate = avcodec_find_decoder_by_name(name);
       if (!candidate)
         continue;
@@ -83,50 +105,52 @@ bool VideoDecoder::init() {
         continue;
       }
 
-      // For hardware decoders, thread pool synchronization adds
-      // overhead/latency. Set thread_count to 1 and disable frame-level
-      // threading.
       ctx->thread_count = 1;
       ctx->thread_type = 0;
       ctx->pkt_timebase = m_timeBase;
 
       // Try opening this decoder.
       if (avcodec_open2(ctx, candidate, nullptr) == 0) {
-        // DRY-RUN CHECK: Validate hardware session initialization using
-        // extradata. This is crucial to detect cases where avcodec_open2()
-        // succeeds but decoding fails (e.g. QSV on headless VMs without GPU
-        // drivers).
-        AVPacket *testPkt = av_packet_alloc();
-        if (m_codecParams->extradata && m_codecParams->extradata_size > 0) {
-          testPkt->data = m_codecParams->extradata;
-          testPkt->size = m_codecParams->extradata_size;
-        }
-        int sendRet = avcodec_send_packet(ctx, testPkt);
-        testPkt->data = nullptr;
-        testPkt->size = 0;
-        av_packet_free(&testPkt);
+        std::string candName(name);
+        bool isV4L2 = (candName.find("v4l2m2m") != std::string::npos);
 
-        int receiveRet = AVERROR(EAGAIN);
-        if (sendRet >= 0 || sendRet == AVERROR(EAGAIN) ||
-            sendRet == AVERROR_INVALIDDATA) {
-          AVFrame *tempFrame = av_frame_alloc();
-          if (tempFrame) {
-            receiveRet = avcodec_receive_frame(ctx, tempFrame);
-            av_frame_free(&tempFrame);
+        bool probeOk = true;
+        // DRY-RUN CHECK: Validate hardware session initialization for non-v4l2 decoders.
+        // For v4l2m2m (e.g. Raspberry Pi), sending raw extradata packets can cause
+        // kernel ioctl(VIDIOC_DQBUF) to block in uninterruptible sleep (D-state).
+        if (!isV4L2) {
+          AVPacket *testPkt = av_packet_alloc();
+          if (m_codecParams->extradata && m_codecParams->extradata_size > 0) {
+            testPkt->data = m_codecParams->extradata;
+            testPkt->size = m_codecParams->extradata_size;
           }
+          int sendRet = avcodec_send_packet(ctx, testPkt);
+          testPkt->data = nullptr;
+          testPkt->size = 0;
+          av_packet_free(&testPkt);
+
+          int receiveRet = AVERROR(EAGAIN);
+          if (sendRet >= 0 || sendRet == AVERROR(EAGAIN) ||
+              sendRet == AVERROR_INVALIDDATA) {
+            AVFrame *tempFrame = av_frame_alloc();
+            if (tempFrame) {
+              receiveRet = avcodec_receive_frame(ctx, tempFrame);
+              av_frame_free(&tempFrame);
+            }
+          }
+
+          bool sendOk =
+              (sendRet >= 0 || sendRet == AVERROR(EAGAIN) ||
+               sendRet == AVERROR_EOF || sendRet == AVERROR_INVALIDDATA);
+          bool receiveOk = (receiveRet >= 0 || receiveRet == AVERROR(EAGAIN) ||
+                            receiveRet == AVERROR_EOF);
+          probeOk = sendOk && receiveOk;
         }
 
-        bool sendOk =
-            (sendRet >= 0 || sendRet == AVERROR(EAGAIN) ||
-             sendRet == AVERROR_EOF || sendRet == AVERROR_INVALIDDATA);
-        bool receiveOk = (receiveRet >= 0 || receiveRet == AVERROR(EAGAIN) ||
-                          receiveRet == AVERROR_EOF);
-
-        if (sendOk && receiveOk) {
+        if (probeOk) {
           codec = candidate;
           codecCtx = ctx;
-          avcodec_flush_buffers(
-              codecCtx); // <-- reset internal state after the dry-run probe
+          avcodec_flush_buffers(codecCtx); // reset internal state after probe
           std::cout << "Using decoder: " << codec->name << '\n';
           break;
         }
@@ -573,13 +597,6 @@ constexpr int kMaxHardwareRecoveryAttempts = 2;
 } // namespace
 
 bool VideoDecoder::recoverHardwareDecoder() {
-  // A genuine hardware decode failure was just observed (stuck, send error,
-  // or receive error). Try a fresh session for the same hardware codec
-  // first -- most failures of this kind (e.g. QSV's surface pool getting
-  // into a bad state) are recoverable by starting over, and this lets
-  // playback return to hardware instead of being stuck on software forever.
-  // Only fall back to software if the hardware codec itself won't reopen,
-  // or keeps failing right after being reopened.
   if (m_hardwareRecoveryAttempts < kMaxHardwareRecoveryAttempts) {
     m_hardwareRecoveryAttempts++;
     if (reopenHardwareDecoder()) {
@@ -588,6 +605,7 @@ bool VideoDecoder::recoverHardwareDecoder() {
       return true;
     }
   }
+  g_disableHardwareDecoders = true; // Permanently disable hardware decoders for session to prevent driver loops
   return fallbackToSoftware();
 }
 

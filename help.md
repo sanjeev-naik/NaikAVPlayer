@@ -245,6 +245,17 @@ The user interface uses Dear ImGui with frosted translucency overlay.
 
 ---
 
+## 5a. Pipeline Backpressure & Deadlock Prevention
+
+The single demuxer thread reads both the video and audio packet streams via `av_read_frame`, so if a push into either queue ever blocked indefinitely, packet delivery to *both* streams would silently stop — for example, nothing drains the audio packet queue while the audio device is paused (a seek catch-up, or simply the user pausing playback). `ThreadSafeQueue` (`src/ThreadSafeQueue.hpp`) provides two bounded push variants used in place of a plain blocking `push()` wherever a producer thread cannot afford to stall:
+
+- **`push_wait_or_drop(value, timeoutMs, dropCleanup)`**: waits up to `timeoutMs` for room, then drops the oldest queued entry (invoking `dropCleanup` on it, if given) and pushes anyway. This is the structural backstop for the demuxer's video/audio packet pushes and the video decode thread's push into the decoded frame queue (all with a 500ms timeout) — no matter what stalls the consumer (a paused device, a wedged hardware decoder, a stuck render loop), the producer thread always returns and keeps making progress.
+- **`push_drop_oldest(value, dropCleanup)`**: never waits at all — drops the oldest entry immediately if full. Used for audio packets specifically while the audio consumer is known to be idle (paused, or mid seek catch-up), since waiting on a consumer that isn't running serves no purpose.
+
+This also replaced the previous PTS-based `throttleCatchupReadahead()` mechanism that capped video read-ahead during seek catch-up: the queue's own bounded-wait-then-drop behavior now throttles read-ahead naturally, tracking actual decoder throughput instead of a fixed "1 second past target" heuristic. See [Section 9](#9-troubleshooting) for the hang symptom this fixes, and `tests/tests.cpp` (`T7b`, `T7c`, and the "rapid consecutive seek recovery" integration case) for the regression coverage.
+
+---
+
 ## 6. Security, Maintenance & Dependency Management
 
 - **Upstream Dependencies**: Build dependencies are pinned in `CMakeLists.txt` (`SDL3` `release-3.4.0`, `imgui` `v1.91.9`, `nativefiledialog-extended` `v1.2.1`, FFmpeg `n8.1.2`).
@@ -283,16 +294,3 @@ The execution pipeline tracks 9 metrics using lock-free Single Producer Single C
 
 ---
 
-## 9. Troubleshooting
-
-### `Could not initialize SDL3: No available audio device` (Linux only)
-
-**Cause:** SDL3 detects its Linux audio backends (ALSA, PipeWire, PulseAudio) via `pkg-config` at CMake configure time. If none of `libasound2-dev`, `libpipewire-0.3-dev`, or `libpulse-dev` are installed, SDL3's build silently falls back to its `dummy`/`disk`-only audio drivers — the configure and build steps report no error, but the resulting binary has no real audio output and fails at launch.
-
-**Why only Linux (and not Windows):** SDL3's Windows audio backend (WASAPI) is a native Win32 API bundled with the OS SDK, so MSVC/MinGW builds always have a working backend with no separate dev package to install. Only the Linux build path depends on `pkg-config`-discovered system libraries, which is why this failure is specific to Linux hosts such as Raspberry Pi OS.
-
-**Fix:** Install the packages listed in [Section 1](#1-linux-binary-compatibility-limitation--prerequisites) for your distribution, then reconfigure (`cmake -B build ...`) — not just rebuild — so SDL3's `pkg-config` detection re-runs. `CMakeLists.txt` now performs this same check itself before fetching SDL3: on Linux, if none of `alsa`, `libpipewire-0.3`, or `libpulse` are found via `pkg-config`, configuration stops immediately with a `FATAL_ERROR` naming the exact packages to install, rather than producing a build that only fails later at runtime.
-
-### `Hardware decoder h264_v4l2m2m unavailable, trying next...` on Raspberry Pi 5
-
-**Cause:** This is expected, not an error. Raspberry Pi 5's SoC (BCM2712) only implements a hardware **HEVC/H.265** decode block (kernel driver `rpi-hevc-dec`, exposed as `/dev/video19`) — unlike the Pi 4 (BCM2711), it has no hardware M2M path for H.264. FFmpeg's `h264_v4l2m2m` decoder cannot find a matching V4L2 device for H.264 streams, so it reports "Could not find a valid device" and NaikAVPlayer's dynamic fallback (Section 5) correctly moves on to software `h264` decoding — playback is unaffected, it just isn't hardware-accelerated. HEVC content on Pi 5 is unaffected by this and can still use hardware decode.

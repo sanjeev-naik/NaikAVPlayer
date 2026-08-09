@@ -12,6 +12,22 @@
 // Cross-platform native file dialog via Native File Dialog Extended (NFD)
 #include <SDL3/SDL_properties.h>
 #include <nfd.hpp>
+#include <csignal>
+
+#ifndef _WIN32
+static std::atomic<bool> g_signalQuit{false};
+static void signalHandler(int sig) {
+  (void)sig;
+  g_signalQuit.store(true);
+}
+static bool isSignalQuitRequested() {
+  return g_signalQuit.load();
+}
+#else
+static bool isSignalQuitRequested() {
+  return false;
+}
+#endif
 
 // Populates args.parentWindow from the SDL3 window's native handle.
 //
@@ -136,6 +152,10 @@ static SDL_Colorspace getSDLColorspace(const AVFrame *frame) {
 }
 
 int main(int argc, char *argv[]) {
+#ifndef _WIN32
+  std::signal(SIGINT, signalHandler);
+  std::signal(SIGTERM, signalHandler);
+#endif
   SDL_SetMainReady();
 
   // Initialize Native File Dialog Extended (RAII)
@@ -263,7 +283,11 @@ int main(int argc, char *argv[]) {
                "arrow keys to seek 10s."
             << std::endl;
 
-  while (!quit) {
+  // cppcheck-suppress knownConditionTrueFalse
+  // isSignalQuitRequested() is a hardcoded `return false` stub on Windows
+  // (only POSIX gets real signal-handling via g_signalQuit) -- always-true
+  // here is intentional cross-platform behavior, not a bug.
+  while (!quit && !isSignalQuitRequested()) {
     double currentSecs = SDL_GetTicks() / 1000.0;
 
     // 1. Process Windows Events & Input Routing

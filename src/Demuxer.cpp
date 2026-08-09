@@ -4,6 +4,16 @@
 #include <cmath>
 #include <limits>
 
+namespace {
+// Upper bound on how long the read loop will ever wait for room in a packet
+// queue before giving up and dropping the oldest entry instead. Generous
+// enough that it never engages under normal backpressure (decode keeps up
+// with real-time content well within this window), but guarantees the
+// single demuxer thread -- which feeds both streams -- can never be stuck
+// indefinitely regardless of what stalls the consumer on the other end.
+constexpr std::chrono::milliseconds kQueuePushTimeout{500};
+} // namespace
+
 Demuxer::Demuxer(const std::string& filename, 
                  ThreadSafeQueue<AVPacket*>& videoQueue, 
                  ThreadSafeQueue<AVPacket*>& audioQueue,
@@ -149,22 +159,6 @@ double Demuxer::packetTimeSeconds(const AVPacket* pkt, int streamIdx) const {
     return (ts - m_audioStartTime) * av_q2d(m_audioTimeBase);
 }
 
-void Demuxer::throttleCatchupReadahead(double videoPtsSec) {
-    // Called after pushing a video packet while a seek catch-up is active.
-    // Once we've read slightly past the target there is no point in racing
-    // further ahead of the decoder - the extra packets would only fill the
-    // audio queue and stall the pipeline. Bails out as soon as a new seek is
-    // requested or the catch-up ends.
-    if (std::isnan(videoPtsSec)) {
-        return;
-    }
-    while (m_running.load() && !m_seekRequested.load() &&
-           m_catchupMode.load() != SeekCatchupMode::NONE &&
-           videoPtsSec > m_catchupTarget.load() + 1.0) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
-    }
-}
-
 void Demuxer::performSeek() {
     std::lock_guard<std::mutex> lock(m_seekMutex);
     
@@ -238,17 +232,29 @@ void Demuxer::threadLoop() {
             SeekCatchupMode cmode = m_catchupMode.load();
 
             if (packet->stream_index == m_videoStreamIdx) {
-                double ptsSec = packetTimeSeconds(packet, m_videoStreamIdx);
-                if (!m_videoQueue.push(packet)) {
+                // Bounded wait, not an unconditional block: this is the only
+                // thread that reads either stream, so if the video decode
+                // thread were ever wedged (a hung hardware decoder, a bug
+                // not yet found) an indefinite block here would silently
+                // stop packet delivery to BOTH queues forever, with no way
+                // to recover short of tearing down playback. Past the
+                // timeout, drop the oldest queued packet and keep reading
+                // instead, so the pipeline can never get permanently stuck.
+                // This 100-packet cap is also what naturally throttles
+                // read-ahead during a seek catch-up scan, in place of a
+                // separate pts-based throttle: it tracks actual decoder
+                // throughput (including B-frame reorder delay) instead of a
+                // fixed "1 second past target" heuristic that can't tell the
+                // difference between "nearly done" and "decoder needs many
+                // more packets before it can produce the target frame".
+                if (!m_videoQueue.push_wait_or_drop(packet, kQueuePushTimeout,
+                                                     [](AVPacket*& p) { av_packet_free(&p); })) {
                     av_packet_free(&packet);
-                }
-                if (cmode != SeekCatchupMode::NONE) {
-                    throttleCatchupReadahead(ptsSec);
                 }
             } else if (packet->stream_index == m_audioStreamIdx) {
                 // During catch-up the audio device is paused: audio from
                 // before the seek target is useless and would only clog the
-                // queue (blocking this thread), so drop it here.
+                // queue, so drop it here.
                 bool drop = false;
                 if (cmode != SeekCatchupMode::NONE) {
                     double ptsSec = packetTimeSeconds(packet, m_audioStreamIdx);
@@ -258,7 +264,29 @@ void Demuxer::threadLoop() {
                     }
                 }
 
-                if (drop || !m_audioQueue.push(packet)) {
+                // Nothing drains the audio queue whenever the audio device
+                // itself is paused (not just during a catch-up scan - e.g.
+                // seeking, or scrubbing, while playback is paused). A
+                // blocking push in that state can stall this thread forever
+                // once the queue fills, which also starves the video queue
+                // since both streams are read by this one loop.
+                bool audioConsumerIdle = (cmode != SeekCatchupMode::NONE) ||
+                    (m_audioPausedFlag && m_audioPausedFlag->load());
+
+                bool pushed;
+                if (drop) {
+                    pushed = false;
+                } else if (audioConsumerIdle) {
+                    // Drop the oldest buffered packet instead of blocking, so
+                    // the demuxer always keeps making progress.
+                    pushed = m_audioQueue.push_drop_oldest(packet, [](AVPacket*& p) { av_packet_free(&p); });
+                } else {
+                    // Same bounded-wait backstop as the video queue above.
+                    pushed = m_audioQueue.push_wait_or_drop(packet, kQueuePushTimeout,
+                                                             [](AVPacket*& p) { av_packet_free(&p); });
+                }
+
+                if (!pushed) {
                     av_packet_free(&packet);
                 }
             } else {
