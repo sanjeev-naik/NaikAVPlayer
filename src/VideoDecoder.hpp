@@ -3,6 +3,7 @@
 #include <string>
 #include <atomic>
 #include <algorithm>
+#include <cstdint>
 #include "ThreadSafeQueue.hpp"
 #include "MetricRing.hpp"
 #include <chrono>
@@ -101,6 +102,14 @@ private:
     std::chrono::steady_clock::time_point m_decodeStart;
     bool m_hasDecodeStart = false;
 
+    // Live pointer to the demuxer's seek-generation counter (see
+    // Demuxer::attachSeekGeneration / m_seekGeneration comment in
+    // Demuxer.hpp). When set, a packet whose opaque-tagged generation
+    // doesn't match this counter's current value is dropped as soon as it's
+    // popped, before ever reaching the codec -- so a frame decoded from
+    // before the most recent seek can never be produced in the first place.
+    std::atomic<uint64_t>* m_seekGeneration = nullptr;
+
     static bool isHardwareDecoder(const AVCodec* codec) noexcept;
     static bool isHardwarePixelFormat(AVPixelFormat fmt);
     bool fallbackToSoftware();
@@ -123,7 +132,12 @@ public:
     ~VideoDecoder();
 
     bool init();
-    
+
+    // Must be called before decodeNextFrame() is first used from another
+    // thread, since the decode loop isn't synchronized with this pointer
+    // assignment. See m_seekGeneration above.
+    void attachSeekGeneration(std::atomic<uint64_t>* gen) { m_seekGeneration = gen; }
+
     // Decode the next video frame from the queue.
     // Returns true if a frame was successfully decoded and stored in m_yuvFrame.
     bool decodeNextFrame();

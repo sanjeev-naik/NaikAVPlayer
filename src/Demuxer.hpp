@@ -53,6 +53,23 @@ private:
     MetricRing<256>& m_demuxTimeRing;
     std::atomic<bool>& m_profilingEnabled;
 
+    // Bumped once per completed seek (in performSeek(), after repositioning
+    // the format context but before any further packets are read). Every
+    // packet pushed afterward is tagged with this generation via its
+    // opaque field (see threadLoop()). Consumers (VideoDecoder/AudioDecoder,
+    // via attachSeekGeneration()) compare a packet's tag against this
+    // counter's *current* live value at the moment they pop it, and drop
+    // the packet if it doesn't match -- catching staleness by where the
+    // packet's data actually came from, not by when the consumer thread's
+    // loop iteration happened to start. That distinction matters: a packet
+    // can be read from the pre-seek position and pushed to the queue in the
+    // brief window between a new seek being requested and this thread
+    // noticing it, surviving the caller's one-shot queue clear; a purely
+    // consumer-side "epoch snapshot before decoding" check (as used
+    // elsewhere for catch-up landing) can't see that, since by the time the
+    // consumer picks the packet up its own epoch may already have advanced.
+    std::atomic<uint64_t> m_seekGeneration{0};
+
     // Set once the AudioDecoder exists (see attachAudioPausedFlag). Lets the
     // read loop tell whether the audio packet queue currently has a consumer
     // draining it, so it never blocks pushing to a queue nothing is popping.
@@ -87,6 +104,11 @@ public:
     // called before start(), since the read loop is not synchronized with
     // this pointer assignment.
     void attachAudioPausedFlag(std::atomic<bool>* flag) { m_audioPausedFlag = flag; }
+
+    // Live pointer to the seek-generation counter, for VideoDecoder/
+    // AudioDecoder to compare a popped packet's tag against (see
+    // attachSeekGeneration() on those classes).
+    std::atomic<uint64_t>* seekGenerationPtr() { return &m_seekGeneration; }
 
     // Getters
     int getVideoStreamIndex() const { return m_videoStreamIdx; }

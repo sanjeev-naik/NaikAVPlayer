@@ -33,6 +33,7 @@ sudo apt-get install -y \
   libavutil-dev \
   libswscale-dev \
   libswresample-dev \
+  libavfilter-dev \
   libgtk-3-dev \
   libxss-dev \
   libasound2-dev \
@@ -232,6 +233,7 @@ The user interface uses Dear ImGui with frosted translucency overlay.
 | **`Right Arrow`** | Seek forward 10 seconds |
 | **`L`** | Toggle Loop Mode |
 | **`D`** | Toggle Diagnostics HUD overlay |
+| **`A`** | Toggle Audio Processing panel (EQ, compressor, limiter, crossover, loudness, channel selection) |
 | **`Escape`** | Exit application |
 
 ---
@@ -256,11 +258,31 @@ This also replaced the previous PTS-based `throttleCatchupReadahead()` mechanism
 
 ---
 
+## 5b. Audio DSP & Loudness Pipeline
+
+Every decoded audio buffer runs through a fixed, in-place signal chain inside the SDL3 audio callback (`AudioDecoder::decodeAndResample()`, `src/AudioDecoder.cpp`), entirely as interleaved `AV_SAMPLE_FMT_FLT` — never the S16 device format — until the very last step:
+
+```text
+decode -> resample (swresample, libsoxr engine) -> DSP chain
+  (parametric EQ -> compressor -> limiter -> LFE crossover)
+  -> loudness normalization (EBU R128) -> TPDF dither -> S16 output
+```
+
+- **DSP chain** (`src/audio/dsp/`): hand-rolled `Biquad`/`ParametricEQ` (RBJ cookbook, 5 bands), `Compressor` (soft-knee, linked-multichannel detection), `Limiter` (fast-attack, hard-ceiling backstop), `Crossover` (Linkwitz-Riley 4th-order lowpass, targets the LFE channel only). Orchestrated by `DspChain`, disabled by default -- every stage is a true no-op (0 dB / 1:1 ratio / 0 dB ceiling) until configured, so wiring it into the pipeline didn't change existing playback behavior on its own.
+- **Loudness normalization** (`src/audio/dsp/LoudnessMeter.hpp` / `LoudnessNormalizer.hpp`): wraps a minimal `libavfilter` graph (`abuffer -> ebur128 -> abuffersink`) for real-time momentary/integrated LUFS, reading FFmpeg's own metadata output (`lavfi.r128.M`/`.I`) rather than a hand-rolled K-weighting/gating implementation -- loudness *measurement* needs to match the real ITU-R BS.1770 spec to mean anything, unlike the DSP effects above. Applies a heavily-smoothed (multi-second) gain correction toward a configurable LUFS target; real-time/streaming measurement only (not the two-pass "scan whole file first" mode).
+- **Resampler**: `swr_alloc_set_opts2`'s `"resampler"` AVOption is set to `"soxr"` (SoX Resampler) instead of swresample's own default engine, for better stopband rejection. This project's vendored FFmpeg build has libsoxr compiled in (confirmed via `--enable-libsoxr` in its `ffmpeg -version` configuration string); if a build ever lacks it, `av_opt_set()` fails gracefully and swresample's own (still correct, just lower-quality) resampler is used instead.
+- **Dither**: applied once, at the final float-to-S16 truncation in the SDL callback -- triangular (TPDF) dither, the sum of two independent uniform draws, decorrelating quantization error from the signal far better than plain rounding.
+- **Thread safety**: `AudioDecoder::applyDspSettings()` lets the UI thread change any DSP/loudness parameter while the SDL audio callback thread concurrently calls `process()` on the same objects -- both sides take a single short-held mutex (`m_dspMutex`). The older `dsp()`/`loudness()` raw accessors remain but are **not** synchronized; they're for tests and pre-playback setup only, not live control.
+- **Multichannel routing**: `AudioDecoder` preserves 2.1/5.1/5.1(back)/7.1 source layouts straight through to a matching multichannel `SDL_AudioSpec` when possible (see [Section 1](#1-linux-binary-compatibility-limitation--prerequisites) for the underlying audio backend prerequisites), with a stereo fallback if the device rejects it. A successful device open does not by itself prove real multichannel hardware is connected -- shared-mode audio APIs silently downmix -- so `AudioDecoder` also queries the device's native channel count via `SDL_GetAudioDeviceFormat` and surfaces both numbers in the Audio Processing panel. `AudioChannelOption::FORCE_STEREO` (panel dropdown, applied on next file open) lets a user override automatic detection outright.
+- **Config file**: all of the above persists in `player_settings.txt` (key=value lines: `dsp_enabled`, `eq_band0`-`eq_band4`, `compressor_*`, `limiter_*`, `crossover_*`, `loudness_*`, `channel_option`), with a tested fallback for the pre-existing legacy format (a single bare resolution integer).
+
+---
+
 ## 6. Security, Maintenance & Dependency Management
 
 - **Upstream Dependencies**: Build dependencies are pinned in `CMakeLists.txt` (`SDL3` `release-3.4.0`, `imgui` `v1.91.9`, `nativefiledialog-extended` `v1.2.1`, FFmpeg `n8.1.2`).
 - **Updating Dependencies**: Update tag entries or archive SHA-256 hashes inside `CMakeLists.txt`.
-- **Packaging Compliance**: Release packages compiled by CI include a complete `licenses/` directory containing third-party licenses (`LICENSE.lgpl-2.1`, `LICENSE.sdl3`, `LICENSE.imgui`, `LICENSE.nfd`, `LICENSE.winpthread`, `FFMPEG_CREDITS.txt`), project `LICENSE`, `README.md`, and executable binaries.
+- **Packaging Compliance**: Release packages compiled by CI include a complete `licenses/` directory containing third-party licenses (`LICENSE.lgpl-3`, `LICENSE.sdl3`, `LICENSE.imgui`, `LICENSE.nfd`, `LICENSE.winpthread`, `FFMPEG_CREDITS.txt`), project `LICENSE`, `README.md`, and executable binaries. `FFMPEG_CREDITS.txt` also credits the bundled libsoxr resampler and the `avfilter`/`ebur128` component now used for loudness metering (see [Section 5b](#5b-audio-dsp--loudness-pipeline)) -- this build uses FFmpeg's `--enable-version3` flag, so LGPL v3 applies to the FFmpeg binaries themselves (libsoxr keeps its own LGPL v2.1+ terms).
 
 ---
 

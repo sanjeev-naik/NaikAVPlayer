@@ -60,6 +60,17 @@ private:
     
     float m_volume;
 
+    // UI-thread-only copy, mirroring m_volume's pattern: written/read only
+    // from the UI thread (single-writer/single-reader), applied to the
+    // audio callback thread's actual filter state via the thread-safe
+    // AudioDecoder::applyDspSettings() -- see setAudioDspSettings() below.
+    naikav::dsp::AudioDspSettings m_audioDspSettings;
+
+    // Applied to AudioDecoder before init() in openFile() (see
+    // AudioChannelOption). UI-thread-only, same single-writer/single-reader
+    // rationale as m_volume/m_audioDspSettings above.
+    AudioChannelOption m_channelOption = AudioChannelOption::AUTO;
+
     bool m_loopEnabled;
 
     // Background video decoding thread
@@ -139,6 +150,9 @@ public:
     // active (so repeated +10s presses stack), otherwise the current time.
     double getSeekReferenceTime();
     std::string getAudioCodecName() const;
+    // Resolved output channel layout name (e.g. "stereo", "5.1", "7.1"); see
+    // AudioDecoder::getOutputChannelLayoutName().
+    std::string getAudioChannelLayoutName() const;
     double getAudioClock();
     double getVideoClock() const;
     bool hasAudio() const { return m_hasAudio; }
@@ -159,6 +173,51 @@ public:
     void setResolutionOption(ResolutionOption option);
     int getPlaybackWidth() const;
     int getPlaybackHeight() const;
+
+    // Audio DSP/loudness settings (EQ, compressor, limiter, crossover,
+    // loudness target). Safe to call during playback -- see
+    // AudioDecoder::applyDspSettings() for the thread-safety story. Applies
+    // immediately but does NOT write to disk (see persistAudioDspSettings())
+    // -- callers driving this from a continuously-changing UI control (e.g.
+    // a slider being dragged) should apply on every change for live audio
+    // feedback, but only persist once the interaction settles.
+    void setAudioDspSettings(const naikav::dsp::AudioDspSettings& settings);
+    const naikav::dsp::AudioDspSettings& getAudioDspSettings() const { return m_audioDspSettings; }
+    // Writes the current settings (resolution + audio DSP) to disk. Call
+    // this once an interaction is done (e.g. ImGui::IsItemDeactivatedAfterEdit()),
+    // not on every intermediate value change.
+    void persistAudioDspSettings() { saveSettings(); }
+    double getMeasuredIntegratedLufs() const {
+        return (m_hasAudio && m_audioDecoder) ? m_audioDecoder->getMeasuredIntegratedLufs() : -120.0;
+    }
+    float getCurrentLoudnessGainDb() const {
+        return (m_hasAudio && m_audioDecoder) ? m_audioDecoder->getCurrentLoudnessGainDb() : 0.0f;
+    }
+    // Resolved output channel count (e.g. 2 for stereo, 6 for 5.1). 0 if
+    // there's no audio stream. See getAudioChannelLayoutName() for the
+    // human-readable name (e.g. "5.1(side)").
+    int getAudioChannelCount() const {
+        return (m_hasAudio && m_audioDecoder) ? m_audioDecoder->getOutputChannelCount() : 0;
+    }
+    // The real default playback device's native channel count as reported
+    // by the OS (0 if unknown). If this is lower than getAudioChannelCount(),
+    // the OS's own audio mixer is silently downmixing what NaikAVPlayer
+    // sends -- the resolved output layout does not guarantee that many
+    // physical speakers are actually reproducing discrete channels.
+    int getAudioDeviceNativeChannels() const {
+        return (m_hasAudio && m_audioDecoder) ? m_audioDecoder->getDeviceNativeChannels() : 0;
+    }
+
+    // User override for output channel resolution (AUTO preserves source
+    // surround layout when supported; FORCE_STEREO always downmixes).
+    // Takes effect on the next openFile() call, not live during current
+    // playback (changing channel count requires reopening the audio
+    // device). Persisted to disk like resolution/DSP settings.
+    AudioChannelOption getAudioChannelOption() const { return m_channelOption; }
+    void setAudioChannelOption(AudioChannelOption option) {
+        m_channelOption = option;
+        saveSettings();
+    }
 
     // Queue depths
     size_t getVideoPacketQueueSize() const { return m_videoQueue.size(); }

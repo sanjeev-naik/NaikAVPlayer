@@ -345,6 +345,9 @@ int main(int argc, char *argv[]) {
         case SDLK_D:
           playerUI.toggleDiagnostics();
           break;
+        case SDLK_A:
+          playerUI.toggleAudioSettings();
+          break;
         default:
           break;
         }

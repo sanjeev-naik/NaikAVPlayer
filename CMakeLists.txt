@@ -309,12 +309,14 @@ if(FFMPEG_USE_SYSTEM)
         libavformat
         libavutil
         libswscale
-        libswresample)
+        libswresample
+        libavfilter)
     message(STATUS "  libavcodec version:    ${FFMPEG_libavcodec_VERSION}")
     message(STATUS "  libavformat version:   ${FFMPEG_libavformat_VERSION}")
     message(STATUS "  libavutil version:     ${FFMPEG_libavutil_VERSION}")
     message(STATUS "  libswscale version:    ${FFMPEG_libswscale_VERSION}")
     message(STATUS "  libswresample version: ${FFMPEG_libswresample_VERSION}")
+    message(STATUS "  libavfilter version:   ${FFMPEG_libavfilter_VERSION}")
 else()
     # ---------- Bundled FFmpeg (Windows / Linux x86_64) ----------
     # Determine if we need to download FFmpeg
@@ -449,6 +451,7 @@ else()
         avutil
         swscale
         swresample
+        avfilter
     )
 endif()
 
@@ -552,6 +555,7 @@ else()
         avutil
         swscale
         swresample
+        avfilter
     )
 endif()
 

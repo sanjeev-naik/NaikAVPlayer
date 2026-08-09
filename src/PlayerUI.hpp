@@ -1,3 +1,4 @@
+
 #pragma once
 
 #include "PlayerController.hpp"
@@ -38,7 +39,8 @@ private:
     float m_seekDragValue;
     float m_savedVolume;
     bool m_showDiagnostics;
-    
+    bool m_showAudioSettings = false;
+
     struct ClockOffsetSample {
         double timeStamp;
         float audioOffsetMs;
@@ -71,6 +73,7 @@ private:
     void drawTitleBar(int windowWidth, int windowHeight);
     void drawControlsBar(int windowWidth, int windowHeight);
     void drawDiagnosticsHUD(int windowWidth, int windowHeight);
+    void drawAudioSettingsPanel(int windowWidth, int windowHeight);
 
     static bool drawIconButton(const char* str_id, IconType icon, ImVec2 size);
 
@@ -89,7 +92,11 @@ public:
         m_showDiagnostics = visible;
         m_controller.getPipelineMetrics().setProfilingEnabled(visible);
     }
-    
+
+    void toggleAudioSettings() { m_showAudioSettings = !m_showAudioSettings; }
+    bool isAudioSettingsVisible() const { return m_showAudioSettings; }
+
+
     void registerVideoFrameRendered(double currentSystemTime);
     
     void setFileDialogCallback(std::function<std::string()> callback) {

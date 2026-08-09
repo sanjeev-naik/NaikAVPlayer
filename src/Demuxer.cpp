@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cmath>
 #include <limits>
+#include <cstdint>
 
 namespace {
 // Upper bound on how long the read loop will ever wait for room in a packet
@@ -196,6 +197,11 @@ void Demuxer::performSeek() {
     } else {
         std::cout << "Successfully seeked format context to " << targetTime << "s" << std::endl;
     }
+
+    // Bumped last, after the format context has actually repositioned: every
+    // packet threadLoop() reads and tags from this point on genuinely comes
+    // from the new position. See the m_seekGeneration comment in Demuxer.hpp.
+    m_seekGeneration.fetch_add(1, std::memory_order_relaxed);
 }
 
 void Demuxer::threadLoop() {
@@ -228,6 +234,13 @@ void Demuxer::threadLoop() {
                 av_packet_free(&packet);
                 continue;
             }
+
+            // Tag with the generation this packet was actually read under,
+            // so a consumer can tell -- independent of its own thread
+            // timing -- whether this packet predates the most recent seek.
+            // See the m_seekGeneration comment in Demuxer.hpp.
+            packet->opaque = reinterpret_cast<void*>(
+                static_cast<uintptr_t>(m_seekGeneration.load(std::memory_order_relaxed)));
 
             SeekCatchupMode cmode = m_catchupMode.load();
 

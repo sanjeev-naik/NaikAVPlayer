@@ -4,6 +4,7 @@
 #include <iostream>
 #include <algorithm>
 #include <fstream>
+#include <sstream>
 
 bool g_videoThreadEnabled = true;
 
@@ -80,6 +81,11 @@ bool PlayerController::openFile(const std::string& filename) {
             m_metrics->m_profilingEnabled
         );
         m_hasVideo = m_videoDecoder->init();
+        if (m_hasVideo) {
+            // Must happen before m_demuxer->start(): the decode loop is not
+            // synchronized with this pointer assignment.
+            m_videoDecoder->attachSeekGeneration(m_demuxer->seekGenerationPtr());
+        }
     }
 
     // Initialize Audio Decoder if audio stream is available
@@ -91,12 +97,15 @@ bool PlayerController::openFile(const std::string& filename) {
             m_audioQueue,
             &m_audioDecodeTimeUs
         );
+        m_audioDecoder->setChannelOption(m_channelOption);
         m_hasAudio = m_audioDecoder->init();
         if (m_hasAudio) {
             m_audioDecoder->setVolume(m_volume);
+            m_audioDecoder->applyDspSettings(m_audioDspSettings);
             // Must happen before m_demuxer->start(): the read loop is not
             // synchronized with this pointer assignment.
             m_demuxer->attachAudioPausedFlag(&m_audioDecoder->pausedFlag());
+            m_audioDecoder->attachSeekGeneration(m_demuxer->seekGenerationPtr());
         }
     }
 
@@ -491,6 +500,13 @@ std::string PlayerController::getAudioCodecName() const {
     return "Unknown";
 }
 
+std::string PlayerController::getAudioChannelLayoutName() const {
+    if (m_hasAudio && m_audioDecoder) {
+        return m_audioDecoder->getOutputChannelLayoutName();
+    }
+    return "Unknown";
+}
+
 double PlayerController::getAudioClock() {
     if (m_hasAudio && m_audioDecoder) {
         return m_audioDecoder->getAudioClock();
@@ -509,6 +525,13 @@ void PlayerController::setVolume(float volume) {
     m_volume = std::clamp(volume, 0.0f, 1.0f);
     if (m_hasAudio && m_audioDecoder) {
         m_audioDecoder->setVolume(m_volume);
+    }
+}
+
+void PlayerController::setAudioDspSettings(const naikav::dsp::AudioDspSettings& settings) {
+    m_audioDspSettings = settings;
+    if (m_hasAudio && m_audioDecoder) {
+        m_audioDecoder->applyDspSettings(m_audioDspSettings);
     }
 }
 
@@ -712,24 +735,114 @@ void PlayerController::finishCatchup(double resumePts) {
 
 void PlayerController::loadSettings() {
     m_resolutionOption.store(ResolutionOption::ORIGINAL);
+    m_audioDspSettings = naikav::dsp::AudioDspSettings{};
+    m_channelOption = AudioChannelOption::AUTO;
+
     std::ifstream f("player_settings.txt");
-    if (f.is_open()) {
-        int optVal = 0;
-        if (f >> optVal) {
-            if (optVal >= 0 && optVal < static_cast<int>(ResolutionOption::COUNT)) {
-                m_resolutionOption.store(static_cast<ResolutionOption>(optVal));
-                std::cout << "Loaded settings: ResolutionOption=" << optVal << std::endl;
-            }
-        }
+    if (!f.is_open()) {
+        return;
     }
+
+    std::string firstLine;
+    std::getline(f, firstLine);
+    if (firstLine.find('=') == std::string::npos) {
+        // Legacy format: a single bare integer (ResolutionOption ordinal),
+        // written before DSP/loudness settings existed. Parse just that;
+        // DSP settings stay at their just-reset defaults above.
+        int optVal = 0;
+        std::istringstream legacy(firstLine);
+        if (legacy >> optVal && optVal >= 0 && optVal < static_cast<int>(ResolutionOption::COUNT)) {
+            m_resolutionOption.store(static_cast<ResolutionOption>(optVal));
+            std::cout << "Loaded settings (legacy format): ResolutionOption=" << optVal << std::endl;
+        }
+        return;
+    }
+
+    // Current format: one "key=value" per line. Unknown keys and
+    // unparsable values are silently skipped rather than failing the
+    // whole load, so a future version adding new keys stays
+    // forward/backward tolerant of older/newer settings files.
+    auto applyLine = [this](const std::string& line) {
+        size_t eq = line.find('=');
+        if (eq == std::string::npos) return;
+        std::string key = line.substr(0, eq);
+        std::string value = line.substr(eq + 1);
+        if (value.empty()) return;
+
+        try {
+            if (key == "resolution") {
+                int v = std::stoi(value);
+                if (v >= 0 && v < static_cast<int>(ResolutionOption::COUNT)) {
+                    m_resolutionOption.store(static_cast<ResolutionOption>(v));
+                }
+            } else if (key == "dsp_enabled") {
+                m_audioDspSettings.dspEnabled = (std::stoi(value) != 0);
+            } else if (key.rfind("eq_band", 0) == 0) {
+                int band = std::stoi(key.substr(7));
+                if (band >= 0 && band < naikav::dsp::ParametricEQ::kNumBands) {
+                    m_audioDspSettings.eqBandGainDb[band] = std::stof(value);
+                }
+            } else if (key == "compressor_enabled") {
+                m_audioDspSettings.compressorEnabled = (std::stoi(value) != 0);
+            } else if (key == "compressor_threshold") {
+                m_audioDspSettings.compressorThresholdDb = std::stof(value);
+            } else if (key == "compressor_ratio") {
+                m_audioDspSettings.compressorRatio = std::stof(value);
+            } else if (key == "limiter_enabled") {
+                m_audioDspSettings.limiterEnabled = (std::stoi(value) != 0);
+            } else if (key == "limiter_ceiling") {
+                m_audioDspSettings.limiterCeilingDb = std::stof(value);
+            } else if (key == "crossover_enabled") {
+                m_audioDspSettings.crossoverEnabled = (std::stoi(value) != 0);
+            } else if (key == "crossover_cutoff") {
+                m_audioDspSettings.crossoverCutoffHz = std::stof(value);
+            } else if (key == "loudness_enabled") {
+                m_audioDspSettings.loudnessEnabled = (std::stoi(value) != 0);
+            } else if (key == "loudness_target") {
+                m_audioDspSettings.loudnessTargetLufs = std::stof(value);
+            } else if (key == "channel_option") {
+                int v = std::stoi(value);
+                if (v >= 0 && v < static_cast<int>(AudioChannelOption::COUNT)) {
+                    m_channelOption = static_cast<AudioChannelOption>(v);
+                }
+            }
+        } catch (const std::exception&) {
+            // Malformed value for this key; skip it and keep going.
+        }
+    };
+
+    applyLine(firstLine);
+    std::string line;
+    while (std::getline(f, line)) {
+        applyLine(line);
+    }
+    std::cout << "Loaded settings: ResolutionOption=" << static_cast<int>(m_resolutionOption.load())
+              << ", AudioDspSettings.dspEnabled=" << m_audioDspSettings.dspEnabled
+              << ", AudioDspSettings.loudnessEnabled=" << m_audioDspSettings.loudnessEnabled << std::endl;
 }
 
 void PlayerController::saveSettings() {
     std::ofstream f("player_settings.txt");
-    if (f.is_open()) {
-        f << static_cast<int>(m_resolutionOption.load());
-        std::cout << "Saved settings: ResolutionOption=" << static_cast<int>(m_resolutionOption.load()) << std::endl;
+    if (!f.is_open()) {
+        return;
     }
+    const auto& s = m_audioDspSettings;
+    f << "resolution=" << static_cast<int>(m_resolutionOption.load()) << "\n";
+    f << "dsp_enabled=" << (s.dspEnabled ? 1 : 0) << "\n";
+    for (int i = 0; i < naikav::dsp::ParametricEQ::kNumBands; ++i) {
+        f << "eq_band" << i << "=" << s.eqBandGainDb[i] << "\n";
+    }
+    f << "compressor_enabled=" << (s.compressorEnabled ? 1 : 0) << "\n";
+    f << "compressor_threshold=" << s.compressorThresholdDb << "\n";
+    f << "compressor_ratio=" << s.compressorRatio << "\n";
+    f << "limiter_enabled=" << (s.limiterEnabled ? 1 : 0) << "\n";
+    f << "limiter_ceiling=" << s.limiterCeilingDb << "\n";
+    f << "crossover_enabled=" << (s.crossoverEnabled ? 1 : 0) << "\n";
+    f << "crossover_cutoff=" << s.crossoverCutoffHz << "\n";
+    f << "loudness_enabled=" << (s.loudnessEnabled ? 1 : 0) << "\n";
+    f << "loudness_target=" << s.loudnessTargetLufs << "\n";
+    f << "channel_option=" << static_cast<int>(m_channelOption) << "\n";
+    std::cout << "Saved settings: ResolutionOption=" << static_cast<int>(m_resolutionOption.load()) << std::endl;
 }
 
 void PlayerController::setResolutionOption(ResolutionOption option) {
@@ -757,8 +870,14 @@ int PlayerController::getPlaybackHeight() const {
 
 size_t PlayerController::getAudioFrameQueueSize() const {
     if (m_hasAudio && m_audioDecoder) {
-        // Sample size is 4 bytes (2 channels * 16-bit). Return number of samples queued.
-        return m_audioDecoder->getAudioStreamQueuedBytes() / 4;
+        // Frame size is (channel count * 2 bytes for 16-bit PCM); channel
+        // count depends on the resolved output layout (stereo downmix or
+        // preserved surround), not always 2.
+        int bytesPerFrame = m_audioDecoder->getOutputChannelCount() * 2;
+        if (bytesPerFrame <= 0) {
+            return 0;
+        }
+        return m_audioDecoder->getAudioStreamQueuedBytes() / bytesPerFrame;
     }
     return 0;
 }

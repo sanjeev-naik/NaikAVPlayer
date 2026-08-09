@@ -71,7 +71,19 @@ NaikAVPlayer/
 │   ├── PlayerController.cpp # Media state machine & sync coordinator
 │   ├── Demuxer.cpp          # FFmpeg container packet parser
 │   ├── VideoDecoder.cpp     # Video decoding (with HW-accelerated fallback)
-│   ├── AudioDecoder.cpp     # Audio sample-accurate decoding & clock tracking
+│   ├── AudioDecoder.cpp     # Audio decode/resample (libsoxr), DSP chain +
+│   │                        # loudness normalization, clock tracking, dither
+│   ├── audio/dsp/           # Header-only audio DSP module (no libav*/SDL
+│   │   │                    # dependency of its own -- pure signal processing)
+│   │   ├── Biquad.hpp             # RBJ cookbook biquad (peaking/LP/HP)
+│   │   ├── ParametricEQ.hpp       # 5-band EQ built from Biquad
+│   │   ├── Compressor.hpp         # Soft-knee, linked-multichannel compressor
+│   │   ├── Limiter.hpp            # Fast-attack limiter + hard-ceiling backstop
+│   │   ├── Crossover.hpp          # Linkwitz-Riley LFE bass crossover
+│   │   ├── DspChain.hpp           # Orchestrates EQ->Compressor->Limiter->Crossover
+│   │   ├── LoudnessMeter.hpp      # EBU R128 metering via libavfilter's ebur128
+│   │   ├── LoudnessNormalizer.hpp # Smoothed gain correction toward a target LUFS
+│   │   └── AudioDspSettings.hpp   # Serializable settings struct + presets
 │   ├── PlayerUI.cpp         # Dear ImGui overlay rendering & HUD controls
 │   └── ThreadSafeQueue.hpp  # Bounded thread-safe queue template
 ├── tests/                   # Test suite files

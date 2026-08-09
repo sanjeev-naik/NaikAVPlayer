@@ -326,6 +326,21 @@ bool VideoDecoder::decodeNextFrame() {
           return false; // Queue empty/aborted, do not block main thread!
         }
 
+        if (m_seekGeneration) {
+          uint64_t packetGeneration = static_cast<uint64_t>(
+              reinterpret_cast<uintptr_t>(packet->opaque));
+          if (packetGeneration != m_seekGeneration->load(std::memory_order_relaxed)) {
+            // This packet's data was read from before the most recent seek
+            // (tagged by the demuxer at read time -- see Demuxer.hpp's
+            // m_seekGeneration comment). Drop it here, before it ever
+            // reaches the codec, instead of letting a stale frame come out
+            // the other end. Loop back around to try the next packet.
+            av_packet_free(&packet);
+            packet = nullptr;
+            continue;
+          }
+        }
+
         // Only count EAGAINs where we actually feed the decoder a packet.
         // An empty packet queue (startup, EOF, seek) is not a stuck decoder.
         m_consecutiveEagainCount++;

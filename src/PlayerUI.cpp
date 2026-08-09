@@ -198,6 +198,11 @@ void PlayerUI::draw(int windowWidth, int windowHeight,
     drawDiagnosticsHUD(windowWidth, windowHeight);
   }
 
+  // 3b. Audio Processing Panel (EQ/compressor/limiter/crossover/loudness)
+  if (state != PlayerState::UNINITIALIZED && m_showAudioSettings) {
+    drawAudioSettingsPanel(windowWidth, windowHeight);
+  }
+
   // 4. Bottom Controls Bar Dock
   if (state != PlayerState::UNINITIALIZED && m_controlsVisible) {
     drawControlsBar(windowWidth, windowHeight);
@@ -790,6 +795,25 @@ void PlayerUI::drawControlsBar(int windowWidth, int windowHeight) {
   }
 
   ImGui::SameLine(0.0f, 8.0f);
+  // Capture before the button, not re-checked after: toggleAudioSettings()
+  // mutates m_showAudioSettings on click, so re-reading it to decide
+  // whether to Pop would mismatch the earlier Push whenever the button is
+  // actually clicked (push decided by the old value, pop by the new one).
+  bool eqButtonHighlighted = m_showAudioSettings;
+  if (eqButtonHighlighted) {
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.53f, 0.90f, 0.80f));
+  }
+  if (ImGui::Button("EQ", ImVec2(36, 28))) {
+    toggleAudioSettings();
+  }
+  if (eqButtonHighlighted) {
+    ImGui::PopStyleColor();
+  }
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("Audio Processing (EQ, Compressor, Loudness) - [A]");
+  }
+
+  ImGui::SameLine(0.0f, 8.0f);
 
   // Mute button
   if (m_isMuted) {
@@ -967,9 +991,10 @@ void PlayerUI::drawDiagnosticsHUD(int windowWidth, int windowHeight) {
   ImGui::Text("Audio Output: ");
   ImGui::SameLine();
   if (m_controller.hasAudio()) {
-    char buf[128];
-    std::snprintf(buf, sizeof(buf), "Active (%s) @ %.2fs",
+    char buf[160];
+    std::snprintf(buf, sizeof(buf), "Active (%s, %s) @ %.2fs",
                   m_controller.getAudioCodecName().c_str(),
+                  m_controller.getAudioChannelLayoutName().c_str(),
                   m_controller.getAudioClock());
     ImGui::TextColored(ImVec4(0.0f, 0.83f, 0.4f, 1.0f), "%s", buf);
   } else {
@@ -1226,6 +1251,207 @@ void PlayerUI::drawDiagnosticsHUD(int windowWidth, int windowHeight) {
     ImGui::Text("Video Playback FPS: ");
     ImGui::SameLine();
     ImGui::TextColored(ImVec4(0.0f, 0.83f, 0.4f, 1.0f), "%.1f", m_videoFPS);
+  }
+
+  if (m_hudFont)
+    ImGui::PopFont();
+
+  ImGui::End();
+}
+
+void PlayerUI::drawAudioSettingsPanel(int windowWidth, int windowHeight) {
+  if (!m_showAudioSettings)
+    return;
+  (void)windowWidth;
+
+  float panelWidth = 380.0f;
+  float panelHeight = windowHeight - 80.0f;
+  if (panelHeight < 560.0f) panelHeight = 560.0f;
+  if (panelHeight > 780.0f) panelHeight = 780.0f;
+
+  ImGui::SetNextWindowPos(ImVec2(20.0f, 60.0f), ImGuiCond_FirstUseEver);
+  ImGui::SetNextWindowSize(ImVec2(panelWidth, panelHeight), ImGuiCond_FirstUseEver);
+
+  if (!ImGui::Begin("Audio Processing", &m_showAudioSettings,
+                     ImGuiWindowFlags_NoSavedSettings)) {
+    ImGui::End();
+    return;
+  }
+
+  if (m_hudFont)
+    ImGui::PushFont(m_hudFont);
+
+  naikav::dsp::AudioDspSettings s = m_controller.getAudioDspSettings();
+  bool changed = false;
+
+  const ImVec4 sectionColor(0.00f, 0.83f, 0.88f, 1.00f);
+
+  const ImVec4 warnColor(0.9f, 0.55f, 0.0f, 1.0f);
+  const ImVec4 grayColor(0.6f, 0.6f, 0.6f, 1.0f);
+  const ImVec4 greenColor(0.0f, 0.83f, 0.4f, 1.0f);
+
+  int outputChannels = m_controller.getAudioChannelCount();
+  int deviceNativeChannels = m_controller.getAudioDeviceNativeChannels();
+  bool possibleSilentDownmix = m_controller.hasAudio() && deviceNativeChannels > 0 &&
+                                deviceNativeChannels < outputChannels;
+
+  ImGui::Text("Channel Layout: ");
+  ImGui::SameLine();
+  if (m_controller.hasAudio()) {
+    ImGui::TextColored(greenColor, "%s (%dch)",
+                       m_controller.getAudioChannelLayoutName().c_str(), outputChannels);
+  } else {
+    ImGui::TextColored(grayColor, "No audio");
+  }
+
+  ImGui::Text("Device reports: ");
+  ImGui::SameLine();
+  if (!m_controller.hasAudio()) {
+    ImGui::TextColored(grayColor, "N/A");
+  } else if (deviceNativeChannels <= 0) {
+    ImGui::TextColored(grayColor, "Unknown");
+  } else {
+    ImGui::TextColored(possibleSilentDownmix ? warnColor : greenColor, "%dch native", deviceNativeChannels);
+  }
+  if (possibleSilentDownmix) {
+    ImGui::SameLine();
+    ImGui::TextColored(warnColor, "(!) likely downmixed by OS");
+    if (ImGui::IsItemHovered()) {
+      ImGui::SetTooltip(
+          "Your default audio device reports only %d native channel(s).\n"
+          "A successful %d-channel device open does not prove %d discrete\n"
+          "speakers are connected -- Windows/Linux audio APIs silently\n"
+          "downmix in shared mode. What you hear is not necessarily true\n"
+          "%s, even though that's the layout being sent.",
+          deviceNativeChannels, outputChannels, outputChannels,
+          m_controller.getAudioChannelLayoutName().c_str());
+    }
+  }
+
+  ImGui::Spacing();
+  ImGui::Text("Output Channels: ");
+  ImGui::SameLine();
+  {
+    static const char* kChannelOptionNames[] = {"Auto", "Force Stereo"};
+    AudioChannelOption currentChOpt = m_controller.getAudioChannelOption();
+    int currentChItem = static_cast<int>(currentChOpt);
+    ImGui::PushItemWidth(140.0f);
+    if (ImGui::BeginCombo("##channeloption", kChannelOptionNames[currentChItem])) {
+      for (int i = 0; i < static_cast<int>(AudioChannelOption::COUNT); ++i) {
+        bool isSelected = (currentChItem == i);
+        if (ImGui::Selectable(kChannelOptionNames[i], isSelected)) {
+          m_controller.setAudioChannelOption(static_cast<AudioChannelOption>(i));
+        }
+        if (isSelected) {
+          ImGui::SetItemDefaultFocus();
+        }
+      }
+      ImGui::EndCombo();
+    }
+    ImGui::PopItemWidth();
+  }
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip(
+        "Applies to the next file you open (not the current one -- changing\n"
+        "channel count requires reopening the audio device).\n"
+        "Auto: preserve the source's surround layout when it's one\n"
+        "  NaikAVPlayer can drive directly (2.1/5.1/7.1).\n"
+        "Force Stereo: always downmix to stereo regardless of source.");
+  }
+
+  ImGui::Spacing();
+  ImGui::TextColored(sectionColor, "Presets");
+  ImGui::Separator();
+  if (ImGui::Button("Flat", ImVec2(78, 0))) { s = naikav::dsp::makeFlatPreset(); changed = true; }
+  ImGui::SameLine();
+  if (ImGui::Button("Music", ImVec2(78, 0))) { s = naikav::dsp::makeMusicPreset(); changed = true; }
+  ImGui::SameLine();
+  if (ImGui::Button("Movie", ImVec2(78, 0))) { s = naikav::dsp::makeMoviePreset(); changed = true; }
+  ImGui::SameLine();
+  if (ImGui::Button("Night", ImVec2(78, 0))) { s = naikav::dsp::makeNightPreset(); changed = true; }
+  if (ImGui::IsItemHovered() || ImGui::IsItemActive()) {
+    ImGui::SetTooltip("Heavy compression for low-volume late-night watching");
+  }
+
+  ImGui::Spacing();
+  ImGui::Spacing();
+
+  ImGui::TextColored(sectionColor, "Master");
+  ImGui::Separator();
+  changed |= ImGui::Checkbox("Enable Audio Processing", &s.dspEnabled);
+
+  ImGui::BeginDisabled(!s.dspEnabled);
+
+  ImGui::Spacing();
+  ImGui::TextColored(sectionColor, "Equalizer (5-band)");
+  static const char* kBandLabels[naikav::dsp::ParametricEQ::kNumBands] = {
+      "60 Hz", "250 Hz", "1 kHz", "4 kHz", "12 kHz"};
+  for (int i = 0; i < naikav::dsp::ParametricEQ::kNumBands; ++i) {
+    ImGui::PushID(i);
+    changed |= ImGui::SliderFloat(kBandLabels[i], &s.eqBandGainDb[i], -12.0f, 12.0f, "%.1f dB");
+    ImGui::PopID();
+  }
+
+  ImGui::Spacing();
+  ImGui::TextColored(sectionColor, "Compressor");
+  changed |= ImGui::Checkbox("Enable Compressor", &s.compressorEnabled);
+  ImGui::BeginDisabled(!s.compressorEnabled);
+  changed |= ImGui::SliderFloat("Threshold", &s.compressorThresholdDb, -60.0f, 0.0f, "%.1f dB");
+  changed |= ImGui::SliderFloat("Ratio", &s.compressorRatio, 1.0f, 20.0f, "%.1f:1");
+  ImGui::EndDisabled();
+
+  ImGui::Spacing();
+  ImGui::TextColored(sectionColor, "Limiter");
+  changed |= ImGui::Checkbox("Enable Limiter", &s.limiterEnabled);
+  ImGui::BeginDisabled(!s.limiterEnabled);
+  changed |= ImGui::SliderFloat("Ceiling", &s.limiterCeilingDb, -12.0f, 0.0f, "%.1f dB");
+  ImGui::EndDisabled();
+
+  ImGui::Spacing();
+  ImGui::TextColored(sectionColor, "Bass Crossover (LFE)");
+  changed |= ImGui::Checkbox("Enable Crossover", &s.crossoverEnabled);
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("Only affects a discrete LFE/subwoofer channel (5.1/7.1/2.1 output)");
+  }
+  ImGui::BeginDisabled(!s.crossoverEnabled);
+  changed |= ImGui::SliderFloat("Cutoff", &s.crossoverCutoffHz, 40.0f, 250.0f, "%.0f Hz");
+  ImGui::EndDisabled();
+
+  ImGui::EndDisabled(); // dspEnabled
+
+  ImGui::Spacing();
+  ImGui::TextColored(sectionColor, "Loudness Normalization (EBU R128)");
+  ImGui::Separator();
+  changed |= ImGui::Checkbox("Enable Loudness Normalization", &s.loudnessEnabled);
+  ImGui::BeginDisabled(!s.loudnessEnabled);
+  changed |= ImGui::SliderFloat("Target", &s.loudnessTargetLufs, -30.0f, -6.0f, "%.1f LUFS");
+  ImGui::EndDisabled();
+
+  if (s.loudnessEnabled && m_controller.hasAudio()) {
+    double measured = m_controller.getMeasuredIntegratedLufs();
+    ImGui::Spacing();
+    if (measured <= -70.0) {
+      ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "Measuring...");
+    } else {
+      float appliedGain = m_controller.getCurrentLoudnessGainDb();
+      ImGui::Text("Measured: ");
+      ImGui::SameLine();
+      ImGui::TextColored(ImVec4(0.0f, 0.83f, 0.4f, 1.0f), "%.1f LUFS", measured);
+      ImGui::SameLine();
+      ImGui::Text(" | Gain: ");
+      ImGui::SameLine();
+      ImGui::TextColored(ImVec4(0.0f, 0.83f, 0.4f, 1.0f), "%+.1f dB", appliedGain);
+    }
+  }
+
+  if (changed) {
+    // Applied live (thread-safe against the audio callback -- see
+    // AudioDecoder::applyDspSettings()) and persisted immediately. A
+    // settings-file write on every slider-drag frame is a non-issue here:
+    // it only touches the UI thread, never the audio callback thread, so
+    // it can't cause an audio dropout.
+    m_controller.setAudioDspSettings(s);
+    m_controller.persistAudioDspSettings();
   }
 
   if (m_hudFont)
