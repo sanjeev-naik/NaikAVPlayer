@@ -1,4 +1,5 @@
 #include "PlayerController.hpp"
+#include "audio/dsp/ReplayGainTags.hpp"
 #include <chrono>
 #include <cmath>
 #include <iostream>
@@ -55,81 +56,116 @@ bool PlayerController::openFile(const std::string& filename) {
     // If a file is already loaded, close it first
     stop();
 
-    m_filename = filename;
-    m_videoQueue.reset();
-    m_audioQueue.reset();
-    m_decodedFrameQueue.reset(); // Clear aborted state set by stop()
+    // Everything below can throw: std::thread's constructor (m_demuxer's
+    // read thread, m_videoThread) throws std::system_error if the OS is
+    // temporarily out of thread/handle capacity, and any of the several
+    // std::vector/std::string allocations along this path (decode buffers,
+    // the audio device name, etc.) can throw std::bad_alloc under memory
+    // pressure -- both realistic failure modes precisely when a user has
+    // already opened/closed several files in a row, not on a fresh launch.
+    // openFile() is called directly from main.cpp's SDL_EVENT_DROP_FILE
+    // handler and from PlayerUI's file-dialog callbacks, neither of which
+    // wrap it in a try/catch, so an uncaught exception here means
+    // std::terminate() -- the whole app crashing -- instead of "this file
+    // didn't load." Catch here and fail gracefully instead: stop() tears
+    // down whatever partial state was constructed before the throw, same
+    // as any other openFile() failure path.
+    try {
+        m_filename = filename;
+        m_videoQueue.reset();
+        m_audioQueue.reset();
+        m_decodedFrameQueue.reset(); // Clear aborted state set by stop()
 
-    // Create and open the demuxer
-    m_demuxer = std::make_unique<Demuxer>(
-        filename, m_videoQueue, m_audioQueue,
-        m_metrics->m_demuxTimePerPacketUs, m_metrics->m_profilingEnabled);
-    if (!m_demuxer->open()) {
-        m_state = PlayerState::ERROR_STATE;
-        return false;
-    }
-
-    // Initialize Video Decoder if video stream is available
-    if (m_demuxer->getVideoStreamIndex() >= 0) {
-        m_videoDecoder = std::make_unique<VideoDecoder>(
-            m_demuxer->getVideoCodecParams(),
-            m_demuxer->getVideoTimeBase(),
-            m_demuxer->getVideoStartTime(),
-            m_videoQueue,
-            m_metrics->m_decodeTimePerFrameUs,
-            m_metrics->m_convertTimeUs,
-            m_metrics->m_profilingEnabled
-        );
-        m_hasVideo = m_videoDecoder->init();
-        if (m_hasVideo) {
-            // Must happen before m_demuxer->start(): the decode loop is not
-            // synchronized with this pointer assignment.
-            m_videoDecoder->attachSeekGeneration(m_demuxer->seekGenerationPtr());
+        // Create and open the demuxer
+        m_demuxer = std::make_unique<Demuxer>(
+            filename, m_videoQueue, m_audioQueue,
+            m_metrics->m_demuxTimePerPacketUs, m_metrics->m_profilingEnabled);
+        if (!m_demuxer->open()) {
+            m_state = PlayerState::ERROR_STATE;
+            return false;
         }
-    }
 
-    // Initialize Audio Decoder if audio stream is available
-    if (m_demuxer->getAudioStreamIndex() >= 0) {
-        m_audioDecoder = std::make_unique<AudioDecoder>(
-            m_demuxer->getAudioCodecParams(),
-            m_demuxer->getAudioTimeBase(),
-            m_demuxer->getAudioStartTime(),
-            m_audioQueue,
-            &m_audioDecodeTimeUs
-        );
-        m_audioDecoder->setChannelOption(m_channelOption);
-        m_hasAudio = m_audioDecoder->init();
-        if (m_hasAudio) {
-            m_audioDecoder->setVolume(m_volume);
-            m_audioDecoder->applyDspSettings(m_audioDspSettings);
-            // Must happen before m_demuxer->start(): the read loop is not
-            // synchronized with this pointer assignment.
-            m_demuxer->attachAudioPausedFlag(&m_audioDecoder->pausedFlag());
-            m_audioDecoder->attachSeekGeneration(m_demuxer->seekGenerationPtr());
+        // Initialize Video Decoder if video stream is available
+        if (m_demuxer->getVideoStreamIndex() >= 0) {
+            m_videoDecoder = std::make_unique<VideoDecoder>(
+                m_demuxer->getVideoCodecParams(),
+                m_demuxer->getVideoTimeBase(),
+                m_demuxer->getVideoStartTime(),
+                m_videoQueue,
+                m_metrics->m_decodeTimePerFrameUs,
+                m_metrics->m_convertTimeUs,
+                m_metrics->m_profilingEnabled
+            );
+            m_hasVideo = m_videoDecoder->init();
+            if (m_hasVideo) {
+                // Must happen before m_demuxer->start(): the decode loop is not
+                // synchronized with this pointer assignment.
+                m_videoDecoder->attachSeekGeneration(m_demuxer->seekGenerationPtr());
+            }
         }
-    }
 
-    if (!m_hasVideo && !m_hasAudio) {
-        std::cerr << "Error: File has no playable video or audio streams" << std::endl;
+        // Initialize Audio Decoder if audio stream is available
+        if (m_demuxer->getAudioStreamIndex() >= 0) {
+            m_audioDecoder = std::make_unique<AudioDecoder>(
+                m_demuxer->getAudioCodecParams(),
+                m_demuxer->getAudioTimeBase(),
+                m_demuxer->getAudioStartTime(),
+                m_audioQueue,
+                &m_audioDecodeTimeUs
+            );
+            m_audioDecoder->setChannelOption(m_channelOption);
+            m_audioDecoder->setOutputBitDepth(m_outputBitDepth);
+            m_audioDecoder->setOutputDeviceName(m_outputDeviceName);
+            m_audioDecoder->setResamplerQuality(m_resamplerQuality);
+            m_hasAudio = m_audioDecoder->init();
+            if (m_hasAudio) {
+                m_audioDecoder->setVolume(m_volume);
+                m_audioDecoder->applyDspSettings(m_audioDspSettings);
+                // Before the loudness prescan below: a genre-based preset swap
+                // can change loudnessEnabled/loudnessTargetLufs, and the
+                // prescan should reflect whatever settings actually end up
+                // active for this file, not whatever was active before it.
+                applyGenrePresetIfEnabled();
+                if (m_audioDspSettings.loudnessEnabled) {
+                    // Blocking, but this runs before m_demuxer->start() below --
+                    // no packets are flowing yet, so there's no audio playing
+                    // for the user to notice the delay in.
+                    prescanLoudnessForCurrentFile();
+                }
+                // Must happen before m_demuxer->start(): the read loop is not
+                // synchronized with this pointer assignment.
+                m_demuxer->attachAudioPausedFlag(&m_audioDecoder->pausedFlag());
+                m_audioDecoder->attachSeekGeneration(m_demuxer->seekGenerationPtr());
+            }
+        }
+
+        if (!m_hasVideo && !m_hasAudio) {
+            std::cerr << "Error: File has no playable video or audio streams" << std::endl;
+            stop();
+            m_state = PlayerState::ERROR_STATE;
+            return false;
+        }
+
+        // Start Demuxer background reading
+        m_demuxer->start();
+
+        // Start video decoding background thread
+        if (m_hasVideo && m_videoThreadEnabled) {
+            m_videoThreadRunning = true;
+            m_videoThread = std::thread(&PlayerController::videoThreadLoop, this);
+        }
+
+        m_videoClock = 0.0;
+        m_lastSystemTime = getSystemTimeInSeconds();
+        m_state = PlayerState::OPENED;
+
+        return true;
+    } catch (const std::exception& e) {
+        std::cerr << "Error: Exception while opening file '" << filename << "': " << e.what() << std::endl;
         stop();
         m_state = PlayerState::ERROR_STATE;
         return false;
     }
-
-    // Start Demuxer background reading
-    m_demuxer->start();
-
-    // Start video decoding background thread
-    if (m_hasVideo && m_videoThreadEnabled) {
-        m_videoThreadRunning = true;
-        m_videoThread = std::thread(&PlayerController::videoThreadLoop, this);
-    }
-
-    m_videoClock = 0.0;
-    m_lastSystemTime = getSystemTimeInSeconds();
-    m_state = PlayerState::OPENED;
-
-    return true;
 }
 
 void PlayerController::play() {
@@ -341,6 +377,13 @@ void PlayerController::instantSeek(double seconds) {
 void PlayerController::stop() {
     m_state = PlayerState::UNINITIALIZED;
 
+    // Must join before m_audioDecoder is reset below and before this
+    // PlayerController could be destroyed -- the background thread's
+    // lambda captures `this` (only to reach m_pendingPrescanMutex/
+    // m_pendingPrescanResult, never m_audioDecoder directly, but it still
+    // can't outlive the object it was spawned from).
+    joinLoudnessPrescanThread();
+
     m_catchupMode.store(SeekCatchupMode::NONE);
     m_resumeAfterCatchup.store(false);
     m_catchupPos.store(0.0);
@@ -529,9 +572,116 @@ void PlayerController::setVolume(float volume) {
 }
 
 void PlayerController::setAudioDspSettings(const naikav::dsp::AudioDspSettings& settings) {
+    const bool loudnessJustEnabled = settings.loudnessEnabled && !m_audioDspSettings.loudnessEnabled;
     m_audioDspSettings = settings;
     if (m_hasAudio && m_audioDecoder) {
         m_audioDecoder->applyDspSettings(m_audioDspSettings);
+        if (loudnessJustEnabled) {
+            // Blocking on the UI thread, but only on the (0->1) toggle
+            // transition, not on every subsequent slider tweak.
+            prescanLoudnessForCurrentFile();
+        }
+    }
+}
+
+void PlayerController::prescanLoudnessForCurrentFile() {
+    if (!m_hasAudio || !m_audioDecoder || m_filename.empty()) {
+        return;
+    }
+
+    // Prefer a ReplayGain/EBU R128 container tag when one is present: it's
+    // exactly what the encoder or a tagging tool already measured against
+    // the whole file, so it's at least as accurate as this project's own
+    // decode-only prescan and, unlike it, needs no decoding at all. Cheap
+    // (a couple of dictionary lookups), so handled synchronously.
+    if (m_demuxer) {
+        double taggedLufs = 0.0;
+        if (naikav::dsp::readTaggedLoudnessAsLufs(m_demuxer->getFormatMetadata(),
+                                                   m_demuxer->getAudioStreamMetadata(),
+                                                   taggedLufs)) {
+            m_audioDecoder->primeLoudnessPrescan(taggedLufs);
+            return;
+        }
+    }
+
+    // No tag: fall back to decoding the whole file's audio, which can take
+    // a long time for a real (non-trivial-length) file -- openFile() is
+    // called directly from main.cpp's SDL_EVENT_DROP_FILE handler on the
+    // render/event thread, so blocking here would freeze the entire UI
+    // (no rendering, no input) for however long the scan takes, which
+    // looks exactly like a crash/hang to a user opening a new file. Run it
+    // on a background thread instead; pollPendingLoudnessPrescan() (called
+    // once per frame from main.cpp) applies the result once ready. The
+    // real-time loudness meter already runs and gives a converging-but-
+    // usable reading in the meantime, so this is a pure improvement, not
+    // a "loudness is briefly wrong" regression.
+    joinLoudnessPrescanThread(); // previous file's scan, if one is still running
+
+    const uint64_t generation = m_loudnessPrescanGeneration.fetch_add(1) + 1;
+    const std::string filenameCopy = m_filename;
+    const int audioStreamIndex = m_demuxer ? m_demuxer->getAudioStreamIndex() : -1;
+
+    // std::thread's constructor throws std::system_error if the OS is
+    // temporarily out of thread/handle capacity. Unlike the openFile() path
+    // (which wraps this call in a try/catch), the other caller --
+    // setAudioDspSettings(), reached live from the DSP panel whenever the
+    // user flips loudness normalization on -- has no such guard, and
+    // nothing between here and main.cpp's event loop would catch an
+    // uncaught exception either. Losing the prescan for this toggle isn't
+    // worth crashing the whole app over; the real-time loudness meter
+    // still gives a usable (if slower-converging) reading without it.
+    try {
+        m_loudnessPrescanThread = std::thread([this, generation, filenameCopy, audioStreamIndex]() {
+            double integratedLufs = naikav::dsp::prescanIntegratedLufs(filenameCopy, audioStreamIndex);
+            if (integratedLufs > -70.0) {
+                std::lock_guard<std::mutex> lock(m_pendingPrescanMutex);
+                m_pendingPrescanResult = {generation, integratedLufs, true};
+            }
+        });
+    } catch (const std::exception& e) {
+        std::cerr << "Warning: could not start background loudness prescan thread: " << e.what() << std::endl;
+    }
+}
+
+void PlayerController::pollPendingLoudnessPrescan() {
+    PendingLoudnessPrescanResult result;
+    {
+        std::lock_guard<std::mutex> lock(m_pendingPrescanMutex);
+        if (!m_pendingPrescanResult.valid) {
+            return;
+        }
+        result = m_pendingPrescanResult;
+        m_pendingPrescanResult.valid = false;
+    }
+    // Only apply if this result is still for the current file -- a newer
+    // openFile()/prescan since this one started bumps the generation, so
+    // a slow scan finishing late for a file the user has already left
+    // can't clobber the loudness state of whatever's playing now.
+    if (result.generation == m_loudnessPrescanGeneration.load() && m_hasAudio && m_audioDecoder) {
+        m_audioDecoder->primeLoudnessPrescan(result.lufs);
+    }
+}
+
+void PlayerController::joinLoudnessPrescanThread() {
+    if (m_loudnessPrescanThread.joinable()) {
+        m_loudnessPrescanThread.join();
+    }
+}
+
+void PlayerController::applyGenrePresetIfEnabled() {
+    if (!m_audioDspSettings.autoGenrePresetEnabled || !m_demuxer) {
+        return;
+    }
+    std::string genre = m_demuxer->getGenreTag();
+    naikav::dsp::AudioDspSettings genreSettings;
+    if (naikav::dsp::presetForGenreTag(genre, genreSettings)) {
+        // Preserve the toggle itself -- applying a preset struct wholesale
+        // would otherwise reset autoGenrePresetEnabled to that preset's
+        // (always-false) default, turning the feature off after using it
+        // exactly once.
+        genreSettings.autoGenrePresetEnabled = true;
+        setAudioDspSettings(genreSettings);
+        persistAudioDspSettings();
     }
 }
 
@@ -551,6 +701,7 @@ double PlayerController::getSeekReferenceTime() {
 }
 
 std::string PlayerController::getVideoPixelFormat() const {
+    std::lock_guard<std::mutex> lock(m_videoDecoderMutex);
     if (m_videoDecoder) {
         return m_videoDecoder->getPixelFormatName();
     }
@@ -737,6 +888,9 @@ void PlayerController::loadSettings() {
     m_resolutionOption.store(ResolutionOption::ORIGINAL);
     m_audioDspSettings = naikav::dsp::AudioDspSettings{};
     m_channelOption = AudioChannelOption::AUTO;
+    m_outputBitDepth = AudioOutputBitDepth::BIT_16;
+    m_outputDeviceName.clear();
+    m_resamplerQuality = ResamplerQuality::MEDIUM;
 
     std::ifstream f("player_settings.txt");
     if (!f.is_open()) {
@@ -777,6 +931,16 @@ void PlayerController::loadSettings() {
                 }
             } else if (key == "dsp_enabled") {
                 m_audioDspSettings.dspEnabled = (std::stoi(value) != 0);
+            } else if (key.rfind("eq_band_freq", 0) == 0) {
+                int band = std::stoi(key.substr(12));
+                if (band >= 0 && band < naikav::dsp::ParametricEQ::kNumBands) {
+                    m_audioDspSettings.eqBandFreqHz[band] = std::stof(value);
+                }
+            } else if (key.rfind("eq_band_q", 0) == 0) {
+                int band = std::stoi(key.substr(9));
+                if (band >= 0 && band < naikav::dsp::ParametricEQ::kNumBands) {
+                    m_audioDspSettings.eqBandQ[band] = std::stof(value);
+                }
             } else if (key.rfind("eq_band", 0) == 0) {
                 int band = std::stoi(key.substr(7));
                 if (band >= 0 && band < naikav::dsp::ParametricEQ::kNumBands) {
@@ -796,14 +960,66 @@ void PlayerController::loadSettings() {
                 m_audioDspSettings.crossoverEnabled = (std::stoi(value) != 0);
             } else if (key == "crossover_cutoff") {
                 m_audioDspSettings.crossoverCutoffHz = std::stof(value);
+            } else if (key == "crossover_bass_redirect") {
+                m_audioDspSettings.crossoverBassRedirectEnabled = (std::stoi(value) != 0);
             } else if (key == "loudness_enabled") {
                 m_audioDspSettings.loudnessEnabled = (std::stoi(value) != 0);
             } else if (key == "loudness_target") {
                 m_audioDspSettings.loudnessTargetLufs = std::stof(value);
+            } else if (key == "widener_enabled") {
+                m_audioDspSettings.widenerEnabled = (std::stoi(value) != 0);
+            } else if (key == "widener_width") {
+                m_audioDspSettings.widenerWidth = std::stof(value);
+            } else if (key == "surround3d_enabled") {
+                m_audioDspSettings.surround3dEnabled = (std::stoi(value) != 0);
+            } else if (key == "surround3d_intensity") {
+                m_audioDspSettings.surround3dIntensity = std::stof(value);
+            } else if (key == "balance") {
+                m_audioDspSettings.balance = std::stof(value);
+            } else if (key == "noise_gate_enabled") {
+                m_audioDspSettings.noiseGateEnabled = (std::stoi(value) != 0);
+            } else if (key == "noise_gate_threshold") {
+                m_audioDspSettings.noiseGateThresholdDb = std::stof(value);
+            } else if (key == "noise_gate_ratio") {
+                m_audioDspSettings.noiseGateRatio = std::stof(value);
+            } else if (key == "multiband_enabled") {
+                m_audioDspSettings.multibandEnabled = (std::stoi(value) != 0);
+            } else if (key == "multiband_low_mid_hz") {
+                m_audioDspSettings.multibandLowMidHz = std::stof(value);
+            } else if (key == "multiband_mid_high_hz") {
+                m_audioDspSettings.multibandMidHighHz = std::stof(value);
+            } else if (key == "multiband_low_threshold") {
+                m_audioDspSettings.multibandLowThresholdDb = std::stof(value);
+            } else if (key == "multiband_low_ratio") {
+                m_audioDspSettings.multibandLowRatio = std::stof(value);
+            } else if (key == "multiband_mid_threshold") {
+                m_audioDspSettings.multibandMidThresholdDb = std::stof(value);
+            } else if (key == "multiband_mid_ratio") {
+                m_audioDspSettings.multibandMidRatio = std::stof(value);
+            } else if (key == "multiband_high_threshold") {
+                m_audioDspSettings.multibandHighThresholdDb = std::stof(value);
+            } else if (key == "multiband_high_ratio") {
+                m_audioDspSettings.multibandHighRatio = std::stof(value);
+            } else if (key == "auto_genre_preset_enabled") {
+                m_audioDspSettings.autoGenrePresetEnabled = (std::stoi(value) != 0);
+            } else if (key == "spectrum_analyzer_enabled") {
+                m_audioDspSettings.spectrumAnalyzerEnabled = (std::stoi(value) != 0);
             } else if (key == "channel_option") {
                 int v = std::stoi(value);
                 if (v >= 0 && v < static_cast<int>(AudioChannelOption::COUNT)) {
                     m_channelOption = static_cast<AudioChannelOption>(v);
+                }
+            } else if (key == "output_bit_depth") {
+                int v = std::stoi(value);
+                if (v >= 0 && v < static_cast<int>(AudioOutputBitDepth::COUNT)) {
+                    m_outputBitDepth = static_cast<AudioOutputBitDepth>(v);
+                }
+            } else if (key == "output_device_name") {
+                m_outputDeviceName = value;
+            } else if (key == "resampler_quality") {
+                int v = std::stoi(value);
+                if (v >= 0 && v < static_cast<int>(ResamplerQuality::COUNT)) {
+                    m_resamplerQuality = static_cast<ResamplerQuality>(v);
                 }
             }
         } catch (const std::exception&) {
@@ -831,6 +1047,8 @@ void PlayerController::saveSettings() {
     f << "dsp_enabled=" << (s.dspEnabled ? 1 : 0) << "\n";
     for (int i = 0; i < naikav::dsp::ParametricEQ::kNumBands; ++i) {
         f << "eq_band" << i << "=" << s.eqBandGainDb[i] << "\n";
+        f << "eq_band_freq" << i << "=" << s.eqBandFreqHz[i] << "\n";
+        f << "eq_band_q" << i << "=" << s.eqBandQ[i] << "\n";
     }
     f << "compressor_enabled=" << (s.compressorEnabled ? 1 : 0) << "\n";
     f << "compressor_threshold=" << s.compressorThresholdDb << "\n";
@@ -839,9 +1057,32 @@ void PlayerController::saveSettings() {
     f << "limiter_ceiling=" << s.limiterCeilingDb << "\n";
     f << "crossover_enabled=" << (s.crossoverEnabled ? 1 : 0) << "\n";
     f << "crossover_cutoff=" << s.crossoverCutoffHz << "\n";
+    f << "crossover_bass_redirect=" << (s.crossoverBassRedirectEnabled ? 1 : 0) << "\n";
     f << "loudness_enabled=" << (s.loudnessEnabled ? 1 : 0) << "\n";
     f << "loudness_target=" << s.loudnessTargetLufs << "\n";
+    f << "widener_enabled=" << (s.widenerEnabled ? 1 : 0) << "\n";
+    f << "widener_width=" << s.widenerWidth << "\n";
+    f << "surround3d_enabled=" << (s.surround3dEnabled ? 1 : 0) << "\n";
+    f << "surround3d_intensity=" << s.surround3dIntensity << "\n";
+    f << "balance=" << s.balance << "\n";
+    f << "noise_gate_enabled=" << (s.noiseGateEnabled ? 1 : 0) << "\n";
+    f << "noise_gate_threshold=" << s.noiseGateThresholdDb << "\n";
+    f << "noise_gate_ratio=" << s.noiseGateRatio << "\n";
+    f << "multiband_enabled=" << (s.multibandEnabled ? 1 : 0) << "\n";
+    f << "multiband_low_mid_hz=" << s.multibandLowMidHz << "\n";
+    f << "multiband_mid_high_hz=" << s.multibandMidHighHz << "\n";
+    f << "multiband_low_threshold=" << s.multibandLowThresholdDb << "\n";
+    f << "multiband_low_ratio=" << s.multibandLowRatio << "\n";
+    f << "multiband_mid_threshold=" << s.multibandMidThresholdDb << "\n";
+    f << "multiband_mid_ratio=" << s.multibandMidRatio << "\n";
+    f << "multiband_high_threshold=" << s.multibandHighThresholdDb << "\n";
+    f << "multiband_high_ratio=" << s.multibandHighRatio << "\n";
+    f << "auto_genre_preset_enabled=" << (s.autoGenrePresetEnabled ? 1 : 0) << "\n";
+    f << "spectrum_analyzer_enabled=" << (s.spectrumAnalyzerEnabled ? 1 : 0) << "\n";
     f << "channel_option=" << static_cast<int>(m_channelOption) << "\n";
+    f << "output_bit_depth=" << static_cast<int>(m_outputBitDepth) << "\n";
+    f << "output_device_name=" << m_outputDeviceName << "\n";
+    f << "resampler_quality=" << static_cast<int>(m_resamplerQuality) << "\n";
     std::cout << "Saved settings: ResolutionOption=" << static_cast<int>(m_resolutionOption.load()) << std::endl;
 }
 
@@ -883,6 +1124,7 @@ size_t PlayerController::getAudioFrameQueueSize() const {
 }
 
 ColorPipelineInfo PlayerController::getColorInfo() const {
+    std::lock_guard<std::mutex> lock(m_videoDecoderMutex);
     if (m_videoDecoder) {
         return m_videoDecoder->getColorInfo();
     }

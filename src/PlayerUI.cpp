@@ -1289,6 +1289,30 @@ void PlayerUI::drawAudioSettingsPanel(int windowWidth, int windowHeight) {
   const ImVec4 warnColor(0.9f, 0.55f, 0.0f, 1.0f);
   const ImVec4 grayColor(0.6f, 0.6f, 0.6f, 1.0f);
   const ImVec4 greenColor(0.0f, 0.83f, 0.4f, 1.0f);
+  const ImVec4 spectrumColor(1.0f, 0.75f, 0.15f, 1.0f);
+
+  ImGui::TextColored(sectionColor, "Spectrum Analyzer");
+  ImGui::Separator();
+  changed |= ImGui::Checkbox("Enable Spectrum Analyzer", &s.spectrumAnalyzerEnabled);
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip(
+        "Real-time magnitude spectrum of the final processed signal,\n"
+        "computed via a 1024-point FFT. Display only -- never modifies\n"
+        "the audio, and costs nothing while disabled.");
+  }
+  if (s.spectrumAnalyzerEnabled && m_controller.hasAudio()) {
+    std::vector<float> spectrumMags = m_controller.getSpectrumMagnitudesDb();
+    if (!spectrumMags.empty()) {
+      float plotWidth = ImGui::GetContentRegionAvail().x;
+      ImGui::PushStyleColor(ImGuiCol_PlotLines, spectrumColor);
+      ImGui::PlotLines("##spectrum", spectrumMags.data(), static_cast<int>(spectrumMags.size()), 0, nullptr,
+                        naikav::dsp::SpectrumAnalyzer::kFloorDb, 0.0f, ImVec2(plotWidth, 120.0f));
+      ImGui::PopStyleColor();
+    }
+  }
+  ImGui::Spacing();
+  ImGui::Separator();
+  ImGui::Spacing();
 
   int outputChannels = m_controller.getAudioChannelCount();
   int deviceNativeChannels = m_controller.getAudioDeviceNativeChannels();
@@ -1332,7 +1356,7 @@ void PlayerUI::drawAudioSettingsPanel(int windowWidth, int windowHeight) {
   ImGui::Text("Output Channels: ");
   ImGui::SameLine();
   {
-    static const char* kChannelOptionNames[] = {"Auto", "Force Stereo"};
+    static const char* kChannelOptionNames[] = {"Auto", "Force Stereo", "Virtual Surround"};
     AudioChannelOption currentChOpt = m_controller.getAudioChannelOption();
     int currentChItem = static_cast<int>(currentChOpt);
     ImGui::PushItemWidth(140.0f);
@@ -1356,21 +1380,160 @@ void PlayerUI::drawAudioSettingsPanel(int windowWidth, int windowHeight) {
         "channel count requires reopening the audio device).\n"
         "Auto: preserve the source's surround layout when it's one\n"
         "  NaikAVPlayer can drive directly (2.1/5.1/7.1).\n"
-        "Force Stereo: always downmix to stereo regardless of source.");
+        "Force Stereo: always downmix to stereo regardless of source.\n"
+        "Virtual Surround: preserve the source's surround layout\n"
+        "  internally, but always fold it down to stereo with\n"
+        "  positional delay/filter cues -- use this on headphones/\n"
+        "  stereo speakers to actually hear 5.1/7.1 content spatially\n"
+        "  instead of flattened to the middle.");
+  }
+  if (m_controller.isAudioVirtualSurroundActive()) {
+    ImGui::TextColored(greenColor, "Virtual surround active");
+    if (ImGui::IsItemHovered()) {
+      ImGui::SetTooltip(
+          "%s is being folded down to a 2-channel stream with positional\n"
+          "delay/filter cues, not sent to the device untouched.",
+          m_controller.getAudioChannelLayoutName().c_str());
+    }
+  }
+
+  ImGui::Spacing();
+  ImGui::Text("Output Bit Depth: ");
+  ImGui::SameLine();
+  {
+    static const char* kBitDepthNames[] = {"16-bit Integer", "32-bit Integer", "32-bit Float"};
+    AudioOutputBitDepth currentDepth = m_controller.getOutputBitDepth();
+    int currentDepthItem = static_cast<int>(currentDepth);
+    ImGui::PushItemWidth(160.0f);
+    if (ImGui::BeginCombo("##outputbitdepth", kBitDepthNames[currentDepthItem])) {
+      for (int i = 0; i < static_cast<int>(AudioOutputBitDepth::COUNT); ++i) {
+        bool isSelected = (currentDepthItem == i);
+        if (ImGui::Selectable(kBitDepthNames[i], isSelected)) {
+          m_controller.setOutputBitDepth(static_cast<AudioOutputBitDepth>(i));
+        }
+        if (isSelected) {
+          ImGui::SetItemDefaultFocus();
+        }
+      }
+      ImGui::EndCombo();
+    }
+    ImGui::PopItemWidth();
+  }
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip(
+        "Applies to the next file you open. The internal pipeline is\n"
+        "always float; this only controls the final format handed to\n"
+        "the audio device. 32-bit Float skips dithering/truncation\n"
+        "entirely (lossless); 32-bit Integer gives more headroom than\n"
+        "16-bit for hardware/drivers that prefer integer PCM.");
+  }
+
+  ImGui::Spacing();
+  ImGui::Text("Output Device: ");
+  ImGui::SameLine();
+  {
+    std::string currentDevice = m_controller.getOutputDeviceName();
+    const char* currentLabel = currentDevice.empty() ? "System Default" : currentDevice.c_str();
+    ImGui::PushItemWidth(220.0f);
+    if (ImGui::BeginCombo("##outputdevice", currentLabel)) {
+      bool defaultSelected = currentDevice.empty();
+      if (ImGui::Selectable("System Default", defaultSelected)) {
+        m_controller.setOutputDeviceName("");
+      }
+      if (defaultSelected) {
+        ImGui::SetItemDefaultFocus();
+      }
+      for (const std::string& name : AudioDecoder::enumeratePlaybackDeviceNames()) {
+        bool isSelected = (currentDevice == name);
+        if (ImGui::Selectable(name.c_str(), isSelected)) {
+          m_controller.setOutputDeviceName(name);
+        }
+        if (isSelected) {
+          ImGui::SetItemDefaultFocus();
+        }
+      }
+      ImGui::EndCombo();
+    }
+    ImGui::PopItemWidth();
+  }
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("Applies to the next file you open. \"System Default\" follows\nwhatever the OS considers the default playback device.");
+  }
+
+  ImGui::Spacing();
+  ImGui::Text("Resampler Quality: ");
+  ImGui::SameLine();
+  {
+    static const char* kQualityNames[] = {"Low", "Medium", "High", "Very High"};
+    ResamplerQuality currentQuality = m_controller.getResamplerQuality();
+    int currentQualityItem = static_cast<int>(currentQuality);
+    ImGui::PushItemWidth(140.0f);
+    if (ImGui::BeginCombo("##resamplerquality", kQualityNames[currentQualityItem])) {
+      for (int i = 0; i < static_cast<int>(ResamplerQuality::COUNT); ++i) {
+        bool isSelected = (currentQualityItem == i);
+        if (ImGui::Selectable(kQualityNames[i], isSelected)) {
+          m_controller.setResamplerQuality(static_cast<ResamplerQuality>(i));
+        }
+        if (isSelected) {
+          ImGui::SetItemDefaultFocus();
+        }
+      }
+      ImGui::EndCombo();
+    }
+    ImGui::PopItemWidth();
+  }
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip(
+        "libsoxr resampling precision. Applies to the next file you\n"
+        "open. Medium matches this project's original (pre-selector)\n"
+        "quality; higher tiers cost more CPU per resampled sample.");
   }
 
   ImGui::Spacing();
   ImGui::TextColored(sectionColor, "Presets");
   ImGui::Separator();
-  if (ImGui::Button("Flat", ImVec2(78, 0))) { s = naikav::dsp::makeFlatPreset(); changed = true; }
-  ImGui::SameLine();
-  if (ImGui::Button("Music", ImVec2(78, 0))) { s = naikav::dsp::makeMusicPreset(); changed = true; }
-  ImGui::SameLine();
-  if (ImGui::Button("Movie", ImVec2(78, 0))) { s = naikav::dsp::makeMoviePreset(); changed = true; }
-  ImGui::SameLine();
-  if (ImGui::Button("Night", ImVec2(78, 0))) { s = naikav::dsp::makeNightPreset(); changed = true; }
-  if (ImGui::IsItemHovered() || ImGui::IsItemActive()) {
-    ImGui::SetTooltip("Heavy compression for low-volume late-night watching");
+  {
+    struct PresetEntry {
+      const char* label;
+      naikav::dsp::AudioDspSettings (*make)();
+      const char* tooltip;
+    };
+    static const PresetEntry kPresets[] = {
+        {"Flat", naikav::dsp::makeFlatPreset, "No processing -- reference/unmodified source"},
+        {"Music", naikav::dsp::makeMusicPreset, "Gentle EQ smile, light dynamics, wider stereo image"},
+        {"Cinema", naikav::dsp::makeCinemaPreset, "Dialogue presence, bass management, 3D surround for movies"},
+        {"Night", naikav::dsp::makeNightPreset, "Heavy compression so quiet dialogue stays audible at low volume"},
+        {"Podcast", naikav::dsp::makePodcastPreset, "Speech clarity and consistent level, rumble cut, mono-safe"},
+        {"Gaming", naikav::dsp::makeGamingPreset, "Wide image + light 3D surround for positional audio cues"},
+        {"Live", naikav::dsp::makeLivePreset, "Open, spacious \"being there\" feel for live recordings"},
+        {"Bass Boost", naikav::dsp::makeBassBoostPreset, "Strong low-end lift with limiter protection"},
+        {"Vocal Boost", naikav::dsp::makeVocalBoostPreset, "Push vocals/dialogue forward and centered"},
+    };
+    constexpr int kPresetCount = static_cast<int>(sizeof(kPresets) / sizeof(kPresets[0]));
+    constexpr int kPresetsPerRow = 3;
+    constexpr float kPresetButtonWidth = 108.0f;
+    for (int i = 0; i < kPresetCount; ++i) {
+      if (ImGui::Button(kPresets[i].label, ImVec2(kPresetButtonWidth, 0))) {
+        s = kPresets[i].make();
+        changed = true;
+      }
+      if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("%s", kPresets[i].tooltip);
+      }
+      if ((i + 1) % kPresetsPerRow != 0 && i + 1 < kPresetCount) {
+        ImGui::SameLine();
+      }
+    }
+
+    changed |= ImGui::Checkbox("Auto-select preset by genre", &s.autoGenrePresetEnabled);
+    if (ImGui::IsItemHovered()) {
+      ImGui::SetTooltip(
+          "When a file has a genre tag, automatically apply a matching\n"
+          "preset above on open (e.g. \"Podcast\"/\"Speech\" -> Podcast,\n"
+          "\"Soundtrack\" -> Cinema). Crude keyword matching, not a real\n"
+          "genre taxonomy -- falls back to leaving your current settings\n"
+          "alone when nothing recognizable matches.");
+    }
   }
 
   ImGui::Spacing();
@@ -1383,14 +1546,35 @@ void PlayerUI::drawAudioSettingsPanel(int windowWidth, int windowHeight) {
   ImGui::BeginDisabled(!s.dspEnabled);
 
   ImGui::Spacing();
-  ImGui::TextColored(sectionColor, "Equalizer (5-band)");
-  static const char* kBandLabels[naikav::dsp::ParametricEQ::kNumBands] = {
-      "60 Hz", "250 Hz", "1 kHz", "4 kHz", "12 kHz"};
-  for (int i = 0; i < naikav::dsp::ParametricEQ::kNumBands; ++i) {
-    ImGui::PushID(i);
-    changed |= ImGui::SliderFloat(kBandLabels[i], &s.eqBandGainDb[i], -12.0f, 12.0f, "%.1f dB");
-    ImGui::PopID();
+  ImGui::PushStyleColor(ImGuiCol_Text, sectionColor);
+  bool eqSectionOpen = ImGui::CollapsingHeader("Equalizer (5-band parametric)", ImGuiTreeNodeFlags_DefaultOpen);
+  ImGui::PopStyleColor();
+  if (eqSectionOpen) {
+    static const char* kBandLabels[naikav::dsp::ParametricEQ::kNumBands] = {
+        "Band 1 (Bass)", "Band 2 (Low-mid)", "Band 3 (Mid)", "Band 4 (High-mid)", "Band 5 (Treble)"};
+    for (int i = 0; i < naikav::dsp::ParametricEQ::kNumBands; ++i) {
+      ImGui::PushID(i);
+      if (ImGui::TreeNodeEx(kBandLabels[i], ImGuiTreeNodeFlags_DefaultOpen)) {
+        changed |= ImGui::SliderFloat("Gain", &s.eqBandGainDb[i], -12.0f, 12.0f, "%.1f dB");
+        changed |= ImGui::SliderFloat("Freq", &s.eqBandFreqHz[i], 20.0f, 20000.0f, "%.0f Hz",
+                                       ImGuiSliderFlags_Logarithmic);
+        changed |= ImGui::SliderFloat("Q", &s.eqBandQ[i], 0.1f, 10.0f, "%.2f");
+        ImGui::TreePop();
+      }
+      ImGui::PopID();
+    }
   }
+
+  ImGui::Spacing();
+  ImGui::TextColored(sectionColor, "Noise Gate");
+  changed |= ImGui::Checkbox("Enable Noise Gate", &s.noiseGateEnabled);
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("Attenuates room noise/hiss/bleed during quiet passages,\nleaving everything above the threshold untouched.");
+  }
+  ImGui::BeginDisabled(!s.noiseGateEnabled);
+  changed |= ImGui::SliderFloat("Gate Threshold", &s.noiseGateThresholdDb, -80.0f, -20.0f, "%.1f dB");
+  changed |= ImGui::SliderFloat("Gate Ratio", &s.noiseGateRatio, 1.0f, 20.0f, "%.1f:1");
+  ImGui::EndDisabled();
 
   ImGui::Spacing();
   ImGui::TextColored(sectionColor, "Compressor");
@@ -1398,6 +1582,36 @@ void PlayerUI::drawAudioSettingsPanel(int windowWidth, int windowHeight) {
   ImGui::BeginDisabled(!s.compressorEnabled);
   changed |= ImGui::SliderFloat("Threshold", &s.compressorThresholdDb, -60.0f, 0.0f, "%.1f dB");
   changed |= ImGui::SliderFloat("Ratio", &s.compressorRatio, 1.0f, 20.0f, "%.1f:1");
+  ImGui::EndDisabled();
+
+  ImGui::Spacing();
+  ImGui::TextColored(sectionColor, "Multiband Compressor");
+  changed |= ImGui::Checkbox("Enable Multiband Compressor", &s.multibandEnabled);
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip(
+        "Splits into low/mid/high bands (via two crossover points) and\n"
+        "compresses each independently, so taming one frequency range\n"
+        "doesn't drag the others down with it the way the single\n"
+        "full-band Compressor above does.");
+  }
+  ImGui::BeginDisabled(!s.multibandEnabled);
+  changed |= ImGui::SliderFloat("Low/Mid Split", &s.multibandLowMidHz, 60.0f, 1000.0f, "%.0f Hz", ImGuiSliderFlags_Logarithmic);
+  changed |= ImGui::SliderFloat("Mid/High Split", &s.multibandMidHighHz, 1000.0f, 12000.0f, "%.0f Hz", ImGuiSliderFlags_Logarithmic);
+  if (ImGui::TreeNodeEx("Low Band", ImGuiTreeNodeFlags_DefaultOpen)) {
+    changed |= ImGui::SliderFloat("Threshold##mbLow", &s.multibandLowThresholdDb, -60.0f, 0.0f, "%.1f dB");
+    changed |= ImGui::SliderFloat("Ratio##mbLow", &s.multibandLowRatio, 1.0f, 20.0f, "%.1f:1");
+    ImGui::TreePop();
+  }
+  if (ImGui::TreeNodeEx("Mid Band", ImGuiTreeNodeFlags_DefaultOpen)) {
+    changed |= ImGui::SliderFloat("Threshold##mbMid", &s.multibandMidThresholdDb, -60.0f, 0.0f, "%.1f dB");
+    changed |= ImGui::SliderFloat("Ratio##mbMid", &s.multibandMidRatio, 1.0f, 20.0f, "%.1f:1");
+    ImGui::TreePop();
+  }
+  if (ImGui::TreeNodeEx("High Band", ImGuiTreeNodeFlags_DefaultOpen)) {
+    changed |= ImGui::SliderFloat("Threshold##mbHigh", &s.multibandHighThresholdDb, -60.0f, 0.0f, "%.1f dB");
+    changed |= ImGui::SliderFloat("Ratio##mbHigh", &s.multibandHighRatio, 1.0f, 20.0f, "%.1f:1");
+    ImGui::TreePop();
+  }
   ImGui::EndDisabled();
 
   ImGui::Spacing();
@@ -1415,6 +1629,14 @@ void PlayerUI::drawAudioSettingsPanel(int windowWidth, int windowHeight) {
   }
   ImGui::BeginDisabled(!s.crossoverEnabled);
   changed |= ImGui::SliderFloat("Cutoff", &s.crossoverCutoffHz, 40.0f, 250.0f, "%.0f Hz");
+  changed |= ImGui::Checkbox("Redirect Bass to Sub", &s.crossoverBassRedirectEnabled);
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip(
+        "True bass management: highpasses every other channel at the\n"
+        "cutoff and sums exactly what was removed into the LFE channel,\n"
+        "instead of only tone-shaping an already-present LFE track.\n"
+        "Useful when the main/surround speakers can't reproduce bass well.");
+  }
   ImGui::EndDisabled();
 
   ImGui::EndDisabled(); // dspEnabled
@@ -1442,6 +1664,51 @@ void PlayerUI::drawAudioSettingsPanel(int windowWidth, int windowHeight) {
       ImGui::SameLine();
       ImGui::TextColored(ImVec4(0.0f, 0.83f, 0.4f, 1.0f), "%+.1f dB", appliedGain);
     }
+  }
+
+  ImGui::Spacing();
+  ImGui::TextColored(sectionColor, "3D Surround");
+  ImGui::Separator();
+  changed |= ImGui::Checkbox("Enable 3D Surround", &s.surround3dEnabled);
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip(
+        "Synthesizes a wider, more enveloping spatial ambience from any\n"
+        "2-channel output -- works on plain stereo sources (unlike Output\n"
+        "Channels: Virtual Surround, which needs a real 5.1/7.1 source),\n"
+        "and adds extra depth on top when Virtual Surround is also active.\n"
+        "Hand-rolled delay/filter based DSP, not a licensed decoder like\n"
+        "DTS:X or Dolby Atmos -- no HRTF/measured spatial data involved.");
+  }
+  ImGui::BeginDisabled(!s.surround3dEnabled);
+  changed |= ImGui::SliderFloat("Intensity", &s.surround3dIntensity, 0.0f, 2.0f, "%.2fx");
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("1.00x = designed nominal strength, 0.00x = off, >1.00x = more pronounced");
+  }
+  ImGui::EndDisabled();
+
+  ImGui::Spacing();
+  ImGui::TextColored(sectionColor, "Stereo Widener");
+  ImGui::Separator();
+  changed |= ImGui::Checkbox("Enable Stereo Widener", &s.widenerEnabled);
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip(
+        "Mid-side widening for a wider, more spacious stereo image.\n"
+        "Only affects 2-channel output -- a no-op on native multichannel\n"
+        "passthrough (Output Channels: Auto with real surround hardware).");
+  }
+  ImGui::BeginDisabled(!s.widenerEnabled);
+  changed |= ImGui::SliderFloat("Width", &s.widenerWidth, 0.0f, 2.0f, "%.2fx");
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("1.00x = unchanged, 0.00x = mono, >1.00x = wider than the source");
+  }
+  ImGui::EndDisabled();
+
+  ImGui::Spacing();
+  ImGui::TextColored(sectionColor, "Balance");
+  ImGui::Separator();
+  changed |= ImGui::SliderFloat("L / R Balance", &s.balance, -1.0f, 1.0f, "%.2f");
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("0.00 = centered, -1.00 = full left, +1.00 = full right.\nOnly affects 2-channel output.");
   }
 
   if (changed) {

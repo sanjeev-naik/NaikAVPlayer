@@ -14,6 +14,10 @@
 #include <nfd.hpp>
 #include <csignal>
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 #ifndef _WIN32
 static std::atomic<bool> g_signalQuit{false};
 static void signalHandler(int sig) {
@@ -26,6 +30,32 @@ static bool isSignalQuitRequested() {
 #else
 static bool isSignalQuitRequested() {
   return false;
+}
+
+// Attaches to whatever console launched this process (if any) and points
+// std::cout/cerr at it. The app is built WIN32_EXECUTABLE (no console
+// subsystem), so without this the existing log output -- file open/decode/
+// DSP/playback-state messages -- has nowhere to go even when launched from
+// a terminal.
+//
+// Deliberately opt-in via --console rather than run automatically at
+// startup. A GUI-subsystem process that silently attaches to its parent
+// console and reopens CONOUT$ before doing anything else is a recognized
+// console-hiding pattern in droppers/stealers, and generic AV heuristics
+// score it accordingly -- the same class of false positive that already
+// pushed the Windows release build from MinGW to MSVC (see the toolchain
+// note in .github/workflows/ci.yml). Requiring an explicit flag keeps the
+// full diagnostic capability while removing the unprompted startup
+// behavior that heuristics actually key on. Silently does nothing when
+// there is no parent console (e.g. launched by double-click).
+static void attachParentConsole() {
+  if (AttachConsole(ATTACH_PARENT_PROCESS)) {
+    FILE *dummy;
+    freopen_s(&dummy, "CONOUT$", "w", stdout);
+    freopen_s(&dummy, "CONOUT$", "w", stderr);
+    std::cout.clear();
+    std::cerr.clear();
+  }
 }
 #endif
 
@@ -152,7 +182,19 @@ static SDL_Colorspace getSDLColorspace(const AVFrame *frame) {
 }
 
 int main(int argc, char *argv[]) {
-#ifndef _WIN32
+#ifdef _WIN32
+  // Scanned here, ahead of everything else, rather than in the main
+  // argument loop further down: SDL/window/renderer/NFD initialization all
+  // log before that loop is reached, and those messages are exactly the
+  // ones worth seeing when diagnosing a startup failure. See
+  // attachParentConsole() for why this is opt-in.
+  for (int i = 1; i < argc; ++i) {
+    if (std::string(argv[i]) == "--console") {
+      attachParentConsole();
+      break;
+    }
+  }
+#else
   std::signal(SIGINT, signalHandler);
   std::signal(SIGTERM, signalHandler);
 #endif
@@ -242,6 +284,12 @@ int main(int argc, char *argv[]) {
     std::string arg = argv[i];
     if (arg == "--metrics") {
       metricsEnabled = true;
+    } else if (arg == "--console") {
+      // Already consumed before SDL initialization above (Windows only).
+      // Still matched here so it is never mistaken for the media path by
+      // the branch below -- and so it is accepted, not treated as a
+      // filename, on non-Windows builds where it does nothing.
+      continue;
     } else if (mediaPath.empty()) {
       mediaPath = arg;
     }
@@ -289,6 +337,15 @@ int main(int argc, char *argv[]) {
   // here is intentional cross-platform behavior, not a bug.
   while (!quit && !isSignalQuitRequested()) {
     double currentSecs = SDL_GetTicks() / 1000.0;
+
+    // The whole per-frame body is guarded: PlayerController::openFile()
+    // (reached below from drag & drop) recreates decode threads and
+    // reallocates several buffers on every call, so an uncaught
+    // std::bad_alloc or std::system_error (thread-creation failure) from
+    // repeatedly opening/closing files here would otherwise propagate all
+    // the way out of main() and std::terminate() the whole app instead of
+    // just failing to load that one file.
+    try {
 
     // 1. Process Windows Events & Input Routing
     while (SDL_PollEvent(&event)) {
@@ -353,6 +410,12 @@ int main(int argc, char *argv[]) {
         }
       }
     }
+
+    // Applies a completed background loudness prescan, if one just
+    // finished -- see PlayerController::prescanLoudnessForCurrentFile()
+    // (the decode-based path runs on a background thread specifically so
+    // opening a new file above never blocks this event loop).
+    controller.pollPendingLoudnessPrescan();
 
     // 2. Decode Video Frames & Synchronize to Master Clock
     if (controller.hasVideo()) {
@@ -565,6 +628,14 @@ int main(int argc, char *argv[]) {
     SDL_GetRenderVSync(renderer, &vsync);
     if (windowMinimized || vsync <= 0) {
       SDL_Delay(5);
+    }
+
+    } catch (const std::exception& e) {
+      std::cerr << "Error: unhandled exception in main loop: " << e.what()
+                << std::endl;
+    } catch (...) {
+      std::cerr << "Error: unhandled non-standard exception in main loop"
+                << std::endl;
     }
   }
 

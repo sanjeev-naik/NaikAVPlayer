@@ -573,6 +573,80 @@ target_compile_options(NaikAVPlayer_tests PRIVATE ${PROJECT_WARNING_FLAGS})
 setup_target_dependencies(NaikAVPlayer_tests)
 
 # -------------------------------------------------------------
+# Standalone DSP-repro diagnostic (not part of the regular test suite --
+# see tests/dsp_repro_standalone.cpp). Talks to the real SDL audio device
+# directly, unlike NaikAVPlayer_tests which mocks SDL_OpenAudioDeviceStream
+# and falls back to a disconnected (no-callback) stream whenever the real
+# device open fails in a sandboxed/headless test-runner environment.
+# -------------------------------------------------------------
+add_executable(NaikAVPlayer_dsp_repro
+    tests/dsp_repro_standalone.cpp
+    ${PLAYER_LOGIC_SOURCES}
+)
+
+target_link_libraries(NaikAVPlayer_dsp_repro PRIVATE
+    SDL3::SDL3-shared
+)
+if(FFMPEG_USE_SYSTEM)
+    target_link_libraries(NaikAVPlayer_dsp_repro PRIVATE PkgConfig::FFMPEG)
+else()
+    target_include_directories(NaikAVPlayer_dsp_repro SYSTEM PRIVATE "${FFMPEG_DIR}/include")
+    target_link_directories(NaikAVPlayer_dsp_repro PRIVATE "${FFMPEG_DIR}/lib")
+    target_link_libraries(NaikAVPlayer_dsp_repro PRIVATE
+        avcodec
+        avformat
+        avutil
+        swscale
+        swresample
+        avfilter
+    )
+endif()
+if(TARGET_PLATFORM_LINUX)
+    target_link_libraries(NaikAVPlayer_dsp_repro PRIVATE pthread dl)
+endif()
+if(TARGET_PLATFORM_WINDOWS AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_link_options(NaikAVPlayer_dsp_repro PRIVATE -static-libgcc -static-libstdc++)
+endif()
+
+setup_target_dependencies(NaikAVPlayer_dsp_repro)
+
+# -------------------------------------------------------------
+# Standalone getColorInfo() data-race diagnostic (see
+# tests/colorinfo_race_repro.cpp) -- isolates the specific race between the
+# Diagnostics HUD's getColorInfo() and the video decode thread.
+# -------------------------------------------------------------
+add_executable(NaikAVPlayer_colorinfo_race
+    tests/colorinfo_race_repro.cpp
+    ${PLAYER_LOGIC_SOURCES}
+)
+
+target_link_libraries(NaikAVPlayer_colorinfo_race PRIVATE
+    SDL3::SDL3-shared
+)
+if(FFMPEG_USE_SYSTEM)
+    target_link_libraries(NaikAVPlayer_colorinfo_race PRIVATE PkgConfig::FFMPEG)
+else()
+    target_include_directories(NaikAVPlayer_colorinfo_race SYSTEM PRIVATE "${FFMPEG_DIR}/include")
+    target_link_directories(NaikAVPlayer_colorinfo_race PRIVATE "${FFMPEG_DIR}/lib")
+    target_link_libraries(NaikAVPlayer_colorinfo_race PRIVATE
+        avcodec
+        avformat
+        avutil
+        swscale
+        swresample
+        avfilter
+    )
+endif()
+if(TARGET_PLATFORM_LINUX)
+    target_link_libraries(NaikAVPlayer_colorinfo_race PRIVATE pthread dl)
+endif()
+if(TARGET_PLATFORM_WINDOWS AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_link_options(NaikAVPlayer_colorinfo_race PRIVATE -static-libgcc -static-libstdc++)
+endif()
+
+setup_target_dependencies(NaikAVPlayer_colorinfo_race)
+
+# -------------------------------------------------------------
 # Install Rules
 # -------------------------------------------------------------
 include(GNUInstallDirs)

@@ -122,4 +122,39 @@ public:
     double getDuration() const { return m_duration; }
     bool isEOF() const { return m_eof.load(); }
     bool isSeekRequested() const { return m_seekRequested.load(); }
+
+    // Container-level metadata tags (e.g. artist/genre/ReplayGain), for
+    // callers that want to read them directly (see
+    // naikav::dsp::readTaggedLoudnessAsLufs() and getGenreTag() below).
+    // nullptr if no format is open.
+    AVDictionary* getFormatMetadata() const { return m_formatCtx ? m_formatCtx->metadata : nullptr; }
+
+    // Per-stream metadata tags for the audio stream specifically -- some
+    // containers (e.g. FLAC with per-stream Vorbis comments) attach tags
+    // there rather than at the format level. nullptr if there's no audio
+    // stream open.
+    AVDictionary* getAudioStreamMetadata() const {
+        int idx = m_audioStreamIdx.load();
+        if (!m_formatCtx || idx < 0 || idx >= static_cast<int>(m_formatCtx->nb_streams)) {
+            return nullptr;
+        }
+        return m_formatCtx->streams[idx]->metadata;
+    }
+
+    // Convenience accessor for the free-form genre tag (container "genre"
+    // key, which FFmpeg normalizes ID3 TCON/Vorbis comment "GENRE"/etc.
+    // into), for naikav::dsp::presetForGenreTag(). Empty string if absent.
+    std::string getGenreTag() const {
+        if (const AVDictionary* d = getFormatMetadata()) {
+            if (const AVDictionaryEntry* e = av_dict_get(d, "genre", nullptr, 0)) {
+                return e->value;
+            }
+        }
+        if (const AVDictionary* d = getAudioStreamMetadata()) {
+            if (const AVDictionaryEntry* e = av_dict_get(d, "genre", nullptr, 0)) {
+                return e->value;
+            }
+        }
+        return "";
+    }
 };

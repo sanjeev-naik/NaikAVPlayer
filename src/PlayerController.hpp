@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cstdint>
 #include <mutex>
+#include <vector>
 #include "ThreadSafeQueue.hpp"
 #include "Demuxer.hpp"
 #include "AudioDecoder.hpp"
@@ -71,6 +72,12 @@ private:
     // rationale as m_volume/m_audioDspSettings above.
     AudioChannelOption m_channelOption = AudioChannelOption::AUTO;
 
+    // Same "applied to AudioDecoder before init()" pattern as
+    // m_channelOption above, for the other output-routing/quality settings.
+    AudioOutputBitDepth m_outputBitDepth = AudioOutputBitDepth::BIT_16;
+    std::string m_outputDeviceName;
+    ResamplerQuality m_resamplerQuality = ResamplerQuality::MEDIUM;
+
     bool m_loopEnabled;
 
     // Background video decoding thread
@@ -108,6 +115,53 @@ private:
 
     void loadSettings();
     void saveSettings();
+
+    // Primes m_audioDecoder's loudness normalizer for the current file --
+    // see LoudnessNormalizer's two-pass mode. Checks a ReplayGain/R128
+    // container tag first (cheap, a couple of dictionary lookups, so
+    // handled synchronously here); failing that, kicks off
+    // naikav::dsp::prescanIntegratedLufs() -- a decode-only pass over the
+    // *entire* audio stream -- on a background thread (see
+    // m_loudnessPrescanThread below), since blocking on that would
+    // otherwise freeze the whole UI thread for however long the file
+    // takes to scan (openFile() is called directly from main.cpp's
+    // SDL_EVENT_DROP_FILE handler on the render/event thread). No-op if
+    // there's no audio decoder or no file open. Called from openFile()
+    // and from setAudioDspSettings() when loudness normalization is newly
+    // toggled on mid-playback.
+    void prescanLoudnessForCurrentFile();
+
+    // Background-thread state for the decode-based prescan path above.
+    // Only ever touches m_pendingPrescanResult (mutex-guarded) from the
+    // background thread -- never m_audioDecoder or any other
+    // PlayerController state directly, so there's no race with
+    // openFile()/stop() replacing m_audioDecoder mid-scan. The result is
+    // only ever applied from the main thread, via
+    // pollPendingLoudnessPrescan() below, and only if its generation tag
+    // still matches the current file.
+    std::thread m_loudnessPrescanThread;
+    std::atomic<uint64_t> m_loudnessPrescanGeneration{0};
+    struct PendingLoudnessPrescanResult {
+        uint64_t generation = 0;
+        double lufs = -120.0;
+        bool valid = false;
+    };
+    std::mutex m_pendingPrescanMutex;
+    PendingLoudnessPrescanResult m_pendingPrescanResult;
+
+    // Joins m_loudnessPrescanThread if it's still running. Called from
+    // stop() (and therefore from both openFile() and the destructor) so a
+    // background scan never outlives the PlayerController instance whose
+    // `this` its lambda captured.
+    void joinLoudnessPrescanThread();
+
+    // If m_audioDspSettings.autoGenrePresetEnabled is set, reads the
+    // current file's genre tag (via m_demuxer) and, if it maps to a known
+    // preset (see naikav::dsp::presetForGenreTag()), applies it -- called
+    // from openFile() after the initial applyDspSettings() so genre-based
+    // preset selection happens automatically per file, without disturbing
+    // callers who never opt in.
+    void applyGenrePresetIfEnabled();
     void videoThreadLoop();
     void instantSeek(double seconds);
     void finishCatchup(double resumePts);
@@ -130,7 +184,17 @@ public:
     void pause();
     void seek(double seconds);
     void stop();
-    
+
+    // Applies a completed background loudness prescan (see
+    // prescanLoudnessForCurrentFile()) if one is ready, from whichever
+    // thread calls this -- intended to be called once per frame from the
+    // main/render thread's event loop (main.cpp), since openFile() is
+    // called directly from there and the prescan result must be applied
+    // via AudioDecoder::primeLoudnessPrescan() from a thread that isn't
+    // racing openFile()/stop() replacing m_audioDecoder. Cheap when
+    // nothing is pending (one mutex-guarded flag check).
+    void pollPendingLoudnessPrescan();
+
     void updateClockForVideoOnly();
 
     // Getters
@@ -193,6 +257,16 @@ public:
     float getCurrentLoudnessGainDb() const {
         return (m_hasAudio && m_audioDecoder) ? m_audioDecoder->getCurrentLoudnessGainDb() : 0.0f;
     }
+    // Live magnitude-spectrum snapshot for the Audio Processing panel's
+    // visualizer (dB per bin, empty if there's no audio decoder yet).
+    // See AudioDecoder::getSpectrumMagnitudesDb().
+    std::vector<float> getSpectrumMagnitudesDb() const {
+        return (m_hasAudio && m_audioDecoder) ? m_audioDecoder->getSpectrumMagnitudesDb() : std::vector<float>{};
+    }
+    static int getSpectrumNumBins() { return AudioDecoder::getSpectrumNumBins(); }
+    double getSpectrumBinFrequencyHz(int bin) const {
+        return (m_hasAudio && m_audioDecoder) ? m_audioDecoder->getSpectrumBinFrequencyHz(bin) : 0.0;
+    }
     // Resolved output channel count (e.g. 2 for stereo, 6 for 5.1). 0 if
     // there's no audio stream. See getAudioChannelLayoutName() for the
     // human-readable name (e.g. "5.1(side)").
@@ -208,14 +282,51 @@ public:
         return (m_hasAudio && m_audioDecoder) ? m_audioDecoder->getDeviceNativeChannels() : 0;
     }
 
+    // True when AudioChannelOption::VIRTUAL_SURROUND is folding a discrete
+    // surround source down to stereo with positional cues (see
+    // AudioDecoder::isVirtualSurroundActive()), rather than either
+    // preserving it untouched or downmixing it flat.
+    bool isAudioVirtualSurroundActive() const {
+        return (m_hasAudio && m_audioDecoder) ? m_audioDecoder->isVirtualSurroundActive() : false;
+    }
+
     // User override for output channel resolution (AUTO preserves source
-    // surround layout when supported; FORCE_STEREO always downmixes).
+    // surround layout when supported; FORCE_STEREO always downmixes;
+    // VIRTUAL_SURROUND preserves it internally but folds it down to a
+    // positionally-cued stereo device stream -- see AudioChannelOption).
     // Takes effect on the next openFile() call, not live during current
     // playback (changing channel count requires reopening the audio
     // device). Persisted to disk like resolution/DSP settings.
     AudioChannelOption getAudioChannelOption() const { return m_channelOption; }
     void setAudioChannelOption(AudioChannelOption option) {
         m_channelOption = option;
+        saveSettings();
+    }
+
+    // Output device PCM bit depth (S16/S32/F32 -- see AudioOutputBitDepth).
+    // Same "takes effect on next openFile()" rule as channel option above.
+    AudioOutputBitDepth getOutputBitDepth() const { return m_outputBitDepth; }
+    void setOutputBitDepth(AudioOutputBitDepth depth) {
+        m_outputBitDepth = depth;
+        saveSettings();
+    }
+
+    // Preferred playback device, by name (empty = OS default) -- see
+    // AudioDecoder::enumeratePlaybackDeviceNames() for the list to
+    // present in a UI dropdown. Same "takes effect on next openFile()"
+    // rule as the other output-routing settings above.
+    const std::string& getOutputDeviceName() const { return m_outputDeviceName; }
+    void setOutputDeviceName(const std::string& name) {
+        m_outputDeviceName = name;
+        saveSettings();
+    }
+
+    // libsoxr resampling quality tier -- see ResamplerQuality. Same
+    // "takes effect on next openFile()" rule as the other output/routing
+    // settings above (resampler is configured once at init() time).
+    ResamplerQuality getResamplerQuality() const { return m_resamplerQuality; }
+    void setResamplerQuality(ResamplerQuality quality) {
+        m_resamplerQuality = quality;
         saveSettings();
     }
 
@@ -227,6 +338,21 @@ public:
     size_t getVideoFrameQueueSize() const { return m_decodedFrameQueue.size(); }
     size_t getVideoFrameQueueCapacity() const { return m_decodedFrameQueue.capacity(); }
     size_t getAudioFrameQueueSize() const;
+
+    // Audio underrun diagnostics -- see
+    // AudioDecoder::getSilenceInjectionCount(). Zero when there's no audio.
+    uint64_t getAudioCallbackCount() const {
+        return (m_hasAudio && m_audioDecoder) ? m_audioDecoder->getCallbackCount() : 0;
+    }
+    uint64_t getAudioSilenceInjectionCount() const {
+        return (m_hasAudio && m_audioDecoder) ? m_audioDecoder->getSilenceInjectionCount() : 0;
+    }
+    uint64_t getAudioSilenceBytes() const {
+        return (m_hasAudio && m_audioDecoder) ? m_audioDecoder->getSilenceBytes() : 0;
+    }
+    // Diagnostics only -- lets a smoke test attribute underruns to a
+    // specific decodeAndResample() exit path. Not for playback control.
+    AudioDecoder* audioDecoderForDiagnostics() const { return m_audioDecoder.get(); }
     static size_t getAudioFrameQueueCapacity() { return 48000; } // target scale for visual (48k samples ~ 1 sec)
 
     // Timing setters/getters
