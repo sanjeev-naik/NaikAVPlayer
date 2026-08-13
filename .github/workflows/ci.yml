@@ -99,6 +99,7 @@ jobs:
             --error-exitcode=1 \
             --xml \
             --xml-version=2 \
+            -I src/ \
             src/ tests/ 2> cppcheck_report.xml
 
       - name: Configure CMake with Sanitizers (ASan/UBSan Debug)

@@ -26,7 +26,7 @@ license text is included in this package as `licenses/LICENSE.lgpl-3`.
 
 Bundled optional component -- libsoxr (The SoX Resampler library):
 NaikAVPlayer explicitly selects libsoxr as swresample's resampling engine
-(`av_opt_set(swrCtx, "resampler", "soxr", 0)` in src/AudioDecoder.cpp) for
+(`av_opt_set(swrCtx, "resampler", "soxr", 0)` in src/audio/AudioDecoder.cpp) for
 better stopband rejection than swresample's own default resampler. libsoxr is
 statically compiled into this build's swresample-6.dll (confirmed via
 `--enable-libsoxr` in the same `ffmpeg -version` configuration string) rather

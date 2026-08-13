@@ -1,11 +1,11 @@
 #pragma once
 
-#include "ParametricEQ.hpp"
-#include "NoiseGate.hpp"
-#include "Compressor.hpp"
-#include "MultibandCompressor.hpp"
-#include "Limiter.hpp"
-#include "Crossover.hpp"
+#include "audio/dsp/ParametricEQ.hpp"
+#include "audio/dsp/NoiseGate.hpp"
+#include "audio/dsp/Compressor.hpp"
+#include "audio/dsp/MultibandCompressor.hpp"
+#include "audio/dsp/Limiter.hpp"
+#include "audio/dsp/Crossover.hpp"
 
 namespace naikav::dsp {
 

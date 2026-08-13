@@ -268,7 +268,7 @@ The user interface uses Dear ImGui with frosted translucency overlay.
 
 ## 5a. Pipeline Backpressure & Deadlock Prevention
 
-The single demuxer thread reads both the video and audio packet streams via `av_read_frame`, so if a push into either queue ever blocked indefinitely, packet delivery to *both* streams would silently stop — for example, nothing drains the audio packet queue while the audio device is paused (a seek catch-up, or simply the user pausing playback). `ThreadSafeQueue` (`src/ThreadSafeQueue.hpp`) provides two bounded push variants used in place of a plain blocking `push()` wherever a producer thread cannot afford to stall:
+The single demuxer thread reads both the video and audio packet streams via `av_read_frame`, so if a push into either queue ever blocked indefinitely, packet delivery to *both* streams would silently stop — for example, nothing drains the audio packet queue while the audio device is paused (a seek catch-up, or simply the user pausing playback). `ThreadSafeQueue` (`src/core/ThreadSafeQueue.hpp`) provides two bounded push variants used in place of a plain blocking `push()` wherever a producer thread cannot afford to stall:
 
 - **`push_wait_or_drop(value, timeoutMs, dropCleanup)`**: waits up to `timeoutMs` for room, then drops the oldest queued entry (invoking `dropCleanup` on it, if given) and pushes anyway. This is the structural backstop for the demuxer's video/audio packet pushes and the video decode thread's push into the decoded frame queue (all with a 500ms timeout) — no matter what stalls the consumer (a paused device, a wedged hardware decoder, a stuck render loop), the producer thread always returns and keeps making progress.
 - **`push_drop_oldest(value, dropCleanup)`**: never waits at all — drops the oldest entry immediately if full. Used for audio packets specifically while the audio consumer is known to be idle (paused, or mid seek catch-up), since waiting on a consumer that isn't running serves no purpose.
@@ -279,7 +279,7 @@ This also replaced the previous PTS-based `throttleCatchupReadahead()` mechanism
 
 ## 5b. Audio DSP & Loudness Pipeline
 
-Every decoded audio buffer runs through a fixed, in-place signal chain inside the SDL3 audio callback (`AudioDecoder::decodeAndResample()`, `src/AudioDecoder.cpp`), entirely as interleaved `AV_SAMPLE_FMT_FLT` — never the S16 device format — until the very last step:
+Every decoded audio buffer runs through a fixed, in-place signal chain inside the SDL3 audio callback (`AudioDecoder::decodeAndResample()`, `src/audio/AudioDecoder.cpp`), entirely as interleaved `AV_SAMPLE_FMT_FLT` — never the S16 device format — until the very last step:
 
 ```text
 decode -> resample (swresample, libsoxr engine, selectable quality) -> DSP chain

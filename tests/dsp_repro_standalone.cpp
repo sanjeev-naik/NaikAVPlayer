@@ -13,8 +13,8 @@
 // stream), enable every DSP option, then open a large real-world file
 // that does have audio.
 #define SDL_MAIN_HANDLED
-#include "../src/PlayerController.hpp"
-#include "../src/audio/dsp/AudioDspSettings.hpp"
+#include "player/PlayerController.hpp"
+#include "audio/dsp/AudioDspSettings.hpp"
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h>
 #include <chrono>

@@ -12,7 +12,7 @@
 // Usage: audio_underrun_smoke.exe <media-file> [seconds]
 
 #define SDL_MAIN_HANDLED
-#include "../src/PlayerController.hpp"
+#include "player/PlayerController.hpp"
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h>
 

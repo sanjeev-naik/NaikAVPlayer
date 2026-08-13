@@ -328,10 +328,10 @@ inline bool mock_SDL_Init(SDL_InitFlags flags) {
 // Direct C++ sources inclusion with private visibility bypass
 // -------------------------------------------------------------
 #define private public
-#include "../src/PlayerController.cpp"
-#include "../src/Demuxer.cpp"
-#include "../src/VideoDecoder.cpp"
-#include "../src/AudioDecoder.cpp"
+#include "player/PlayerController.cpp"
+#include "media/Demuxer.cpp"
+#include "video/VideoDecoder.cpp"
+#include "audio/AudioDecoder.cpp"
 #undef private
 
 // Simple assert helper

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "LoudnessMeter.hpp"
+#include "audio/dsp/LoudnessMeter.hpp"
 
 extern "C" {
 #include <libavformat/avformat.h>

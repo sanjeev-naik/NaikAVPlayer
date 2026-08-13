@@ -1,5 +1,5 @@
 #pragma once
-#include "MetricRing.hpp"
+#include "core/MetricRing.hpp"
 #include <atomic>
 
 struct PipelineMetrics {

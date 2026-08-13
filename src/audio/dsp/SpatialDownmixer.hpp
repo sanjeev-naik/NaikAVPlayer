@@ -4,7 +4,7 @@
 #include <cmath>
 #include <cstddef>
 #include <vector>
-#include "Biquad.hpp"
+#include "audio/dsp/Biquad.hpp"
 
 namespace naikav::dsp {
 

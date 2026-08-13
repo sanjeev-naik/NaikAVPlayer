@@ -2,8 +2,8 @@
 
 #include <vector>
 #include <algorithm>
-#include "Biquad.hpp"
-#include "Compressor.hpp"
+#include "audio/dsp/Biquad.hpp"
+#include "audio/dsp/Compressor.hpp"
 
 namespace naikav::dsp {
 

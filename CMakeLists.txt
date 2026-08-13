@@ -414,25 +414,33 @@ endif()
 # -------------------------------------------------------------
 # Main Executable
 # -------------------------------------------------------------
+# Sources are grouped by function under src/ (core, media, video, audio,
+# player, ui, app). Every target adds src/ to its include path via
+# PLAYER_INCLUDE_DIR, so headers are included by their root-anchored path
+# ("audio/dsp/DspChain.hpp") regardless of the including file's location.
+set(PLAYER_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src")
+
 # Separate logic source files from main.cpp
 set(PLAYER_LOGIC_SOURCES
-    src/PlayerController.cpp
-    src/Demuxer.cpp
-    src/VideoDecoder.cpp
-    src/AudioDecoder.cpp
+    src/player/PlayerController.cpp
+    src/media/Demuxer.cpp
+    src/video/VideoDecoder.cpp
+    src/audio/AudioDecoder.cpp
 )
 
 set(WINDOWS_RESOURCE_FILE "")
 if(TARGET_PLATFORM_WINDOWS)
-    set(WINDOWS_RESOURCE_FILE src/resource.rc)
+    set(WINDOWS_RESOURCE_FILE src/app/resource.rc)
 endif()
 
-add_executable(NaikAVPlayer 
-    src/main.cpp 
-    src/PlayerUI.cpp
+add_executable(NaikAVPlayer
+    src/app/main.cpp
+    src/ui/PlayerUI.cpp
     ${PLAYER_LOGIC_SOURCES}
     ${WINDOWS_RESOURCE_FILE}
 )
+
+target_include_directories(NaikAVPlayer PRIVATE "${PLAYER_INCLUDE_DIR}")
 
 # Link libraries to our executable
 target_link_libraries(NaikAVPlayer PRIVATE
@@ -519,9 +527,11 @@ setup_target_dependencies(NaikAVPlayer)
 # -------------------------------------------------------------
 # Test Target
 # -------------------------------------------------------------
-add_executable(NaikAVPlayer_tests 
+add_executable(NaikAVPlayer_tests
     tests/tests.cpp
 )
+
+target_include_directories(NaikAVPlayer_tests PRIVATE "${PLAYER_INCLUDE_DIR}")
 
 option(ENABLE_COVERAGE "Enable code coverage instrumentation" ON)
 
@@ -584,6 +594,8 @@ add_executable(NaikAVPlayer_dsp_repro
     ${PLAYER_LOGIC_SOURCES}
 )
 
+target_include_directories(NaikAVPlayer_dsp_repro PRIVATE "${PLAYER_INCLUDE_DIR}")
+
 target_link_libraries(NaikAVPlayer_dsp_repro PRIVATE
     SDL3::SDL3-shared
 )
@@ -619,6 +631,8 @@ add_executable(NaikAVPlayer_colorinfo_race
     tests/colorinfo_race_repro.cpp
     ${PLAYER_LOGIC_SOURCES}
 )
+
+target_include_directories(NaikAVPlayer_colorinfo_race PRIVATE "${PLAYER_INCLUDE_DIR}")
 
 target_link_libraries(NaikAVPlayer_colorinfo_race PRIVATE
     SDL3::SDL3-shared

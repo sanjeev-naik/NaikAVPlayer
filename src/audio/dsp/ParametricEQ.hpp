@@ -3,7 +3,7 @@
 #include <array>
 #include <vector>
 #include <algorithm>
-#include "Biquad.hpp"
+#include "audio/dsp/Biquad.hpp"
 
 namespace naikav::dsp {
 

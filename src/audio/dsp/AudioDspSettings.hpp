@@ -1,6 +1,6 @@
 #pragma once
 
-#include "ParametricEQ.hpp"
+#include "audio/dsp/ParametricEQ.hpp"
 #include <string>
 #include <algorithm>
 #include <cctype>

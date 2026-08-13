@@ -66,26 +66,37 @@ NaikAVPlayer/
 │   ├── fonts/               # Bundled open-source typography (Noto Sans)
 │   └── app_icon.png         # Project launcher icon
 ├── build/                   # Recommended directory for CMake builds (ignored by git)
-├── src/                     # Source files for the playback engine and UI
-│   ├── main.cpp             # Application entry point & render loop
-│   ├── PlayerController.cpp # Media state machine & sync coordinator
-│   ├── Demuxer.cpp          # FFmpeg container packet parser
-│   ├── VideoDecoder.cpp     # Video decoding (with HW-accelerated fallback)
-│   ├── AudioDecoder.cpp     # Audio decode/resample (libsoxr), DSP chain +
-│   │                        # loudness normalization, clock tracking, dither
-│   ├── audio/dsp/           # Header-only audio DSP module (no libav*/SDL
-│   │   │                    # dependency of its own -- pure signal processing)
-│   │   ├── Biquad.hpp             # RBJ cookbook biquad (peaking/LP/HP)
-│   │   ├── ParametricEQ.hpp       # 5-band EQ built from Biquad
-│   │   ├── Compressor.hpp         # Soft-knee, linked-multichannel compressor
-│   │   ├── Limiter.hpp            # Fast-attack limiter + hard-ceiling backstop
-│   │   ├── Crossover.hpp          # Linkwitz-Riley LFE bass crossover
-│   │   ├── DspChain.hpp           # Orchestrates EQ->Compressor->Limiter->Crossover
-│   │   ├── LoudnessMeter.hpp      # EBU R128 metering via libavfilter's ebur128
-│   │   ├── LoudnessNormalizer.hpp # Smoothed gain correction toward a target LUFS
-│   │   └── AudioDspSettings.hpp   # Serializable settings struct + presets
-│   ├── PlayerUI.cpp         # Dear ImGui overlay rendering & HUD controls
-│   └── ThreadSafeQueue.hpp  # Bounded thread-safe queue template
+├── src/                     # Source files, grouped by function
+│   ├── app/                 # Process entry point and Windows resources
+│   │   ├── main.cpp         # Application entry point & render loop
+│   │   ├── resource.rc      # Version info + manifest resource
+│   │   └── app.manifest     # Win32 application manifest
+│   ├── core/                # Shared primitives (no libav*/SDL dependency)
+│   │   ├── ThreadSafeQueue.hpp # Bounded thread-safe queue template
+│   │   ├── MetricRing.hpp      # Fixed-size ring for rolling metric samples
+│   │   └── PipelineMetrics.hpp # Aggregated per-stage pipeline counters
+│   ├── media/
+│   │   └── Demuxer.cpp      # FFmpeg container packet parser
+│   ├── video/
+│   │   └── VideoDecoder.cpp # Video decoding (with HW-accelerated fallback)
+│   ├── audio/
+│   │   ├── AudioDecoder.cpp # Audio decode/resample (libsoxr), DSP chain +
+│   │   │                    # loudness normalization, clock tracking, dither
+│   │   └── dsp/             # Header-only audio DSP module (no libav*/SDL
+│   │       │                # dependency of its own -- pure signal processing)
+│   │       ├── Biquad.hpp             # RBJ cookbook biquad (peaking/LP/HP)
+│   │       ├── ParametricEQ.hpp       # 5-band EQ built from Biquad
+│   │       ├── Compressor.hpp         # Soft-knee, linked-multichannel compressor
+│   │       ├── Limiter.hpp            # Fast-attack limiter + hard-ceiling backstop
+│   │       ├── Crossover.hpp          # Linkwitz-Riley LFE bass crossover
+│   │       ├── DspChain.hpp           # Orchestrates EQ->Compressor->Limiter->Crossover
+│   │       ├── LoudnessMeter.hpp      # EBU R128 metering via libavfilter's ebur128
+│   │       ├── LoudnessNormalizer.hpp # Smoothed gain correction toward a target LUFS
+│   │       └── AudioDspSettings.hpp   # Serializable settings struct + presets
+│   ├── player/
+│   │   └── PlayerController.cpp # Media state machine & sync coordinator
+│   └── ui/
+│       └── PlayerUI.cpp     # Dear ImGui overlay rendering & HUD controls
 ├── tests/                   # Test suite files
 │   ├── tests.cpp            # Test cases, custom mocks, and assertion runner
 │   └── lsan.supp            # LeakSanitizer suppression list

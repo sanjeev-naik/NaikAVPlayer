@@ -13,12 +13,12 @@
 // the loudness meter which this deliberately excludes, have no libav* deps):
 //   g++ -O2 -std=c++17 -I src tests/audio_callback_bench.cpp -o build/bench.exe
 
-#include "../src/audio/dsp/DspChain.hpp"
-#include "../src/audio/dsp/Limiter.hpp"
-#include "../src/audio/dsp/Surround3D.hpp"
-#include "../src/audio/dsp/StereoWidener.hpp"
-#include "../src/audio/dsp/BalanceControl.hpp"
-#include "../src/audio/dsp/SpectrumAnalyzer.hpp"
+#include "audio/dsp/DspChain.hpp"
+#include "audio/dsp/Limiter.hpp"
+#include "audio/dsp/Surround3D.hpp"
+#include "audio/dsp/StereoWidener.hpp"
+#include "audio/dsp/BalanceControl.hpp"
+#include "audio/dsp/SpectrumAnalyzer.hpp"
 
 #include <chrono>
 #include <cstdio>
