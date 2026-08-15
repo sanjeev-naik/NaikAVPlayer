@@ -592,8 +592,14 @@ void PlayerUI::drawTitleBar(int windowWidth, int windowHeight) {
 }
 
 void PlayerUI::drawControlsBar(int windowWidth, int windowHeight) {
-  // Floating centered dock design
-  float barWidth = std::min(880.0f, windowWidth * 0.95f);
+  // Floating centered dock design.
+  //
+  // 940 rather than 880: the right-hand group (resolution / EQ / mute /
+  // volume) is right-anchored and the playback buttons are centered, so at
+  // 880 the two collide once the right group reserves its true width. The
+  // extra 60px restores a clear gap between them and keeps the volume
+  // slider fully inside the dock.
+  float barWidth = std::min(940.0f, windowWidth * 0.95f);
   float barHeight = 85.0f;
   float posX = (windowWidth - barWidth) * 0.5f;
   float posY = windowHeight - barHeight - 20.0f;
@@ -759,9 +765,24 @@ void PlayerUI::drawControlsBar(int windowWidth, int windowHeight) {
   }
 
   // Right Group: Resolution, Volume and Mute
-  float volumeGroupWidth = 144.0f;
-  float resolutionGroupWidth = 120.0f;
-  ImGui::SameLine(barWidth - volumeGroupWidth - resolutionGroupWidth - 28.0f);
+  //
+  // This group is right-anchored, so the offset below must reserve room for
+  // EVERY item in it: the resolution combo, the EQ and mute buttons, the
+  // volume slider, the 8px gaps between them, and the window's right padding.
+  // Deriving the reserve from the actual item widths (rather than a hand-
+  // totalled constant) keeps the trailing volume slider inside the window --
+  // under-counting here pushes it past the content edge, where it is clipped.
+  const float groupItemSpacing = 8.0f;
+  const float resolutionGroupWidth = 120.0f;
+  const float eqButtonWidth = 36.0f;
+  const float muteButtonWidth = 36.0f;
+  const float volumeSliderWidth = 100.0f;
+  const float barRightPadding = 20.0f; // matches the WindowPadding.x pushed above
+
+  float rightGroupWidth = resolutionGroupWidth + eqButtonWidth +
+                          muteButtonWidth + volumeSliderWidth +
+                          groupItemSpacing * 3.0f;
+  ImGui::SameLine(barWidth - rightGroupWidth - barRightPadding);
 
   // Resolution Dropdown
   const char* resolutionNames[] = {
@@ -794,7 +815,7 @@ void PlayerUI::drawControlsBar(int windowWidth, int windowHeight) {
       ImGui::SetTooltip("Select Output Playback Resolution");
   }
 
-  ImGui::SameLine(0.0f, 8.0f);
+  ImGui::SameLine(0.0f, groupItemSpacing);
   // Capture before the button, not re-checked after: toggleAudioSettings()
   // mutates m_showAudioSettings on click, so re-reading it to decide
   // whether to Pop would mismatch the earlier Push whenever the button is
@@ -803,7 +824,7 @@ void PlayerUI::drawControlsBar(int windowWidth, int windowHeight) {
   if (eqButtonHighlighted) {
     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.53f, 0.90f, 0.80f));
   }
-  if (ImGui::Button("EQ", ImVec2(36, 28))) {
+  if (ImGui::Button("EQ", ImVec2(eqButtonWidth, 28))) {
     toggleAudioSettings();
   }
   if (eqButtonHighlighted) {
@@ -813,12 +834,12 @@ void PlayerUI::drawControlsBar(int windowWidth, int windowHeight) {
     ImGui::SetTooltip("Audio Processing (EQ, Compressor, Loudness) - [A]");
   }
 
-  ImGui::SameLine(0.0f, 8.0f);
+  ImGui::SameLine(0.0f, groupItemSpacing);
 
   // Mute button
   if (m_isMuted) {
     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(1.00f, 0.20f, 0.20f, 0.80f));
-    if (drawIconButton("##unmute", IconType::VolumeMute, ImVec2(36, 28))) {
+    if (drawIconButton("##unmute", IconType::VolumeMute, ImVec2(muteButtonWidth, 28))) {
       m_isMuted = false;
       m_uiVolume = m_savedVolume;
       m_controller.setVolume(m_uiVolume / 100.0f);
@@ -828,7 +849,7 @@ void PlayerUI::drawControlsBar(int windowWidth, int windowHeight) {
       ImGui::SetTooltip("Unmute Audio");
     }
   } else {
-    if (drawIconButton("##mute", IconType::VolumeHigh, ImVec2(36, 28))) {
+    if (drawIconButton("##mute", IconType::VolumeHigh, ImVec2(muteButtonWidth, 28))) {
       m_savedVolume = m_uiVolume;
       m_isMuted = true;
       m_uiVolume = 0.0f;
@@ -839,8 +860,8 @@ void PlayerUI::drawControlsBar(int windowWidth, int windowHeight) {
     }
   }
 
-  ImGui::SameLine(0.0f, 8.0f);
-  ImGui::PushItemWidth(100.0f);
+  ImGui::SameLine(0.0f, groupItemSpacing);
+  ImGui::PushItemWidth(volumeSliderWidth);
   if (ImGui::SliderFloat("##volume", &m_uiVolume, 0.0f, 100.0f,
                          "Vol: %.0f%%")) {
     m_isMuted = (m_uiVolume == 0.0f);

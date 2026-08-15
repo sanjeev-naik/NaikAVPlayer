@@ -6,6 +6,7 @@
 #include <cmath>
 #include <vector>
 #include <cstdlib>
+#include <cstdio>
 #include <atomic>
 #include <mutex>
 #include <sstream>
@@ -3362,6 +3363,16 @@ int main(int argc, char* argv[]) {
         // -------------------------------------------------------------
         {
             std::cout << "Testing audio DSP settings persistence..." << std::endl;
+
+            // PlayerController's constructor loads player_settings.txt from the
+            // current working directory, so a file left behind by a real app run
+            // (or by an earlier run of this very test) would make the "defaults
+            // to ..." assertions below read someone else's saved state. Start
+            // from a known-clean directory, and don't leave a file behind either.
+            struct SettingsFileGuard {
+                SettingsFileGuard()  { std::remove("player_settings.txt"); }
+                ~SettingsFileGuard() { std::remove("player_settings.txt"); }
+            } settingsFileGuard;
 
             naikav::dsp::AudioDspSettings testSettings = naikav::dsp::makeCinemaPreset();
             testSettings.eqBandGainDb[1] = 3.25f; // distinctive, non-preset value

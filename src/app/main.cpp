@@ -210,9 +210,14 @@ int main(int argc, char *argv[]) {
     return -1;
   }
 
-  // Create the application window
-  int winWidth = 960;
-  int winHeight = 540;
+  // Create the application window.
+  //
+  // 1024x576 (still 16:9) rather than 960x540: the controls dock caps its
+  // width at 95% of the window, and at 960 that capped the bar below the
+  // width its right-hand group (resolution / EQ / mute / volume) needs,
+  // leaving the volume slider crowded against the edge.
+  int winWidth = 1024;
+  int winHeight = 576;
   SDL_Window *window =
       SDL_CreateWindow("NaikAVPlayer", winWidth, winHeight,
                        SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
@@ -223,6 +228,11 @@ int main(int argc, char *argv[]) {
     SDL_Quit();
     return -1;
   }
+
+  // Floor the window at the previous default size. The controls dock scales
+  // with the window, and below roughly this width its centered playback
+  // buttons start overlapping the right-hand volume/resolution group.
+  SDL_SetWindowMinimumSize(window, 960, 540);
 
   // Set the application window icon
   std::string iconPaths[] = {"assets/app_icon.bmp", "../assets/app_icon.bmp",
