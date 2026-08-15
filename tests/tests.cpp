@@ -333,6 +333,7 @@ inline bool mock_SDL_Init(SDL_InitFlags flags) {
 #include "media/Demuxer.cpp"
 #include "video/VideoDecoder.cpp"
 #include "audio/AudioDecoder.cpp"
+#include "video/FrameExporter.hpp"
 #undef private
 
 // Simple assert helper
@@ -3720,6 +3721,58 @@ int main(int argc, char* argv[]) {
                 speedController.setPlaybackSpeed(1.0f);
                 test_assert(std::fabs(speedController.getPlaybackSpeed() - 1.0f) < 0.001f,
                             "PlayerController: playback speed reset to 1.0x");
+            }
+
+            // --- Volume Control Clamping Tests ---
+            {
+                std::cout << "Running volume control clamping tests..." << std::endl;
+                PlayerController volController;
+                volController.setVolume(0.5f);
+                test_assert(std::fabs(volController.m_volume - 0.5f) < 0.001f,
+                            "PlayerController: setVolume(0.5) sets volume to 0.5");
+
+                volController.setVolume(-0.2f);
+                test_assert(std::fabs(volController.m_volume - 0.0f) < 0.001f,
+                            "PlayerController: setVolume(-0.2) clamps volume to 0.0");
+
+                volController.setVolume(1.8f);
+                test_assert(std::fabs(volController.m_volume - 1.0f) < 0.001f,
+                            "PlayerController: setVolume(1.8) clamps volume to 1.0");
+            }
+
+            // --- FrameExporter Unit Tests ---
+            {
+                std::cout << "Running FrameExporter unit tests..." << std::endl;
+                // Test 1: Null/invalid frame fails cleanly
+                auto nullRes = FrameExporter::saveFrameAsPng(nullptr, "test.mp4", 10.0, "test_screenshots");
+                test_assert(!nullRes.success, "FrameExporter: null frame returns failure");
+                test_assert(!nullRes.errorMessage.empty(), "FrameExporter: null frame provides error message");
+
+                // Test 2: Valid synthetic YUV420P frame exports successfully
+                AVFrame* synthFrame = av_frame_alloc();
+                test_assert(synthFrame != nullptr, "Allocated synthetic AVFrame");
+                synthFrame->format = AV_PIX_FMT_YUV420P;
+                synthFrame->width = 128;
+                synthFrame->height = 128;
+                int bufRet = av_frame_get_buffer(synthFrame, 0);
+                test_assert(bufRet >= 0, "Allocated synthetic frame buffer");
+
+                // Fill with dummy color data (Y=128, U=128, V=128)
+                std::memset(synthFrame->data[0], 128, synthFrame->linesize[0] * 128);
+                std::memset(synthFrame->data[1], 128, synthFrame->linesize[1] * 64);
+                std::memset(synthFrame->data[2], 128, synthFrame->linesize[2] * 64);
+
+                auto exportRes = FrameExporter::saveFrameAsPng(synthFrame, "synthetic_video.mp4", 75.5, "test_screenshots");
+                test_assert(exportRes.success, "FrameExporter: successfully exported synthetic frame as PNG");
+                test_assert(!exportRes.filepath.empty(), "FrameExporter: output filepath is not empty");
+                test_assert(std::filesystem::exists(exportRes.filepath), "FrameExporter: output PNG file exists on disk");
+                test_assert(std::filesystem::file_size(exportRes.filepath) > 0, "FrameExporter: output PNG file has non-zero size");
+
+                // Cleanup test artifacts
+                std::error_code ec;
+                std::filesystem::remove(exportRes.filepath, ec);
+                std::filesystem::remove("test_screenshots", ec);
+                av_frame_free(&synthFrame);
             }
 
             std::cout << "ReplayGain tag / genre preset / output selector tests passed!" << std::endl;

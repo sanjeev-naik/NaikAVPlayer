@@ -1,6 +1,7 @@
 #define SDL_MAIN_HANDLED
 #include "player/PlayerController.hpp"
 #include "ui/PlayerUI.hpp"
+#include "video/FrameExporter.hpp"
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h>
 #include <imgui.h>
@@ -17,6 +18,15 @@
 #ifdef _WIN32
 #include <windows.h>
 #endif
+
+static void toggleFullscreen(SDL_Window *window) {
+  if (!window)
+    return;
+  bool isFullscreen =
+      (SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN) != 0;
+  SDL_SetWindowFullscreen(window, !isFullscreen);
+}
+
 
 #ifndef _WIN32
 static std::atomic<bool> g_signalQuit{false};
@@ -332,16 +342,9 @@ int main(int argc, char *argv[]) {
 
   bool quit = false;
   SDL_Event event;
-  // Windows throttles/blocks SDL_RenderPresent() (vsync) for an occluded
-  // or minimized swapchain (DWM composition throttling). Since this loop
-  // does event polling, decoded-frame consumption (paced against the
-  // audio clock, which keeps advancing in real time on its own SDL audio
-  // thread), and presentation all in one iteration, a blocked Present()
-  // stalls frame consumption too -> video falls behind audio while
-  // minimized and has to decode through the backlog to catch up once
-  // restored. Skip only the Present() call while minimized so the rest of
-  // the loop keeps pace with real time and there's no backlog to drain.
   bool windowMinimized = false;
+  bool isCursorHidden = false;
+  double lastMouseActivityTime = 0.0;
 
   std::cout << "Application loop started. Press Space to pause, Left/Right "
                "arrow keys to seek 10s."
@@ -367,11 +370,18 @@ int main(int argc, char *argv[]) {
     while (SDL_PollEvent(&event)) {
       ImGui_ImplSDL3_ProcessEvent(&event);
 
-      // Notify UI of mouse or keyboard events to prevent auto-hiding
+      // Notify UI of mouse, keyboard or wheel events to prevent auto-hiding
       if (event.type == SDL_EVENT_MOUSE_MOTION ||
           event.type == SDL_EVENT_MOUSE_BUTTON_DOWN ||
+          event.type == SDL_EVENT_MOUSE_BUTTON_UP ||
+          event.type == SDL_EVENT_MOUSE_WHEEL ||
           event.type == SDL_EVENT_KEY_DOWN) {
+        lastMouseActivityTime = currentSecs;
         playerUI.notifyMouseActivity(currentSecs);
+        if (isCursorHidden) {
+          SDL_ShowCursor();
+          isCursorHidden = false;
+        }
       }
 
       if (event.type == SDL_EVENT_QUIT) {
@@ -390,6 +400,17 @@ int main(int argc, char *argv[]) {
         if (controller.openFile(droppedFilepath)) {
           controller.play();
         }
+      } else if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && !io.WantCaptureMouse) {
+        // Double-click on video canvas toggles fullscreen
+        if (event.button.button == SDL_BUTTON_LEFT && event.button.clicks == 2) {
+          toggleFullscreen(window);
+        }
+      } else if (event.type == SDL_EVENT_MOUSE_WHEEL && !io.WantCaptureMouse) {
+        // Mouse wheel adjusts volume
+        float wheelDelta = event.wheel.y * 5.0f;
+        if (wheelDelta != 0.0f) {
+          playerUI.adjustVolume(wheelDelta);
+        }
       } else if (event.type == SDL_EVENT_KEY_DOWN && !io.WantCaptureKeyboard) {
         // Process keyboard hotkeys
         switch (event.key.key) {
@@ -401,6 +422,38 @@ int main(int argc, char *argv[]) {
             controller.play();
           }
           break;
+        case SDLK_F11:
+          toggleFullscreen(window);
+          break;
+        case SDLK_RETURN:
+        case SDLK_KP_ENTER:
+          if (event.key.mod & SDL_KMOD_ALT) {
+            toggleFullscreen(window);
+          }
+          break;
+        case SDLK_M:
+          playerUI.toggleMute();
+          break;
+        case SDLK_UP:
+          playerUI.adjustVolume(5.0f);
+          break;
+        case SDLK_DOWN:
+          playerUI.adjustVolume(-5.0f);
+          break;
+        case SDLK_S:
+          if (currentFrame.frame && currentFrame.frame->data[0]) {
+            auto res = FrameExporter::saveFrameAsPng(
+                currentFrame.frame, controller.getFilename(),
+                controller.getCurrentTime());
+            if (res.success) {
+              playerUI.showToast("Screenshot saved: " + res.filepath, false, 3.5);
+            } else {
+              playerUI.showToast("Screenshot failed: " + res.errorMessage, true, 3.5);
+            }
+          } else {
+            playerUI.showToast("No active video frame to capture", true, 2.5);
+          }
+          break;
         case SDLK_LEFT:
           // Reference time lets repeated presses stack onto a
           // catch-up that is still in flight
@@ -410,7 +463,12 @@ int main(int argc, char *argv[]) {
           controller.seek(controller.getSeekReferenceTime() + 10.0);
           break;
         case SDLK_ESCAPE:
-          quit = true;
+          // If in fullscreen, exit fullscreen first; otherwise quit
+          if ((SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN) != 0) {
+            SDL_SetWindowFullscreen(window, false);
+          } else {
+            quit = true;
+          }
           break;
         case SDLK_L:
           controller.setLoopEnabled(!controller.isLoopEnabled());
@@ -439,6 +497,13 @@ int main(int argc, char *argv[]) {
         }
       }
     }
+
+    // Auto-hide mouse cursor after 2.5s of inactivity when not interacting with ImGui
+    if (!isCursorHidden && !io.WantCaptureMouse && (currentSecs - lastMouseActivityTime > 2.5)) {
+      SDL_HideCursor();
+      isCursorHidden = true;
+    }
+
 
     // Applies a completed background loudness prescan, if one just
     // finished -- see PlayerController::prescanLoudnessForCurrentFile()

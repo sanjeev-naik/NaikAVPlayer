@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <numeric>
 #include <imgui.h>
 #include <iostream>
 
@@ -229,6 +230,9 @@ void PlayerUI::draw(int windowWidth, int windowHeight,
   if (state != PlayerState::UNINITIALIZED && m_controlsVisible) {
     drawControlsBar(windowWidth, windowHeight);
   }
+
+  // 4b. On-screen Toast Notification Banner (for screenshots, mute, etc.)
+  drawToastNotification(windowWidth, windowHeight, currentSystemTime);
 
   if (m_mainFont)
     ImGui::PopFont();
@@ -525,14 +529,17 @@ void PlayerUI::drawWelcomeHUD(int windowWidth, int windowHeight) {
   // Centering the shortcut display
   float rowWidth =
       ImGui::CalcTextSize(
-          " [Space] Play/Pause    [<- / ->] Seek 10s    [ [ / ] ] Speed    [Backspace] Reset Speed    [L] Loop    [Esc] Exit")
+          " [Space] Play/Pause    [<- / ->] Seek 10s    [ [ / ] ] Speed    [F11] Fullscreen    [M] Mute    [Up/Down] Vol    [S] Screenshot    [L] Loop    [Esc] Exit")
           .x;
   ImGui::SetCursorPosX((cardWidth - rowWidth) * 0.5f);
 
   renderKey("Space", "Play/Pause");
   renderKey("<- / ->", "Seek 10s");
   renderKey("[ / ]", "Speed -/+");
-  renderKey("Backspace", "Reset Speed");
+  renderKey("F11", "Fullscreen");
+  renderKey("M", "Mute");
+  renderKey("Up/Down", "Vol");
+  renderKey("S", "Screenshot");
   renderKey("L", "Loop");
   renderKey("Esc", "Exit");
 
@@ -609,11 +616,11 @@ void PlayerUI::drawAudioVisualizer(int windowWidth, int windowHeight, double cur
   }
 
   // Calculate aggregate energy for bass and brightness
-  float bassEnergy = 0.0f;
-  for (int i = 0; i < std::min(8, kNumVisualizerBands); ++i) {
-    bassEnergy += m_visualizerSmoothBands[i];
-  }
-  bassEnergy /= 8.0f;
+  const int bassBandsCount = std::min(8, kNumVisualizerBands);
+  float bassEnergy = std::accumulate(m_visualizerSmoothBands.begin(),
+                                     m_visualizerSmoothBands.begin() + bassBandsCount,
+                                     0.0f) / static_cast<float>(bassBandsCount);
+
 
   // Palette color interpolator
   auto getThemeColor = [this](float t, float alpha = 1.0f) -> ImVec4 {
@@ -2269,3 +2276,94 @@ void PlayerUI::applyTheme() {
   colors[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.25f, 0.25f, 0.30f, 0.80f);
   colors[ImGuiCol_ScrollbarGrabActive] = ImVec4(0.12f, 0.53f, 0.90f, 0.80f);
 }
+
+void PlayerUI::toggleMute() {
+  if (m_isMuted) {
+    m_isMuted = false;
+    m_uiVolume = (m_savedVolume > 0.0f) ? m_savedVolume : 50.0f;
+    m_controller.setVolume(m_uiVolume / 100.0f);
+    showToast("Audio Unmuted (" + std::to_string(static_cast<int>(std::round(m_uiVolume))) + "%)", false, 2.0);
+  } else {
+    m_savedVolume = m_uiVolume;
+    m_isMuted = true;
+    m_uiVolume = 0.0f;
+    m_controller.setVolume(0.0f);
+    showToast("Audio Muted", false, 2.0);
+  }
+}
+
+void PlayerUI::adjustVolume(float deltaPercent) {
+  float newVol = std::clamp(m_uiVolume + deltaPercent, 0.0f, 100.0f);
+  setVolumePercent(newVol);
+  showToast("Volume: " + std::to_string(static_cast<int>(std::round(m_uiVolume))) + "%", false, 1.5);
+}
+
+void PlayerUI::setVolumePercent(float percent) {
+  m_uiVolume = std::clamp(percent, 0.0f, 100.0f);
+  if (m_uiVolume > 0.0f) {
+    m_isMuted = false;
+    m_savedVolume = m_uiVolume;
+  } else {
+    m_isMuted = true;
+  }
+  m_controller.setVolume(m_uiVolume / 100.0f);
+}
+
+void PlayerUI::showToast(const std::string &message, bool isError, double durationSeconds) {
+  m_toast.message = message;
+  m_toast.isError = isError;
+  m_toast.totalDuration = durationSeconds;
+  double now = SDL_GetTicks() / 1000.0;
+  m_toast.expiryTime = now + durationSeconds;
+}
+
+void PlayerUI::drawToastNotification(int windowWidth, int windowHeight, double currentSystemTime) {
+  (void)windowHeight;
+  if (m_toast.message.empty() || currentSystemTime >= m_toast.expiryTime) {
+    return;
+  }
+
+  float remaining = static_cast<float>(m_toast.expiryTime - currentSystemTime);
+  float alpha = 1.0f;
+  if (remaining < 0.6f) {
+    alpha = std::clamp(remaining / 0.6f, 0.0f, 1.0f);
+  }
+
+  float cardW = std::min(600.0f, static_cast<float>(windowWidth) - 40.0f);
+  float cardH = 46.0f;
+  float posX = (windowWidth - cardW) * 0.5f;
+  float posY = 58.0f;
+
+  ImGui::SetNextWindowPos(ImVec2(posX, posY));
+  ImGui::SetNextWindowSize(ImVec2(cardW, cardH));
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.0f);
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(16.0f, 12.0f));
+
+  ImVec4 bgCol = m_toast.isError ? ImVec4(0.18f, 0.06f, 0.07f, 0.92f * alpha)
+                                 : ImVec4(0.06f, 0.12f, 0.16f, 0.92f * alpha);
+  ImVec4 borderCol = m_toast.isError ? ImVec4(0.95f, 0.25f, 0.25f, 0.90f * alpha)
+                                     : ImVec4(0.00f, 0.85f, 0.90f, 0.90f * alpha);
+
+  ImGui::PushStyleColor(ImGuiCol_WindowBg, bgCol);
+  ImGui::PushStyleColor(ImGuiCol_Border, borderCol);
+
+  if (ImGui::Begin("ToastNotification", nullptr,
+                   ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+                       ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings |
+                       ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_AlwaysAutoResize)) {
+    if (m_hudFont)
+      ImGui::PushFont(m_hudFont);
+
+    ImVec4 textCol = m_toast.isError ? ImVec4(1.0f, 0.45f, 0.45f, alpha)
+                                     : ImVec4(0.35f, 0.95f, 1.0f, alpha);
+    ImGui::TextColored(textCol, "%s  %s", m_toast.isError ? "[!]" : "[*]", m_toast.message.c_str());
+
+    if (m_hudFont)
+      ImGui::PopFont();
+  }
+  ImGui::End();
+
+  ImGui::PopStyleColor(2);
+  ImGui::PopStyleVar(2);
+}
+

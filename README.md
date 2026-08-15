@@ -437,20 +437,25 @@ that launched it. Opt-in by design: automatic console attachment at startup
 matches a console-hiding pattern that generic antivirus heuristics flag. No
 effect when launched by double-click, and ignored on Linux.
 
-### Keyboard Controls
+### Keyboard Controls & Gestures
 
-| Key | Action |
+| Key / Gesture | Action |
 | :--- | :--- |
 | **`Spacebar`** | Toggle Play / Pause |
-| **`Left Arrow`** | Seek backward by 10 seconds |
-| **`Right Arrow`** | Seek forward by 10 seconds |
-| **`[`** | Decrease playback speed by 0.25x (min 0.25x) |
-| **`]`** | Increase playback speed by 0.25x (max 2.0x) |
+| **`F11`** / **`Alt+Enter`** | Toggle Fullscreen Mode |
+| **`Double-Click`** (on video) | Toggle Fullscreen Mode |
+| **`M`** | Toggle Audio Mute / Unmute |
+| **`Up Arrow`** / **`Down Arrow`** | Increase / Decrease Volume (±5%) |
+| **`Mouse Wheel`** (over video) | Adjust Volume Up / Down |
+| **`S`** | Capture Screenshot / Export Video Frame as PNG |
+| **`Left Arrow`** / **`Right Arrow`** | Seek backward / forward by 10 seconds |
+| **`[`** / **`]`** | Decrease / Increase playback speed by 0.25x (0.25x – 2.0x) |
 | **`Backspace`** | Reset playback speed to normal (1.0x) |
-| **`L`** | Toggle Loop Mode |
+| **`L`** | Toggle Continuous Loop Mode |
 | **`D`** | Toggle Diagnostics HUD & Telemetry Metrics |
 | **`A`** | Toggle Audio Processing Panel (EQ, Noise Gate, Compressor, Multiband, Limiter, Crossover, Loudness, Surround, Balance, Channel/Device/Format Selection) |
-| **`Escape`** | Exit Application |
+| **`Escape`** | Exit Fullscreen (if in fullscreen) or Exit Application |
+
 
 ---
 

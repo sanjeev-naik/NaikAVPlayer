@@ -260,20 +260,25 @@ The user interface uses Dear ImGui with frosted translucency overlay.
 - **Controls Bar Selector**: Click the playback speed button (e.g. `1x`, `1.5x`) next to the loop toggle to open a quick-selection popup menu with presets (`0.25x`, `0.5x`, `0.75x`, `1.0x`, `1.25x`, `1.5x`, `1.75x`, `2.0x`).
 - **Real-Time Resampling**: Uses SDL3 dynamic audio stream frequency resampling to maintain smooth, synchronized audio and video playback without audio glitches or drift.
 
-### Keyboard Shortcuts
+### Keyboard Shortcuts & Gestures
 
-| Key | Action |
+| Key / Gesture | Action |
 | :--- | :--- |
 | **`Spacebar`** | Toggle Play / Pause |
-| **`Left Arrow`** | Seek backward 10 seconds |
-| **`Right Arrow`** | Seek forward 10 seconds |
-| **`[`** | Decrease playback speed by 0.25x (min 0.25x) |
-| **`]`** | Increase playback speed by 0.25x (max 2.0x) |
+| **`F11`** / **`Alt+Enter`** | Toggle Fullscreen Mode |
+| **`Double-Click`** (on video) | Toggle Fullscreen Mode |
+| **`M`** | Toggle Audio Mute / Unmute |
+| **`Up Arrow`** / **`Down Arrow`** | Increase / Decrease Volume (±5%) |
+| **`Mouse Wheel`** (over video) | Adjust Volume Up / Down |
+| **`S`** | Capture Screenshot / Export Video Frame as PNG |
+| **`Left Arrow`** / **`Right Arrow`** | Seek backward / forward by 10 seconds |
+| **`[`** / **`]`** | Decrease / Increase playback speed by 0.25x (0.25x – 2.0x) |
 | **`Backspace`** | Reset playback speed to normal (1.0x) |
 | **`L`** | Toggle Loop Mode |
 | **`D`** | Toggle Diagnostics HUD overlay |
 | **`A`** | Toggle Audio Processing panel (EQ, noise gate, compressor, multiband compressor, limiter, crossover, loudness, 3D surround, widener, balance, channel/device/format selection) |
-| **`Escape`** | Exit application |
+| **`Escape`** | Exit Fullscreen (if in fullscreen) or Exit application |
+
 
 ---
 
