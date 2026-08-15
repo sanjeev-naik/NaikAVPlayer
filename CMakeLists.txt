@@ -478,48 +478,56 @@ target_compile_options(NaikAVPlayer PRIVATE ${PROJECT_WARNING_FLAGS})
 
 # Helper function to configure target RPATH and copy runtime dependencies
 function(setup_target_dependencies TARGET_NAME)
-    if(TARGET_PLATFORM_WINDOWS)
-        add_custom_command(TARGET ${TARGET_NAME} POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_directory
-                "${FFMPEG_DIR}/bin"
-                $<TARGET_FILE_DIR:${TARGET_NAME}>
-            COMMENT "Copying FFmpeg DLLs for ${TARGET_NAME}..."
-        )
-
-        add_custom_command(TARGET ${TARGET_NAME} POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy
-                $<TARGET_FILE:SDL3::SDL3-shared>
-                $<TARGET_FILE_DIR:${TARGET_NAME}>
-            COMMENT "Copying SDL3.dll for ${TARGET_NAME}..."
-        )
-    elseif(TARGET_PLATFORM_LINUX)
+    if(TARGET_PLATFORM_LINUX)
         set_target_properties(${TARGET_NAME} PROPERTIES
             BUILD_RPATH "$ORIGIN/lib"
             INSTALL_RPATH "$ORIGIN/lib"
         )
-        add_custom_command(TARGET ${TARGET_NAME} POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:${TARGET_NAME}>/lib
-            COMMAND ${CMAKE_COMMAND} -E copy
-                $<TARGET_FILE:SDL3::SDL3-shared>
-                $<TARGET_FILE_DIR:${TARGET_NAME}>/lib
-            COMMENT "Copying SDL3 .so to lib/ directory for ${TARGET_NAME}..."
-        )
-        if(NOT FFMPEG_USE_SYSTEM)
-            add_custom_command(TARGET ${TARGET_NAME} POST_BUILD
-                COMMAND ${CMAKE_COMMAND} -E copy_directory
-                    "${FFMPEG_DIR}/lib"
-                    $<TARGET_FILE_DIR:${TARGET_NAME}>/lib
-                COMMENT "Copying FFmpeg .so files to lib/ directory for ${TARGET_NAME}..."
-            )
-        endif()
     endif()
 
-    add_custom_command(TARGET ${TARGET_NAME} POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_directory
-            "${CMAKE_SOURCE_DIR}/assets/fonts"
-            "$<TARGET_FILE_DIR:${TARGET_NAME}>/assets/fonts"
-        COMMENT "Copying Noto Sans fonts for ${TARGET_NAME}..."
-    )
+    if(TARGET_NAME STREQUAL "NaikAVPlayer")
+        if(TARGET_PLATFORM_WINDOWS)
+            add_custom_command(TARGET ${TARGET_NAME} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_directory
+                    "${FFMPEG_DIR}/bin"
+                    $<TARGET_FILE_DIR:${TARGET_NAME}>
+                COMMENT "Copying FFmpeg DLLs for ${TARGET_NAME}..."
+            )
+
+            add_custom_command(TARGET ${TARGET_NAME} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy
+                    $<TARGET_FILE:SDL3::SDL3-shared>
+                    $<TARGET_FILE_DIR:${TARGET_NAME}>
+                COMMENT "Copying SDL3.dll for ${TARGET_NAME}..."
+            )
+        elseif(TARGET_PLATFORM_LINUX)
+            add_custom_command(TARGET ${TARGET_NAME} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:${TARGET_NAME}>/lib
+                COMMAND ${CMAKE_COMMAND} -E copy
+                    $<TARGET_FILE:SDL3::SDL3-shared>
+                    $<TARGET_FILE_DIR:${TARGET_NAME}>/lib
+                COMMENT "Copying SDL3 .so to lib/ directory for ${TARGET_NAME}..."
+            )
+            if(NOT FFMPEG_USE_SYSTEM)
+                add_custom_command(TARGET ${TARGET_NAME} POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_directory
+                        "${FFMPEG_DIR}/lib"
+                        $<TARGET_FILE_DIR:${TARGET_NAME}>/lib
+                    COMMENT "Copying FFmpeg .so files to lib/ directory for ${TARGET_NAME}..."
+                )
+            endif()
+        endif()
+
+        add_custom_command(TARGET ${TARGET_NAME} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_directory
+                "${CMAKE_SOURCE_DIR}/assets/fonts"
+                "$<TARGET_FILE_DIR:${TARGET_NAME}>/assets/fonts"
+            COMMENT "Copying Noto Sans fonts for ${TARGET_NAME}..."
+        )
+    else()
+        # Secondary targets (tests, repro diagnostic tools) share the output directory with NaikAVPlayer
+        add_dependencies(${TARGET_NAME} NaikAVPlayer)
+    endif()
 endfunction()
 
 setup_target_dependencies(NaikAVPlayer)

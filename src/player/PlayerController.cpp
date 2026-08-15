@@ -466,10 +466,15 @@ double PlayerController::getCurrentTime() {
 
     if (duration > 0.0 && currentTime >= duration) {
         reachedEnd = true;
-    } else if (m_demuxer && m_demuxer->isEOF()) {
-        bool videoQueueEmpty = !m_hasVideo || m_videoQueue.empty();
+    } else if (m_hasVideo && m_demuxer && m_demuxer->isEOF()) {
+        bool videoQueueEmpty = m_videoQueue.empty();
         bool audioQueueEmpty = !m_hasAudio || m_audioQueue.empty();
         if (videoQueueEmpty && audioQueueEmpty) {
+            reachedEnd = true;
+        }
+    } else if (!m_hasVideo && m_demuxer && m_demuxer->isEOF()) {
+        bool audioQueueEmpty = !m_hasAudio || m_audioQueue.empty();
+        if ((duration <= 0.0 || currentTime >= (duration - 0.25)) && audioQueueEmpty) {
             reachedEnd = true;
         }
     }

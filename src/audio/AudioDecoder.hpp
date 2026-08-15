@@ -442,6 +442,7 @@ public:
     // Processing panel's visualizer. Self-synchronized inside
     // SpectrumAnalyzer -- doesn't need/use m_dspMutex.
     std::vector<float> getSpectrumMagnitudesDb() const { return m_spectrum.getMagnitudesDb(); }
+    std::vector<float> getWaveformSamples() const { return m_spectrum.getWaveformSamples(); }
     static int getSpectrumNumBins() { return naikav::dsp::SpectrumAnalyzer::kNumBins; }
     double getSpectrumBinFrequencyHz(int bin) const { return m_spectrum.binFrequencyHz(bin); }
 };

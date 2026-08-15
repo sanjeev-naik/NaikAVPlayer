@@ -65,11 +65,36 @@ private:
     std::deque<double> m_videoFrameTimes;
     double m_videoFPS;
 
+    enum class VisualizerMode {
+        NeonBars = 0,
+        SmoothWave,
+        RadialDisc,
+        MirroredBars,
+        COUNT
+    };
+
+    enum class VisualizerTheme {
+        Cyberpunk = 0, // Cyan to Magenta
+        SunsetFire,    // Amber to Hot Pink
+        NeonEmerald,   // Mint to Emerald
+        ElectricViolet // Blue to Purple
+    };
+
+    VisualizerMode m_visualizerMode = VisualizerMode::NeonBars;
+    VisualizerTheme m_visualizerTheme = VisualizerTheme::Cyberpunk;
+
+    static constexpr int kNumVisualizerBands = 64;
+    std::vector<float> m_visualizerSmoothBands;
+    std::vector<float> m_visualizerPeakCaps;
+    std::vector<float> m_visualizerPeakVelocities;
+    double m_visualizerLastTime = 0.0;
+
     static std::string formatTime(double seconds);
     static void applyTheme();
 
     // Modular drawing helpers
     void drawWelcomeHUD(int windowWidth, int windowHeight);
+    void drawAudioVisualizer(int windowWidth, int windowHeight, double currentSystemTime);
     void drawTitleBar(int windowWidth, int windowHeight);
     void drawControlsBar(int windowWidth, int windowHeight);
     void drawDiagnosticsHUD(int windowWidth, int windowHeight);

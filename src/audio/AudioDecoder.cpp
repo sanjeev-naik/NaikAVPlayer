@@ -473,6 +473,7 @@ bool AudioDecoder::init() {
     m_widener.configure(m_outChannels);
     m_balance.configure(m_outChannels);
     m_spectrum.configure(m_outChannels, m_outSampleRate);
+    m_spectrum.setEnabled(true);
     m_finalSafetyLimiter.configure(m_outChannels, m_outSampleRate);
 
     std::cout << "Audio initialized successfully. Target format: " << m_outSampleRate
@@ -609,9 +610,9 @@ void AudioDecoder::decodeAndResample() {
 
             double pts = 0.0;
             if (m_decodedFrame->pts != AV_NOPTS_VALUE) {
-                double frameSeconds = static_cast<double>(m_decodedFrame->pts) / m_decodedFrame->sample_rate;
-                double startSeconds = static_cast<double>(m_startTime) * av_q2d(m_timeBase);
-                pts = frameSeconds - startSeconds;
+                pts = static_cast<double>(m_decodedFrame->pts - m_startTime) * av_q2d(m_timeBase);
+            } else if (m_decodedFrame->pkt_dts != AV_NOPTS_VALUE) {
+                pts = static_cast<double>(m_decodedFrame->pkt_dts - m_startTime) * av_q2d(m_timeBase);
             } else {
                 pts = clockSnapshot;
             }
@@ -756,11 +757,9 @@ void AudioDecoder::decodeAndResample() {
 
                 pts = 0.0;
                 if (m_decodedFrame->pts != AV_NOPTS_VALUE) {
-                    // Convert frame PTS (in codec timebase units: sample count) to seconds
-                    double frameSeconds = static_cast<double>(m_decodedFrame->pts) / m_decodedFrame->sample_rate;
-                    // Convert stream start time (in stream timebase units) to seconds
-                    double startSeconds = static_cast<double>(m_startTime) * av_q2d(m_timeBase);
-                    pts = frameSeconds - startSeconds;
+                    pts = static_cast<double>(m_decodedFrame->pts - m_startTime) * av_q2d(m_timeBase);
+                } else if (m_decodedFrame->pkt_dts != AV_NOPTS_VALUE) {
+                    pts = static_cast<double>(m_decodedFrame->pkt_dts - m_startTime) * av_q2d(m_timeBase);
                 } else {
                     // Fallback: increment clock by the duration of the decoded audio frame
                     pts = clockForUpdate + static_cast<double>(m_decodedFrame->nb_samples) / m_decodedFrame->sample_rate;
