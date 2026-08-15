@@ -525,12 +525,14 @@ void PlayerUI::drawWelcomeHUD(int windowWidth, int windowHeight) {
   // Centering the shortcut display
   float rowWidth =
       ImGui::CalcTextSize(
-          " [Space] Play/Pause    [<- / ->] Seek 10s    [L] Loop    [Esc] Exit")
+          " [Space] Play/Pause    [<- / ->] Seek 10s    [ [ / ] ] Speed    [Backspace] Reset Speed    [L] Loop    [Esc] Exit")
           .x;
   ImGui::SetCursorPosX((cardWidth - rowWidth) * 0.5f);
 
   renderKey("Space", "Play/Pause");
   renderKey("<- / ->", "Seek 10s");
+  renderKey("[ / ]", "Speed -/+");
+  renderKey("Backspace", "Reset Speed");
   renderKey("L", "Loop");
   renderKey("Esc", "Exit");
 
@@ -1106,7 +1108,7 @@ void PlayerUI::drawControlsBar(int windowWidth, int windowHeight) {
   }
 
   // Middle Group: Playback buttons
-  float centerButtonsGroupWidth = 216.0f;
+  float centerButtonsGroupWidth = 268.0f;
   ImGui::SameLine((barWidth - centerButtonsGroupWidth) * 0.5f);
 
   // Seek back button (<<)
@@ -1176,6 +1178,48 @@ void PlayerUI::drawControlsBar(int windowWidth, int windowHeight) {
   }
   if (ImGui::IsItemHovered()) {
     ImGui::SetTooltip(loopEnabled ? "Loop: On" : "Loop: Off");
+  }
+  ImGui::SameLine(0.0f, 8.0f);
+
+  // Playback Speed button
+  float currentSpeed = m_controller.getPlaybackSpeed();
+  char speedBtnLabel[16];
+  if (std::fabs(currentSpeed - std::round(currentSpeed)) < 0.01f) {
+    std::snprintf(speedBtnLabel, sizeof(speedBtnLabel), "%.0fx##speed", currentSpeed);
+  } else {
+    std::snprintf(speedBtnLabel, sizeof(speedBtnLabel), "%.2fx##speed", currentSpeed);
+  }
+
+  bool isNonDefaultSpeed = (std::fabs(currentSpeed - 1.0f) > 0.01f);
+  if (isNonDefaultSpeed) {
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.53f, 0.90f, 0.75f));
+  }
+  if (ImGui::Button(speedBtnLabel, ImVec2(44, 28))) {
+    ImGui::OpenPopup("##speed_popup");
+  }
+  if (isNonDefaultSpeed) {
+    ImGui::PopStyleColor();
+  }
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("Playback Speed: %.2fx (Hotkeys: [ / ] or Backspace)", currentSpeed);
+  }
+
+  if (ImGui::BeginPopup("##speed_popup")) {
+    ImGui::TextColored(ImVec4(0.00f, 0.83f, 0.88f, 1.00f), "Playback Speed");
+    ImGui::Separator();
+    const float speeds[] = {0.25f, 0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 1.75f, 2.0f};
+    for (float s : speeds) {
+      char sLabel[32];
+      if (std::fabs(s - 1.0f) < 0.01f) {
+        std::snprintf(sLabel, sizeof(sLabel), "1.0x (Normal)%s", (std::fabs(currentSpeed - s) < 0.01f) ? "  [OK]" : "");
+      } else {
+        std::snprintf(sLabel, sizeof(sLabel), "%.2fx%s", s, (std::fabs(currentSpeed - s) < 0.01f) ? "  [OK]" : "");
+      }
+      if (ImGui::Selectable(sLabel, std::fabs(currentSpeed - s) < 0.01f)) {
+        m_controller.setPlaybackSpeed(s);
+      }
+    }
+    ImGui::EndPopup();
   }
 
   // Right Group: Resolution, Volume and Mute
@@ -1346,6 +1390,11 @@ void PlayerUI::drawDiagnosticsHUD(int windowWidth, int windowHeight) {
   ImGui::Text("State: ");
   ImGui::SameLine();
   ImGui::TextColored(stateColor, "%s", stateStr);
+
+  ImGui::SameLine(0.0f, 16.0f);
+  ImGui::Text("Speed: ");
+  ImGui::SameLine();
+  ImGui::TextColored(ImVec4(0.00f, 0.83f, 0.88f, 1.00f), "%.2fx", m_controller.getPlaybackSpeed());
 
   ImGui::Spacing();
 

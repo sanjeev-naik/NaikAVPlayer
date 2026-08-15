@@ -19,6 +19,9 @@
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libswresample/swresample.h>
+#include <libavfilter/avfilter.h>
+#include <libavfilter/buffersink.h>
+#include <libavfilter/buffersrc.h>
 #include <libavutil/channel_layout.h>
 #include <libavutil/version.h>
 #include <libavutil/common.h>
@@ -289,6 +292,9 @@ private:
     // pre-seek audio packet can't be decoded either.
     std::atomic<uint64_t>* m_seekGeneration = nullptr;
 
+    // Dynamic playback speed rate via SDL3 audio stream frequency ratio
+    std::atomic<float> m_playbackSpeed{1.0f};
+
     void decodeAndResample();
     static void sdlAudioStreamCallback(void* userdata, SDL_AudioStream* stream, int additional_amount, int total_amount);
  
@@ -312,6 +318,10 @@ public:
     // Thread-safe access to the audio clock
     double getAudioClock();
     void setClock(double seconds);
+
+    // Playback speed rate (pitch-preserving time stretching)
+    void setPlaybackSpeed(float speed);
+    float getPlaybackSpeed() const { return m_playbackSpeed.load(); }
 
     // Volume adjustment helper
     void setVolume(float volume); // 0.0 to 1.0

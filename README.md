@@ -30,6 +30,8 @@ NaikAVPlayer is a native, multi-threaded C++17 media engine and video player bui
 - **Selectable Output Format & Device:** 16-bit integer (default), 32-bit integer, or 32-bit float device output (the internal pipeline is always float — 32-bit float skips dithering/truncation entirely), and a playback device picker (`AudioDecoder::enumeratePlaybackDeviceNames()`) instead of always using the OS default device.
 - **DSP Presets & Persistent Settings:** One-click Flat / Music / Cinema / Night / Podcast / Gaming / Live / Bass Boost / Vocal Boost presets for the whole audio chain, all settings (resolution, DSP, loudness, output format/device, channel selection) surviving restarts via `player_settings.txt`.
 - **Dynamic Resolution Scaling:** Real-time playback scaling supporting dynamic output resolution selection (Original source, 360p, 480p, 720p, 1080p, 1440p, 4K) from the UI dropdown to optimize GPU upload bandwidth.
+- **Variable Playback Speed Control (0.25x - 2.0x):** Real-time, pitch-preserving playback rate adjustments using SDL3 dynamic audio stream frequency resampling (`SDL_SetAudioStreamFrequencyRatio`) synchronized with master audio/video clock pacing.
+- **Auto-Pause on File Selection:** Automatically pauses background audio and video playback whenever the native file explorer dialog is opened, preserving the exact playback position and keeping the audio silent while browsing.
 - **Software Volume Attenuation:** Scalable audio output level adjustments with memcpy/memset bypasses for 100% and 0% volume states.
 - **Loop Playback:** Wraparound seek to 0.0 upon reaching end-of-file for continuous playback.
 - **Native File Picker:** Cross-platform native file picker integration using `nativefiledialog-extended` (NFD) on Win32 and GTK3/Portal backends.
@@ -442,6 +444,9 @@ effect when launched by double-click, and ignored on Linux.
 | **`Spacebar`** | Toggle Play / Pause |
 | **`Left Arrow`** | Seek backward by 10 seconds |
 | **`Right Arrow`** | Seek forward by 10 seconds |
+| **`[`** | Decrease playback speed by 0.25x (min 0.25x) |
+| **`]`** | Increase playback speed by 0.25x (max 2.0x) |
+| **`Backspace`** | Reset playback speed to normal (1.0x) |
 | **`L`** | Toggle Loop Mode |
 | **`D`** | Toggle Diagnostics HUD & Telemetry Metrics |
 | **`A`** | Toggle Audio Processing Panel (EQ, Noise Gate, Compressor, Multiband, Limiter, Crossover, Loudness, Surround, Balance, Channel/Device/Format Selection) |

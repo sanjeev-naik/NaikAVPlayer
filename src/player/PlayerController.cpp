@@ -23,6 +23,7 @@ PlayerController::PlayerController()
       m_videoClock(0.0),
       m_lastSystemTime(0.0),
       m_volume(0.05f),
+      m_playbackSpeed(1.0f),
       m_loopEnabled(false),
       m_videoThreadRunning(false),
       m_videoThreadEnabled(g_videoThreadEnabled),
@@ -120,6 +121,7 @@ bool PlayerController::openFile(const std::string& filename) {
             m_hasAudio = m_audioDecoder->init();
             if (m_hasAudio) {
                 m_audioDecoder->setVolume(m_volume);
+                m_audioDecoder->setPlaybackSpeed(m_playbackSpeed.load());
                 m_audioDecoder->applyDspSettings(m_audioDspSettings);
                 // Before the loudness prescan below: a genre-based preset swap
                 // can change loudnessEnabled/loudnessTargetLufs, and the
@@ -432,7 +434,7 @@ void PlayerController::updateClockForVideoOnly() {
     }
     if (m_state == PlayerState::PLAYING && !m_hasAudio) {
         double now = getSystemTimeInSeconds();
-        m_videoClock.store(m_videoClock.load() + (now - m_lastSystemTime.load()));
+        m_videoClock.store(m_videoClock.load() + (now - m_lastSystemTime.load()) * m_playbackSpeed.load());
         m_lastSystemTime.store(now);
     }
 }
@@ -573,6 +575,14 @@ void PlayerController::setVolume(float volume) {
     m_volume = std::clamp(volume, 0.0f, 1.0f);
     if (m_hasAudio && m_audioDecoder) {
         m_audioDecoder->setVolume(m_volume);
+    }
+}
+
+void PlayerController::setPlaybackSpeed(float speed) {
+    speed = std::clamp(speed, kMinPlaybackSpeed, kMaxPlaybackSpeed);
+    m_playbackSpeed.store(speed);
+    if (m_hasAudio && m_audioDecoder) {
+        m_audioDecoder->setPlaybackSpeed(speed);
     }
 }
 

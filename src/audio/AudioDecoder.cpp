@@ -476,6 +476,10 @@ bool AudioDecoder::init() {
     m_spectrum.setEnabled(true);
     m_finalSafetyLimiter.configure(m_outChannels, m_outSampleRate);
 
+    if (m_playbackSpeed.load() != 1.0f) {
+        SDL_SetAudioStreamFrequencyRatio(m_audioStream, m_playbackSpeed.load());
+    }
+
     std::cout << "Audio initialized successfully. Target format: " << m_outSampleRate
               << "Hz, 16-bit PCM, " << getOutputChannelLayoutName() << std::endl;
     return true;
@@ -816,6 +820,14 @@ void AudioDecoder::decodeAndResample() {
 
 void AudioDecoder::setVolume(float volume) {
     m_volume = std::clamp(volume, 0.0f, 1.0f);
+}
+
+void AudioDecoder::setPlaybackSpeed(float speed) {
+    speed = std::clamp(speed, 0.25f, 2.0f);
+    m_playbackSpeed.store(speed);
+    if (m_audioStream) {
+        SDL_SetAudioStreamFrequencyRatio(m_audioStream, speed);
+    }
 }
 
 void AudioDecoder::sdlAudioStreamCallback(void* userdata, SDL_AudioStream* stream, int additional_amount, int total_amount) {

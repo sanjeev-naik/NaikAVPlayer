@@ -254,7 +254,11 @@ The user interface uses Dear ImGui with frosted translucency overlay.
 
 ### Media Selection
 - **Drag-and-Drop**: Drag any video or audio file onto the application window to open and play immediately.
-- **Native File Dialog**: Click "Open Media File" or the folder icon to launch the platform-native file selector.
+- **Native File Dialog**: Click "Open Media File" or the folder icon to launch the platform-native file selector (automatically pauses background playback during file selection).
+
+### Playback Speed Control
+- **Controls Bar Selector**: Click the playback speed button (e.g. `1x`, `1.5x`) next to the loop toggle to open a quick-selection popup menu with presets (`0.25x`, `0.5x`, `0.75x`, `1.0x`, `1.25x`, `1.5x`, `1.75x`, `2.0x`).
+- **Real-Time Resampling**: Uses SDL3 dynamic audio stream frequency resampling to maintain smooth, synchronized audio and video playback without audio glitches or drift.
 
 ### Keyboard Shortcuts
 
@@ -263,6 +267,9 @@ The user interface uses Dear ImGui with frosted translucency overlay.
 | **`Spacebar`** | Toggle Play / Pause |
 | **`Left Arrow`** | Seek backward 10 seconds |
 | **`Right Arrow`** | Seek forward 10 seconds |
+| **`[`** | Decrease playback speed by 0.25x (min 0.25x) |
+| **`]`** | Increase playback speed by 0.25x (max 2.0x) |
+| **`Backspace`** | Reset playback speed to normal (1.0x) |
 | **`L`** | Toggle Loop Mode |
 | **`D`** | Toggle Diagnostics HUD overlay |
 | **`A`** | Toggle Audio Processing panel (EQ, noise gate, compressor, multiband compressor, limiter, crossover, loudness, 3D surround, widener, balance, channel/device/format selection) |
