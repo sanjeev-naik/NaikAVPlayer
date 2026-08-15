@@ -1530,6 +1530,65 @@ int real_main(int argc, char* argv[]) {
         }
 
         // -------------------------------------------------------------
+        // H4. Audio-Only Playback (e.g. MP3) - Normal speed and duration
+        // -------------------------------------------------------------
+        {
+            std::string audioTestFile = testFile.substr(0, testFile.find_last_of("/\\") + 1) + "test_audio.mp3";
+            std::cout << "Testing Audio-Only Playback with MP3: " << audioTestFile << std::endl;
+            bool audioOpenSuccess = controller.openFile(audioTestFile);
+            test_assert(audioOpenSuccess, "Audio-only file opens successfully");
+            test_assert(controller.hasAudio(), "Audio-only file hasAudio() is true");
+            test_assert(!controller.hasVideo(), "Audio-only file hasVideo() is false");
+            test_assert(controller.getDuration() > 4.5, "Audio-only duration is correct (~5s)");
+
+            // Stay paused for 250ms to verify demuxer backpressure does not discard packets
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            test_assert(controller.getCurrentTime() < 0.1, "Audio-only playback does not skip while paused in OPENED state");
+            test_assert(!controller.isEOF(), "Audio-only demuxer does not prematurely hit EOF while paused");
+
+            controller.play();
+            drive_playback(controller, 0.5);
+            test_assert(controller.getState() == PlayerState::PLAYING, "Audio-only state is PLAYING after play");
+            double t = controller.getCurrentTime();
+            test_assert(t > 0.05 && t < 2.0, "Audio-only clock advances normally from the beginning");
+
+            // Verify visualizer real-time telemetry APIs
+            auto spectrum = controller.getSpectrumMagnitudesDb();
+            test_assert(!spectrum.empty() && spectrum.size() == 512, "Visualizer magnitude spectrum is available and has 512 bins");
+            auto waveform = controller.getWaveformSamples();
+            test_assert(!waveform.empty() && waveform.size() == 1024, "Visualizer waveform snapshot is available and has 1024 samples");
+
+            // Test seeking in audio-only file
+            controller.seek(2.5);
+            drive_playback(controller, 0.3);
+            test_assert(std::abs(controller.getCurrentTime() - 2.5) < 1.0, "Audio-only seek positions accurately");
+
+            controller.stop();
+            test_assert(controller.getState() == PlayerState::UNINITIALIZED, "Audio-only stopped cleanly");
+        }
+
+        // -------------------------------------------------------------
+        // H5. Audio-Only with Embedded Album Art / Attached Picture (APIC)
+        // -------------------------------------------------------------
+        {
+            std::string coverAudioFile = testFile.substr(0, testFile.find_last_of("/\\") + 1) + "test_audio_with_cover.mp3";
+            std::cout << "Testing Audio with Attached Picture: " << coverAudioFile << std::endl;
+            bool openSuccess = controller.openFile(coverAudioFile);
+            test_assert(openSuccess, "Audio file with album art opens successfully");
+            test_assert(controller.hasAudio(), "Audio with album art hasAudio() is true");
+            test_assert(!controller.hasVideo(), "Audio with album art hasVideo() is false (attached picture excluded from video pipeline)");
+
+            controller.play();
+            drive_playback(controller, 0.4);
+            test_assert(controller.getState() == PlayerState::PLAYING, "State is PLAYING for audio with album art");
+            auto spectrum = controller.getSpectrumMagnitudesDb();
+            test_assert(!spectrum.empty() && spectrum.size() == 512, "Visualizer spectrum active for audio with album art");
+
+            controller.stop();
+            test_assert(controller.getState() == PlayerState::UNINITIALIZED, "Audio with album art stopped cleanly");
+        }
+
+        // -------------------------------------------------------------
         // I. Clean Stopping & Destruction
         // -------------------------------------------------------------
         controller.stop();

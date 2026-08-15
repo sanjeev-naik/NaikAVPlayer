@@ -188,6 +188,11 @@ void PlayerUI::draw(int windowWidth, int windowHeight,
     drawWelcomeHUD(windowWidth, windowHeight);
   }
 
+  // 1b. Real-time Audio Visualizer (automatically shown for audio-only media)
+  if (state != PlayerState::UNINITIALIZED && m_controller.hasAudio() && !m_controller.hasVideo()) {
+    drawAudioVisualizer(windowWidth, windowHeight, currentSystemTime);
+  }
+
   // 2. Top Title Bar HUD
   if (state != PlayerState::UNINITIALIZED && m_controlsVisible) {
     drawTitleBar(windowWidth, windowHeight);
@@ -527,6 +532,416 @@ void PlayerUI::drawWelcomeHUD(int windowWidth, int windowHeight) {
     ImGui::PopFont();
 
   ImGui::End();
+}
+
+void PlayerUI::drawAudioVisualizer(int windowWidth, int windowHeight, double currentSystemTime) {
+  // Ensure visualizer state buffers are properly sized
+  if (m_visualizerSmoothBands.size() != static_cast<size_t>(kNumVisualizerBands)) {
+    m_visualizerSmoothBands.assign(kNumVisualizerBands, 0.0f);
+    m_visualizerPeakCaps.assign(kNumVisualizerBands, 0.0f);
+    m_visualizerPeakVelocities.assign(kNumVisualizerBands, 0.0f);
+  }
+
+  // Calculate delta time for physics / animation
+  float dt = 0.016f;
+  if (m_visualizerLastTime > 0.0 && currentSystemTime > m_visualizerLastTime) {
+    dt = static_cast<float>(currentSystemTime - m_visualizerLastTime);
+    dt = std::clamp(dt, 0.001f, 0.1f);
+  }
+  m_visualizerLastTime = currentSystemTime;
+
+  bool isPlaying = (m_controller.getState() == PlayerState::PLAYING);
+
+  // Fetch real-time spectrum and waveform from PlayerController / SpectrumAnalyzer
+  std::vector<float> spectrumDb = m_controller.getSpectrumMagnitudesDb();
+  std::vector<float> waveform = m_controller.getWaveformSamples();
+
+  // Logarithmic frequency binning: map 512 raw FFT bins into kNumVisualizerBands
+  const size_t numBins = spectrumDb.size();
+  for (int i = 0; i < kNumVisualizerBands; ++i) {
+    float targetLevel = 0.0f;
+    if (isPlaying && numBins > 0) {
+      float fracStart = std::pow(static_cast<float>(i) / kNumVisualizerBands, 2.2f);
+      float fracEnd = std::pow(static_cast<float>(i + 1) / kNumVisualizerBands, 2.2f);
+      size_t bStart = std::min(static_cast<size_t>(fracStart * numBins), numBins - 1);
+      size_t bEnd = std::clamp(static_cast<size_t>(fracEnd * numBins) + 1, bStart + 1, numBins);
+
+      float maxDb = naikav::dsp::SpectrumAnalyzer::kFloorDb;
+      for (size_t b = bStart; b < bEnd; ++b) {
+        if (spectrumDb[b] > maxDb) {
+          maxDb = spectrumDb[b];
+        }
+      }
+
+      // Normalize from [-75dB, 0dB] to [0.0, 1.0]
+      constexpr float kFloor = -75.0f;
+      float norm = std::clamp((maxDb - kFloor) / (-kFloor), 0.0f, 1.0f);
+      // Gentle frequency equalization curve: slight boost on low bass and high air
+      float freqCurve = 1.0f + 0.15f * std::cos(static_cast<float>(i) / kNumVisualizerBands * 3.14159f);
+      targetLevel = std::clamp(norm * freqCurve, 0.0f, 1.0f);
+    }
+
+    // Smooth response with fast attack and natural decay
+    float attackSpeed = 26.0f;
+    float decaySpeed = 10.0f;
+    float speed = (targetLevel > m_visualizerSmoothBands[i]) ? attackSpeed : decaySpeed;
+    m_visualizerSmoothBands[i] += (targetLevel - m_visualizerSmoothBands[i]) * std::clamp(dt * speed, 0.0f, 1.0f);
+
+    // Peak cap physics (falling gravity)
+    if (m_visualizerSmoothBands[i] >= m_visualizerPeakCaps[i]) {
+      m_visualizerPeakCaps[i] = m_visualizerSmoothBands[i];
+      m_visualizerPeakVelocities[i] = 0.0f;
+    } else {
+      m_visualizerPeakVelocities[i] += 1.8f * dt;
+      m_visualizerPeakCaps[i] -= m_visualizerPeakVelocities[i] * dt;
+      if (m_visualizerPeakCaps[i] < 0.0f) m_visualizerPeakCaps[i] = 0.0f;
+    }
+  }
+
+  // Calculate aggregate energy for bass and brightness
+  float bassEnergy = 0.0f;
+  for (int i = 0; i < std::min(8, kNumVisualizerBands); ++i) {
+    bassEnergy += m_visualizerSmoothBands[i];
+  }
+  bassEnergy /= 8.0f;
+
+  // Palette color interpolator
+  auto getThemeColor = [this](float t, float alpha = 1.0f) -> ImVec4 {
+    t = std::clamp(t, 0.0f, 1.0f);
+    switch (m_visualizerTheme) {
+    case VisualizerTheme::SunsetFire:
+      // Golden yellow (1.0, 0.75, 0.1) -> Fiery Orange (1.0, 0.35, 0.05) -> Hot Pink (1.0, 0.1, 0.45)
+      if (t < 0.5f) {
+        float f = t * 2.0f;
+        return ImVec4(1.0f, 0.75f - f * 0.40f, 0.10f - f * 0.05f, alpha);
+      } else {
+        float f = (t - 0.5f) * 2.0f;
+        return ImVec4(1.0f, 0.35f - f * 0.25f, 0.05f + f * 0.40f, alpha);
+      }
+    case VisualizerTheme::NeonEmerald:
+      // Mint (0.2, 1.0, 0.7) -> Electric Green (0.0, 0.9, 0.35) -> Deep Teal (0.0, 0.6, 0.65)
+      if (t < 0.5f) {
+        float f = t * 2.0f;
+        return ImVec4(0.20f - f * 0.20f, 1.00f - f * 0.10f, 0.70f - f * 0.35f, alpha);
+      } else {
+        float f = (t - 0.5f) * 2.0f;
+        return ImVec4(0.0f, 0.90f - f * 0.30f, 0.35f + f * 0.30f, alpha);
+      }
+    case VisualizerTheme::ElectricViolet:
+      // Electric Aqua (0.3, 0.8, 1.0) -> Violet (0.65, 0.3, 1.0) -> Vivid Purple (0.9, 0.15, 1.0)
+      if (t < 0.5f) {
+        float f = t * 2.0f;
+        return ImVec4(0.30f + f * 0.35f, 0.80f - f * 0.50f, 1.0f, alpha);
+      } else {
+        float f = (t - 0.5f) * 2.0f;
+        return ImVec4(0.65f + f * 0.25f, 0.30f - f * 0.15f, 1.0f, alpha);
+      }
+    case VisualizerTheme::Cyberpunk:
+    default:
+      // Cyan (0.0, 0.88, 0.95) -> Deep Blue (0.3, 0.4, 1.0) -> Magenta/Pink (0.98, 0.15, 0.7)
+      if (t < 0.5f) {
+        float f = t * 2.0f;
+        return ImVec4(f * 0.30f, 0.88f - f * 0.48f, 0.95f + f * 0.05f, alpha);
+      } else {
+        float f = (t - 0.5f) * 2.0f;
+        return ImVec4(0.30f + f * 0.68f, 0.40f - f * 0.25f, 1.0f - f * 0.30f, alpha);
+      }
+    }
+  };
+
+  // Setup full-viewport canvas for visualizer drawing
+  ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f));
+  ImGui::SetNextWindowSize(ImVec2(static_cast<float>(windowWidth), static_cast<float>(windowHeight)));
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+  ImGui::Begin("AudioVisualizerCanvas", nullptr,
+               ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs |
+               ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoBringToFrontOnFocus |
+               ImGuiWindowFlags_NoSavedSettings);
+
+  ImDrawList* drawList = ImGui::GetWindowDrawList();
+  const float cx = windowWidth * 0.5f;
+  const float cy = windowHeight * 0.5f;
+
+  // 1. Ambient Background Glow reacting to bass
+  float glowRadius = 160.0f + bassEnergy * 150.0f;
+  ImVec4 glowColor = getThemeColor(0.2f, 0.08f + bassEnergy * 0.12f);
+  drawList->AddCircleFilled(ImVec2(cx, cy), glowRadius, ImGui::GetColorU32(glowColor), 48);
+
+  // 2. Render Selected Visualizer Mode
+  switch (m_visualizerMode) {
+  case VisualizerMode::NeonBars: {
+    // Mode 0: Modern Equalizer Bars with falling peak caps and reflections
+    const float availableW = std::max(200.0f, static_cast<float>(windowWidth) - 100.0f);
+    const float barSpacing = std::clamp(availableW / kNumVisualizerBands, 4.0f, 18.0f);
+    const float barW = std::max(2.0f, barSpacing - 2.0f);
+    const float totalW = kNumVisualizerBands * barSpacing;
+    const float startX = (windowWidth - totalW) * 0.5f;
+    const float baseY = cy + std::min(130.0f, windowHeight * 0.22f);
+    const float maxHeight = std::min(240.0f, windowHeight * 0.40f);
+
+    for (int i = 0; i < kNumVisualizerBands; ++i) {
+      float tFrac = static_cast<float>(i) / (kNumVisualizerBands - 1);
+      float barX = startX + i * barSpacing;
+      float barH = std::max(3.0f, m_visualizerSmoothBands[i] * maxHeight);
+
+      ImVec4 colTop = getThemeColor(tFrac, 1.0f);
+      ImVec4 colBottom = getThemeColor(tFrac * 0.4f, 0.35f);
+      ImU32 u32Top = ImGui::GetColorU32(colTop);
+      ImU32 u32Bottom = ImGui::GetColorU32(colBottom);
+
+      // Main Equalizer Bar (multi-color gradient)
+      drawList->AddRectFilledMultiColor(
+          ImVec2(barX, baseY - barH),
+          ImVec2(barX + barW, baseY),
+          u32Top, u32Top, u32Bottom, u32Bottom);
+
+      // Top glowing cap highlight
+      drawList->AddRectFilled(
+          ImVec2(barX, baseY - barH),
+          ImVec2(barX + barW, baseY - barH + 2.0f),
+          ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 0.90f)), 1.0f);
+
+      // Falling Peak Cap
+      float peakH = m_visualizerPeakCaps[i] * maxHeight;
+      if (peakH > barH + 2.0f) {
+        drawList->AddRectFilled(
+            ImVec2(barX, baseY - peakH - 2.0f),
+            ImVec2(barX + barW, baseY - peakH),
+            ImGui::GetColorU32(ImVec4(colTop.x, colTop.y, colTop.z, 0.95f)), 1.0f);
+      }
+
+      // Floor Reflection (downward fading gradient)
+      float reflH = barH * 0.35f;
+      ImU32 u32ReflStart = ImGui::GetColorU32(ImVec4(colTop.x, colTop.y, colTop.z, 0.25f));
+      ImU32 u32ReflEnd = ImGui::GetColorU32(ImVec4(colTop.x, colTop.y, colTop.z, 0.0f));
+      drawList->AddRectFilledMultiColor(
+          ImVec2(barX, baseY + 2.0f),
+          ImVec2(barX + barW, baseY + 2.0f + reflH),
+          u32ReflStart, u32ReflStart, u32ReflEnd, u32ReflEnd);
+    }
+
+    // Horizon line under bars
+    drawList->AddLine(
+        ImVec2(startX - 20.0f, baseY + 1.0f),
+        ImVec2(startX + totalW + 20.0f, baseY + 1.0f),
+        ImGui::GetColorU32(ImVec4(0.3f, 0.35f, 0.45f, 0.4f)), 1.0f);
+    break;
+  }
+
+  case VisualizerMode::SmoothWave: {
+    // Mode 1: Glowing Continuous Waveform
+    const float leftX = 60.0f;
+    const float rightX = windowWidth - 60.0f;
+    const float waveW = rightX - leftX;
+    const float waveY = cy + 40.0f;
+    const float waveAmp = std::min(150.0f, windowHeight * 0.25f);
+    const size_t waveCount = waveform.empty() ? kNumVisualizerBands : std::min(waveform.size(), size_t(256));
+
+    std::vector<ImVec2> pts;
+    pts.reserve(waveCount);
+
+    for (size_t i = 0; i < waveCount; ++i) {
+      float t = static_cast<float>(i) / (waveCount - 1);
+      float x = leftX + t * waveW;
+      float sample = 0.0f;
+      if (isPlaying) {
+        if (!waveform.empty()) {
+          sample = waveform[i % waveform.size()];
+        } else {
+          int bandIdx = static_cast<int>(t * (kNumVisualizerBands - 1));
+          sample = m_visualizerSmoothBands[bandIdx] * std::sin(t * 12.0f + static_cast<float>(currentSystemTime) * 4.0f);
+        }
+      }
+      float y = waveY - sample * waveAmp;
+      pts.push_back(ImVec2(x, y));
+    }
+
+    // Draw translucent gradient fill under the wave
+    for (size_t i = 0; i + 1 < pts.size(); ++i) {
+      float t = static_cast<float>(i) / pts.size();
+      ImVec4 c = getThemeColor(t, 0.20f);
+      ImU32 u32C = ImGui::GetColorU32(c);
+      ImU32 u32Fade = ImGui::GetColorU32(ImVec4(c.x, c.y, c.z, 0.0f));
+      drawList->AddTriangleFilled(pts[i], pts[i + 1], ImVec2(pts[i + 1].x, waveY + waveAmp * 0.5f), u32Fade);
+      drawList->AddTriangleFilled(pts[i], ImVec2(pts[i + 1].x, waveY + waveAmp * 0.5f), ImVec2(pts[i].x, waveY + waveAmp * 0.5f), u32C);
+    }
+
+    // Draw glowing polyline
+    for (size_t i = 0; i + 1 < pts.size(); ++i) {
+      float t = static_cast<float>(i) / pts.size();
+      ImVec4 cGlow = getThemeColor(t, 0.40f);
+      ImVec4 cCore = getThemeColor(t, 0.95f);
+      // Outer glow line
+      drawList->AddLine(pts[i], pts[i + 1], ImGui::GetColorU32(cGlow), 5.0f);
+      // Core bright line
+      drawList->AddLine(pts[i], pts[i + 1], ImGui::GetColorU32(cCore), 2.0f);
+    }
+    break;
+  }
+
+  case VisualizerMode::RadialDisc: {
+    // Mode 2: Circular 360-degree Radial Visualizer
+    const float radiusBase = std::min(80.0f, windowHeight * 0.16f);
+    const float maxSpike = std::min(130.0f, windowHeight * 0.22f);
+    constexpr float kTwoPi = 6.2831853f;
+
+    // Draw rotating vinyl disc grooves
+    float spinAngle = static_cast<float>(currentSystemTime) * (isPlaying ? 0.8f : 0.0f);
+    for (int r = 1; r <= 4; ++r) {
+      float gr = radiusBase * (0.3f + r * 0.16f);
+      drawList->AddCircle(ImVec2(cx, cy), gr, ImGui::GetColorU32(ImVec4(0.2f, 0.22f, 0.28f, 0.35f)), 36, 1.0f);
+    }
+
+    // Center pulsating disc
+    float pulseR = radiusBase + bassEnergy * 15.0f;
+    drawList->AddCircleFilled(ImVec2(cx, cy), pulseR, ImGui::GetColorU32(ImVec4(0.08f, 0.09f, 0.12f, 0.90f)), 48);
+    drawList->AddCircle(ImVec2(cx, cy), pulseR, ImGui::GetColorU32(getThemeColor(0.5f, 0.85f)), 48, 2.5f);
+
+    // Radiating 360-degree frequency spikes
+    for (int i = 0; i < kNumVisualizerBands; ++i) {
+      float angle = spinAngle + (static_cast<float>(i) / kNumVisualizerBands) * kTwoPi;
+      float cosA = std::cos(angle);
+      float sinA = std::sin(angle);
+
+      float spikeLen = m_visualizerSmoothBands[i] * maxSpike;
+      float p1x = cx + cosA * (pulseR + 4.0f);
+      float p1y = cy + sinA * (pulseR + 4.0f);
+      float p2x = cx + cosA * (pulseR + 4.0f + spikeLen);
+      float p2y = cy + sinA * (pulseR + 4.0f + spikeLen);
+
+      float t = static_cast<float>(i) / kNumVisualizerBands;
+      ImVec4 col = getThemeColor(t, 0.90f);
+      drawList->AddLine(ImVec2(p1x, p1y), ImVec2(p2x, p2y), ImGui::GetColorU32(col), 2.5f);
+    }
+
+    // Center music note / visual icon
+    drawList->AddCircleFilled(ImVec2(cx, cy), 18.0f, ImGui::GetColorU32(getThemeColor(0.2f, 0.3f)), 24);
+    drawList->AddCircle(ImVec2(cx, cy), 18.0f, ImGui::GetColorU32(getThemeColor(0.8f, 0.9f)), 24, 2.0f);
+    break;
+  }
+
+  case VisualizerMode::MirroredBars: {
+    // Mode 3: Symmetrical Top-and-Bottom Mirrored Spectrum
+    const float availableW = std::max(200.0f, static_cast<float>(windowWidth) - 100.0f);
+    const float barSpacing = std::clamp(availableW / kNumVisualizerBands, 4.0f, 18.0f);
+    const float barW = std::max(2.0f, barSpacing - 2.0f);
+    const float totalW = kNumVisualizerBands * barSpacing;
+    const float startX = (windowWidth - totalW) * 0.5f;
+    const float horizonY = cy + 30.0f;
+    const float maxBarH = std::min(130.0f, windowHeight * 0.22f);
+
+    for (int i = 0; i < kNumVisualizerBands; ++i) {
+      float tFrac = static_cast<float>(i) / (kNumVisualizerBands - 1);
+      float barX = startX + i * barSpacing;
+      float barH = std::max(2.0f, m_visualizerSmoothBands[i] * maxBarH);
+
+      ImVec4 col = getThemeColor(tFrac, 0.90f);
+      ImU32 u32Col = ImGui::GetColorU32(col);
+      ImU32 u32Fade = ImGui::GetColorU32(ImVec4(col.x, col.y, col.z, 0.20f));
+
+      // Upper bar (reaching up)
+      drawList->AddRectFilledMultiColor(
+          ImVec2(barX, horizonY - barH),
+          ImVec2(barX + barW, horizonY),
+          u32Col, u32Col, u32Fade, u32Fade);
+
+      // Lower mirrored bar (reaching down)
+      drawList->AddRectFilledMultiColor(
+          ImVec2(barX, horizonY),
+          ImVec2(barX + barW, horizonY + barH),
+          u32Fade, u32Fade, u32Col, u32Col);
+    }
+
+    // Glowing horizon line
+    drawList->AddLine(
+        ImVec2(startX - 20.0f, horizonY),
+        ImVec2(startX + totalW + 20.0f, horizonY),
+        ImGui::GetColorU32(getThemeColor(0.5f, 0.85f)), 2.0f);
+    break;
+  }
+  default:
+    break;
+  }
+
+  ImGui::End();
+  ImGui::PopStyleVar(2);
+
+  // 3. Interactive Floating Track Info & Visualizer Controls Header (when controls visible)
+  {
+    float cardW = std::min(600.0f, static_cast<float>(windowWidth) - 40.0f);
+    float cardH = 76.0f;
+    float cardX = (windowWidth - cardW) * 0.5f;
+    float cardY = 60.0f;
+
+    ImGui::SetNextWindowPos(ImVec2(cardX, cardY));
+    ImGui::SetNextWindowSize(ImVec2(cardW, cardH));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14.0f, 8.0f));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.08f, 0.08f, 0.10f, 0.85f));
+    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.20f, 0.22f, 0.28f, 0.70f));
+
+    ImGuiWindowFlags infoFlags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoSavedSettings;
+    if (!m_controlsVisible) {
+      infoFlags |= ImGuiWindowFlags_NoInputs;
+    }
+
+    if (ImGui::Begin("AudioVisualizerHeader", nullptr, infoFlags)) {
+      // Audio title basename
+      std::string fullPath = m_controller.getFilename();
+      std::string baseName = fullPath;
+      size_t lastSlash = fullPath.find_last_of("/\\");
+      if (lastSlash != std::string::npos) {
+        baseName = fullPath.substr(lastSlash + 1);
+      }
+
+      ImGui::TextColored(ImVec4(0.00f, 0.88f, 0.95f, 1.0f), "AUDIO PLAYBACK");
+      ImGui::SameLine();
+      ImGui::TextDisabled("|");
+      ImGui::SameLine();
+      ImGui::TextUnformatted(baseName.c_str());
+
+      // Audio stream spec pill badges & Style switcher on the second line
+      std::string codecStr = m_controller.getAudioCodecName();
+      std::string layoutStr = m_controller.getAudioChannelLayoutName();
+      ImGui::TextColored(ImVec4(0.70f, 0.72f, 0.78f, 1.0f), "[ %s ]  [ %s ]",
+                         codecStr.c_str(), layoutStr.c_str());
+
+      // Visualizer Mode Selector Buttons (interactive)
+      ImGui::SameLine(cardW - 270.0f);
+      auto drawModeBtn = [this](const char* label, VisualizerMode mode) {
+        bool active = (m_visualizerMode == mode);
+        if (active) {
+          ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.00f, 0.65f, 0.75f, 0.80f));
+        }
+        if (ImGui::SmallButton(label)) {
+          m_visualizerMode = mode;
+        }
+        if (active) {
+          ImGui::PopStyleColor();
+        }
+      };
+
+      drawModeBtn("Bars", VisualizerMode::NeonBars);
+      ImGui::SameLine();
+      drawModeBtn("Wave", VisualizerMode::SmoothWave);
+      ImGui::SameLine();
+      drawModeBtn("Radial", VisualizerMode::RadialDisc);
+      ImGui::SameLine();
+      drawModeBtn("Mirror", VisualizerMode::MirroredBars);
+
+      // Theme toggle button
+      ImGui::SameLine();
+      const char* themeNames[] = { "CYBER", "SUNSET", "MINT", "VIOLET" };
+      int currentTheme = static_cast<int>(m_visualizerTheme);
+      if (ImGui::SmallButton(themeNames[currentTheme])) {
+        m_visualizerTheme = static_cast<VisualizerTheme>((currentTheme + 1) % 4);
+      }
+    }
+    ImGui::End();
+    ImGui::PopStyleColor(2);
+    ImGui::PopStyleVar(2);
+  }
 }
 
 void PlayerUI::drawTitleBar(int windowWidth, int windowHeight) {

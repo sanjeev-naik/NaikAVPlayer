@@ -263,6 +263,9 @@ public:
     std::vector<float> getSpectrumMagnitudesDb() const {
         return (m_hasAudio && m_audioDecoder) ? m_audioDecoder->getSpectrumMagnitudesDb() : std::vector<float>{};
     }
+    std::vector<float> getWaveformSamples() const {
+        return (m_hasAudio && m_audioDecoder) ? m_audioDecoder->getWaveformSamples() : std::vector<float>{};
+    }
     static int getSpectrumNumBins() { return AudioDecoder::getSpectrumNumBins(); }
     double getSpectrumBinFrequencyHz(int bin) const {
         return (m_hasAudio && m_audioDecoder) ? m_audioDecoder->getSpectrumBinFrequencyHz(bin) : 0.0;

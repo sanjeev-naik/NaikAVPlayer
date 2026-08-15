@@ -43,6 +43,7 @@ public:
         buildHannWindow();
         std::lock_guard<std::mutex> lock(m_mutex);
         m_magnitudesDb.assign(kNumBins, kFloorDb);
+        m_waveformSnapshot.assign(kFftSize, 0.0f);
     }
 
     void setEnabled(bool enabled) { m_enabled = enabled; }
@@ -53,6 +54,7 @@ public:
         m_writePos = 0;
         std::lock_guard<std::mutex> lock(m_mutex);
         std::fill(m_magnitudesDb.begin(), m_magnitudesDb.end(), kFloorDb);
+        std::fill(m_waveformSnapshot.begin(), m_waveformSnapshot.end(), 0.0f);
     }
 
     // Feeds interleaved float samples (post-DSP-chain, pre-dither).
@@ -85,6 +87,12 @@ public:
     std::vector<float> getMagnitudesDb() const {
         std::lock_guard<std::mutex> lock(m_mutex);
         return m_magnitudesDb;
+    }
+
+    // Thread-safe snapshot of recent time-domain audio samples [-1.0, 1.0]
+    std::vector<float> getWaveformSamples() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_waveformSnapshot;
     }
 
     double binFrequencyHz(int bin) const {
@@ -120,6 +128,7 @@ private:
         }
 
         std::lock_guard<std::mutex> lock(m_mutex);
+        m_waveformSnapshot = m_ringBuffer;
         if (m_magnitudesDb.size() != mags.size()) {
             m_magnitudesDb = std::move(mags);
             return;
@@ -179,6 +188,7 @@ private:
 
     mutable std::mutex m_mutex;
     std::vector<float> m_magnitudesDb;
+    std::vector<float> m_waveformSnapshot;
 };
 
 } // namespace naikav::dsp

@@ -84,7 +84,9 @@ bool Demuxer::open() {
     // Find video and audio streams
     for (unsigned int i = 0; i < m_formatCtx->nb_streams; i++) {
         AVCodecParameters* codecParams = m_formatCtx->streams[i]->codecpar;
-        if (codecParams->codec_type == AVMEDIA_TYPE_VIDEO && m_videoStreamIdx < 0) {
+        if (codecParams->codec_type == AVMEDIA_TYPE_VIDEO &&
+            !(m_formatCtx->streams[i]->disposition & (AV_DISPOSITION_ATTACHED_PIC | AV_DISPOSITION_TIMED_THUMBNAILS)) &&
+            m_videoStreamIdx < 0) {
             m_videoStreamIdx = i;
             m_videoCodecParams = codecParams;
             m_videoTimeBase = m_formatCtx->streams[i]->time_base;
@@ -277,24 +279,19 @@ void Demuxer::threadLoop() {
                     }
                 }
 
-                // Nothing drains the audio queue whenever the audio device
-                // itself is paused (not just during a catch-up scan - e.g.
-                // seeking, or scrubbing, while playback is paused). A
-                // blocking push in that state can stall this thread forever
-                // once the queue fills, which also starves the video queue
-                // since both streams are read by this one loop.
-                bool audioConsumerIdle = (cmode != SeekCatchupMode::NONE) ||
-                    (m_audioPausedFlag && m_audioPausedFlag->load());
-
-                bool pushed;
+                bool pushed = false;
                 if (drop) {
                     pushed = false;
-                } else if (audioConsumerIdle) {
-                    // Drop the oldest buffered packet instead of blocking, so
-                    // the demuxer always keeps making progress.
+                } else if (m_videoStreamIdx < 0) {
+                    // Audio-only media: apply full queue backpressure. When paused or queue
+                    // is full, wait for the audio consumer without dropping packets.
+                    pushed = m_audioQueue.push(packet);
+                } else if (cmode != SeekCatchupMode::NONE) {
+                    // Active video catch-up scan: audio consumer is paused, drop oldest
+                    // so the demuxer does not block video keyframe scanning.
                     pushed = m_audioQueue.push_drop_oldest(packet, [](AVPacket*& p) { av_packet_free(&p); });
                 } else {
-                    // Same bounded-wait backstop as the video queue above.
+                    // Video with audio in normal playback or pause: bounded-wait backstop.
                     pushed = m_audioQueue.push_wait_or_drop(packet, kQueuePushTimeout,
                                                              [](AVPacket*& p) { av_packet_free(&p); });
                 }
