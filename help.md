@@ -174,7 +174,20 @@ To build Windows 64-bit executables from a Linux development machine:
    cmake --build build-windows -j$(nproc)
    ```
 
-> **Advanced Build Options**: Specialized build options such as `-DENABLE_SANITIZERS=ON` (ASan/UBSan), `-DENABLE_TSAN=ON` (ThreadSanitizer), `RelWithDebInfo`, and `MinSizeRel` remain supported across all configurations.
+### Advanced Build Options
+
+All are supported across configurations:
+
+| Option | Default | Purpose |
+|---|---|---|
+| `-DENABLE_SANITIZERS=ON` | `OFF` | AddressSanitizer + UndefinedBehaviorSanitizer |
+| `-DENABLE_TSAN=ON` | `OFF` | ThreadSanitizer |
+| `-DTREAT_WARNINGS_AS_ERRORS=OFF` | `ON` | Disable `-Werror` |
+| `-DENABLE_COVERAGE=OFF` | `ON` | gcov/lcov coverage instrumentation |
+| `-DNAIKAV_FORCE_BUNDLED_FFMPEG=OFF` | — | Use the system FFmpeg (via `pkg-config`) instead of the downloaded prebuilt archive; required when cross-compiling for ARM64 |
+| `-DPLATFORM=LINUX\|WINDOWS` | autodetected | Target platform selection |
+
+The `RelWithDebInfo` and `MinSizeRel` build types are also supported.
 
 ---
 
@@ -257,6 +270,26 @@ The user interface uses Dear ImGui with frosted translucency overlay.
 
 ---
 
+## 4a. Source Layout
+
+Sources are grouped by subsystem under `src/`. Headers are included by that subsystem-relative path (e.g. `#include "audio/dsp/DspChain.hpp"`), which is why manual compiles and static analysis both need `-I src` / `-I src/`:
+
+```text
+src/
+├── app/       main.cpp — entry point, SDL window/event loop, render loop, CLI flags
+├── audio/     AudioDecoder.{hpp,cpp} — decode, resample, SDL callback, output selectors
+│   └── dsp/   header-only DSP module (see Section 5b)
+├── core/      ThreadSafeQueue.hpp, MetricRing.hpp, PipelineMetrics.hpp
+├── media/     Demuxer.{hpp,cpp} — packet reading and routing
+├── player/    PlayerController.{hpp,cpp} — state machine, seeking, settings persistence
+├── ui/        PlayerUI.{hpp,cpp} — ImGui controls dock, diagnostics HUD, audio panel
+└── video/     VideoDecoder.{hpp,cpp} — HW/SW decode, frame conversion
+```
+
+`src/audio/dsp/` is entirely header-only: `AudioDspSettings.hpp` (settings struct, the 9 presets, and genre mapping), `Biquad.hpp`, `ParametricEQ.hpp`, `NoiseGate.hpp`, `Compressor.hpp`, `MultibandCompressor.hpp`, `Limiter.hpp`, `Crossover.hpp`, `DspChain.hpp`, `LoudnessMeter.hpp`, `LoudnessNormalizer.hpp`, `LoudnessPrescan.hpp`, `ReplayGainTags.hpp`, `SpatialDownmixer.hpp`, `Surround3D.hpp`, `StereoWidener.hpp`, `BalanceControl.hpp`, `SpectrumAnalyzer.hpp`.
+
+---
+
 ## 5. Hardware Acceleration & Dynamic Fallback
 
 - **Windows Decoders:** Tries `h264_d3d11va`, `h264_dxva2`, `h264_qsv`, `h264_cuvid`.
@@ -310,21 +343,35 @@ decode -> resample (swresample, libsoxr engine, selectable quality) -> DSP chain
 
 ## 6. Security, Maintenance & Dependency Management
 
-- **Upstream Dependencies**: Build dependencies are pinned in `CMakeLists.txt` (`SDL3` `release-3.4.0`, `imgui` `v1.91.9`, `nativefiledialog-extended` `v1.2.1`, FFmpeg `n8.1.2`).
-- **Updating Dependencies**: Update tag entries or archive SHA-256 hashes inside `CMakeLists.txt`.
-- **Packaging Compliance**: Release packages compiled by CI include a complete `licenses/` directory containing third-party licenses (`LICENSE.lgpl-3`, `LICENSE.sdl3`, `LICENSE.imgui`, `LICENSE.nfd`, `LICENSE.winpthread`, `FFMPEG_CREDITS.txt`), project `LICENSE`, `README.md`, and executable binaries. `FFMPEG_CREDITS.txt` also credits the bundled libsoxr resampler and the `avfilter`/`ebur128` component now used for loudness metering (see [Section 5b](#5b-audio-dsp--loudness-pipeline)) -- this build uses FFmpeg's `--enable-version3` flag, so LGPL v3 applies to the FFmpeg binaries themselves (libsoxr keeps its own LGPL v2.1+ terms).
+- **Upstream Dependencies**: Build dependencies are pinned in `CMakeLists.txt` by commit SHA, with the semantic version in a trailing comment — `SDL3` `release-3.4.0`, `imgui` `v1.91.9`, `nativefiledialog-extended` `v1.2.1` (all via `FetchContent`), and FFmpeg `n8.1.2` (prebuilt archive, verified by SHA-256).
+- **Updating Dependencies**: Update the `GIT_TAG` commit SHAs or the FFmpeg archive filename/SHA-256 hashes inside `CMakeLists.txt`, keeping the trailing version comments in sync.
+- **Packaging Compliance**: Release packages compiled by CI include a complete `licenses/` directory containing third-party licenses (`LICENSE.lgpl-3`, `LICENSE.sdl3`, `LICENSE.imgui`, `LICENSE.nfd`, `LICENSE.winpthread`, `FFMPEG_CREDITS.txt`), the project `LICENSE`, both `README.md` and `help.md`, the `assets/` directory, and the executable plus its runtime libraries. `FFMPEG_CREDITS.txt` also credits the bundled libsoxr resampler and the `avfilter`/`ebur128` component used for loudness metering (see [Section 5b](#5b-audio-dsp--loudness-pipeline)) -- this build uses FFmpeg's `--enable-version3` flag, so LGPL v3 applies to the FFmpeg binaries themselves (libsoxr keeps its own LGPL v2.1+ terms).
+- **`LICENSE.winpthread` scope**: retained in `licenses/` for locally MinGW-built binaries. It does **not** apply to the published Windows release, which is MSVC-built against the static CRT (`/MT`) and links no `libwinpthread` — see [Section 7](#7-cicd-pipeline--package-verification).
 
 ---
 
 ## 7. CI/CD Pipeline & Package Verification
 
-GitHub Actions workflows ([ci.yml](.github/workflows/ci.yml)) perform:
-- **Pinned Actions**: Every `uses:` reference is pinned to an immutable commit SHA (with the semantic version in a trailing comment), not a mutable `@v4`-style tag — a moving tag would silently pull new code into the build if that action's repository were ever compromised. This matches how `CMakeLists.txt` already pins SDL3/ImGui/NFD by commit SHA and verifies the FFmpeg archive by SHA-256. When updating an action, resolve the new tag to its commit (`gh api repos/OWNER/REPO/git/ref/tags/vN`, dereferencing to `object.sha` for annotated tags) and update the trailing version comment to match.
+GitHub Actions ([ci.yml](.github/workflows/ci.yml)) runs two jobs:
+
+**`test-and-analysis`** (Native Linux Testing & Analysis, `ubuntu-latest`):
+- **Repository Integrity**: Fails the build if `README.md`, `help.md`, `LICENSE`, or a non-empty `licenses/` directory is missing.
 - **Warning Enforcement**: Builds are compiled with `-Werror` (`-DTREAT_WARNINGS_AS_ERRORS=ON`).
-- **Sanitizers**: ASan, UBSan, and TSan automated test runs.
-- **Cross-Compilation**: MinGW cross-compilation testing.
-- **Package Verification**: Automated `Verify Package Compliance` step asserts presence of executable, dynamic libraries, `LICENSE`, `README.md`, and non-empty `licenses/` / `LICENSES/` directories.
-- **Release Artifact Publishing**: Publishes Windows release packages (`NaikAVPlayer-windows-x64`). Linux release artifact uploads are currently suspended until a portable build strategy is implemented.
+- **Tests & Coverage**: Runs the `ctest` suite in Release, captures coverage with `lcov`, and uploads it to Codecov.
+- **Static Analysis**: `cppcheck` over `src/` and `tests/` with `--error-exitcode=1` (passed `-I src/` so it resolves the subsystem-relative includes).
+- **Sanitizers**: Separate ASan/UBSan and TSan configure/build/test passes in Debug.
+- **Extra Configuration Check**: A `RelWithDebInfo` configure-and-build pass.
+- **Reports**: Test execution, cppcheck, ASan and UBSan results are converted to XLS and uploaded as workflow artifacts.
+
+**`build-packages`** (matrix):
+- **Linux x86_64** on `ubuntu-latest`, and **Windows x86_64** on `windows-latest` using the **native MSVC toolchain** — not MinGW cross-compiled from Linux, since MinGW PE binaries trip generic antivirus heuristics while MSVC output trips far fewer and supports Control Flow Guard. The MSVC build uses the static CRT (`/MT`), so no VC++ redistributable and no MinGW `libwinpthread` are shipped.
+- **Package Verification**: The `Verify Package Compliance` step asserts presence of the executable, `LICENSE`, `README.md`, `help.md`, and non-empty `licenses/` **and** `LICENSES/` directories.
+- **Release Artifact Publishing**: Uploads the Windows package (`NaikAVPlayer-windows-x64`) only for branches starting with `release`. Linux release artifact uploads are currently suspended until a portable build strategy is implemented.
+
+**Supply-chain pinning** (both jobs): every `uses:` reference is pinned to an immutable commit SHA (with the semantic version in a trailing comment), not a mutable `@v4`-style tag — a moving tag would silently pull new code into the build if that action's repository were ever compromised. This matches how `CMakeLists.txt` already pins SDL3/ImGui/NFD by commit SHA and verifies the FFmpeg archive by SHA-256. When updating an action, resolve the new tag to its commit (`gh api repos/OWNER/REPO/git/ref/tags/vN`, dereferencing to `object.sha` for annotated tags) and update the trailing version comment to match.
+
+> [!NOTE]
+> There is no MinGW cross-compilation job in CI. The MinGW cross-compile workflow in [Section 2](#2-compilation--local-cross-compilation-guide) is supported for local builds, but is not exercised by the pipeline.
 
 ---
 
@@ -334,19 +381,19 @@ The execution pipeline tracks 9 metrics using lock-free Single Producer Single C
 
 | Metric ID | Metric Name | Hook Site (File:Function) | Producing Thread | Type | Gating |
 |---|---|---|---|---|---|
-| **M1** | `video_packet_queue_depth` | `ThreadSafeQueue.hpp:push/pop/try_pop/clear/reset` | Demuxer & Video Decoder | std::atomic<int> (Gauge) | Always-On |
-| **M2** | `audio_packet_queue_depth` | `ThreadSafeQueue.hpp:push/pop/try_pop/clear/reset` | Demuxer & Audio Decoder callback | std::atomic<int> (Gauge) | Always-On |
-| **M3** | `decoded_frame_queue_depth` | `ThreadSafeQueue.hpp:push/pop/try_pop/clear/reset` | Video Decoder & Main Render | std::atomic<int> (Gauge) | Always-On |
-| **M4** | `demux_time_per_packet_us` | `Demuxer.cpp:threadLoop()` | Demuxer thread | MetricRing<256> (SPSC) | gated |
-| **M5** | `decode_time_per_frame_us` | `VideoDecoder.cpp:decodeNextFrame()` | Video Decoder thread | MetricRing<256> (SPSC) | gated |
-| **M6-A** | `convert_time_us` | `VideoDecoder.cpp:convertFrame()` | Video Decoder thread | MetricRing<256> (SPSC) | gated |
-| **M6-B** | `upload_time_us` | `main.cpp:main()` | Main / Render thread | MetricRing<256> (SPSC) | gated |
-| **M7** | `av_clock_offset_ms` | `main.cpp:main()` | Main / Render thread | MetricRing<256> (SPSC) | gated |
-| **M8** | `frames_dropped_count` | `main.cpp:main()` | Main / Render thread | std::atomic<uint64_t> (Counter) | Always-On |
-| **M9** | `seek_latency_ms` | `PlayerController.cpp:seek()` & `finishCatchup()` | Video Decoder & Main thread | MetricRing<256> (SPSC) | gated |
-| **M10** | `audio_callback_count` | `AudioDecoder.cpp:sdlAudioStreamCallback()` | SDL audio callback thread | std::atomic<uint64_t> (Counter) | Always-On |
-| **M11** | `audio_silence_injections` | `AudioDecoder.cpp:sdlAudioStreamCallback()` | SDL audio callback thread | std::atomic<uint64_t> (Counter) | Always-On |
-| **M12** | `audio_silence_bytes` | `AudioDecoder.cpp:sdlAudioStreamCallback()` | SDL audio callback thread | std::atomic<uint64_t> (Counter) | Always-On |
+| **M1** | `video_packet_queue_depth` | `core/ThreadSafeQueue.hpp:push/pop/try_pop/clear/reset` | Demuxer & Video Decoder | std::atomic<int> (Gauge) | Always-On |
+| **M2** | `audio_packet_queue_depth` | `core/ThreadSafeQueue.hpp:push/pop/try_pop/clear/reset` | Demuxer & Audio Decoder callback | std::atomic<int> (Gauge) | Always-On |
+| **M3** | `decoded_frame_queue_depth` | `core/ThreadSafeQueue.hpp:push/pop/try_pop/clear/reset` | Video Decoder & Main Render | std::atomic<int> (Gauge) | Always-On |
+| **M4** | `demux_time_per_packet_us` | `media/Demuxer.cpp:threadLoop()` | Demuxer thread | MetricRing<256> (SPSC) | gated |
+| **M5** | `decode_time_per_frame_us` | `video/VideoDecoder.cpp:decodeNextFrame()` | Video Decoder thread | MetricRing<256> (SPSC) | gated |
+| **M6-A** | `convert_time_us` | `video/VideoDecoder.cpp:convertFrame()` | Video Decoder thread | MetricRing<256> (SPSC) | gated |
+| **M6-B** | `upload_time_us` | `app/main.cpp:main()` | Main / Render thread | MetricRing<256> (SPSC) | gated |
+| **M7** | `av_clock_offset_ms` | `app/main.cpp:main()` | Main / Render thread | MetricRing<256> (SPSC) | gated |
+| **M8** | `frames_dropped_count` | `app/main.cpp:main()` | Main / Render thread | std::atomic<uint64_t> (Counter) | Always-On |
+| **M9** | `seek_latency_ms` | `player/PlayerController.cpp:seek()` & `finishCatchup()` | Video Decoder & Main thread | MetricRing<256> (SPSC) | gated |
+| **M10** | `audio_callback_count` | `audio/AudioDecoder.cpp:sdlAudioStreamCallback()` | SDL audio callback thread | std::atomic<uint64_t> (Counter) | Always-On |
+| **M11** | `audio_silence_injections` | `audio/AudioDecoder.cpp:sdlAudioStreamCallback()` | SDL audio callback thread | std::atomic<uint64_t> (Counter) | Always-On |
+| **M12** | `audio_silence_bytes` | `audio/AudioDecoder.cpp:sdlAudioStreamCallback()` | SDL audio callback thread | std::atomic<uint64_t> (Counter) | Always-On |
 
 ### Audio Underrun Counters (M10-M12)
 
@@ -359,15 +406,24 @@ Accessors: `AudioDecoder::getCallbackCount()` / `getSilenceInjectionCount()` / `
 
 ### Standalone Diagnostic Harnesses
 
-Three self-contained programs under `tests/` (not part of the `ctest` suite — they are built manually and, in the smoke test's case, need a real audio device):
+Five self-contained programs under `tests/`, none of which are part of the `ctest` suite (only `NaikAVPlayer_tests` is registered via `add_test`). Two are CMake targets built alongside the app; three are built manually.
 
-| Program | Purpose |
+**Built by CMake** (produced by a normal `cmake --build`, but never run by `ctest`):
+
+| Target | Source | Purpose |
+|---|---|---|
+| `NaikAVPlayer_dsp_repro` | `tests/dsp_repro_standalone.cpp` | Exercises the DSP chain through the **real** SDL audio device path, with none of the `SDL_OpenAudioDeviceStream` mocking `tests.cpp` uses. That mock falls back to a disconnected `SDL_CreateAudioStream()` with no callback bound whenever the real device open fails in a sandboxed runner, meaning `decodeAndResample()` — and therefore the whole DSP chain — never actually executes under a real audio callback thread in the normal suite. This program makes it run, matching what the GUI app does. |
+| `NaikAVPlayer_colorinfo_race` | `tests/colorinfo_race_repro.cpp` | Stress-tests the `getColorInfo()` data race between the UI thread (which calls it every frame for the Diagnostics HUD) and the video decode thread, which concurrently mutates and frees the same `AVFrame`. A real render loop only calls it once per frame, so the race was hard to hit organically. |
+
+**Built manually** (not wired into CMake; the smoke test needs a real audio device):
+
+| Source | Purpose |
 |---|---|
 | `tests/audio_underrun_smoke.cpp` | Drives the real `PlayerController` → `AudioDecoder` → SDL device path against a real media file, samples every queue depth over time, and reports M10-M12 with per-exit-path attribution. This is the tool that isolates a crackling report to a specific cause. |
 | `tests/audio_callback_bench.cpp` | Per-stage cost of the post-resample DSP path with every effect disabled, as a percentage of the realtime budget — i.e. what the callback still pays for unconditionally. |
 | `tests/resampler_bench.cpp` | `swr_convert` cost per `ResamplerQuality` tier at both matched (48k→48k) and converting (44.1k→48k) rates. |
 
-Build them with the compiler directly; the DSP headers are header-only. Example:
+The manually-built ones compile with the compiler directly, since the DSP headers are header-only. Note the `-I src` — headers are included by subsystem-relative path:
 
 ```bash
 g++ -O2 -std=gnu++17 -I src tests/audio_callback_bench.cpp -o build/bench

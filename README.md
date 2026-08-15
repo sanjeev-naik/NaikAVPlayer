@@ -40,6 +40,22 @@ NaikAVPlayer is a native, multi-threaded C++17 media engine and video player bui
 
 NaikAVPlayer follows a multi-threaded media player design with decoupled worker threads coordinated through bounded thread-safe queues and an audio-master clock reference.
 
+### Source Layout
+
+Sources are grouped by subsystem under `src/`, and headers are included by that path (e.g. `#include "audio/dsp/DspChain.hpp"`):
+
+```text
+src/
+├── app/       main.cpp — entry point, SDL window/event loop, render loop, CLI flags
+├── audio/     AudioDecoder.{hpp,cpp} — decode, resample, SDL callback, output selectors
+│   └── dsp/   header-only DSP module (see Audio DSP & Loudness Pipeline below)
+├── core/      ThreadSafeQueue.hpp, MetricRing.hpp, PipelineMetrics.hpp
+├── media/     Demuxer.{hpp,cpp} — packet reading and routing
+├── player/    PlayerController.{hpp,cpp} — state machine, seeking, settings persistence
+├── ui/        PlayerUI.{hpp,cpp} — ImGui controls dock, diagnostics HUD, audio panel
+└── video/     VideoDecoder.{hpp,cpp} — HW/SW decode, frame conversion
+```
+
 ### Thread Model
 
 ```text
@@ -366,7 +382,11 @@ To build native Windows 64-bit `.exe` binaries on a Linux workstation:
    cmake --build build-windows -j$(nproc)
    ```
 
-> **Advanced Build Flags**: Additional CMake options such as `-DENABLE_SANITIZERS=ON` (ASan/UBSan), `-DENABLE_TSAN=ON` (ThreadSanitizer), `RelWithDebInfo`, and `MinSizeRel` are fully supported for analysis across build configurations.
+> **Advanced Build Flags**: Additional CMake options are supported for analysis across build configurations:
+> `-DENABLE_SANITIZERS=ON` (ASan/UBSan, default `OFF`), `-DENABLE_TSAN=ON` (ThreadSanitizer, default `OFF`),
+> `-DTREAT_WARNINGS_AS_ERRORS=OFF` (`-Werror`, default `ON`), `-DENABLE_COVERAGE=OFF` (gcov/lcov
+> instrumentation, default `ON`), `-DNAIKAV_FORCE_BUNDLED_FFMPEG=OFF` (use the system FFmpeg instead of the
+> downloaded prebuilt one), plus the `RelWithDebInfo` and `MinSizeRel` build types.
 
 ---
 
@@ -458,7 +478,9 @@ Fixed. This was caused by the demuxer thread — the single thread that reads bo
 
 Release packages generated and published by the CI/CD pipeline (`NaikAVPlayer-windows-x64`) are validated for full open-source redistribution compliance.
 
-*(Note: Linux release binary artifact uploads are currently suspended until a portable AppImage/containerized build process is available. Windows release executables continue to be published for every release).*
+The Windows release is built with the **native MSVC toolchain on a Windows runner**, not MinGW cross-compiled from Linux: MinGW PE binaries trip generic antivirus heuristics, while MSVC output trips far fewer and supports Control Flow Guard. It links the static CRT (`/MT`), so neither a VC++ redistributable nor MinGW's `libwinpthread` is bundled.
+
+*(Note: Linux release binary artifact uploads are currently suspended until a portable AppImage/containerized build process is available. Windows release executables continue to be published — uploads run only for `release*` branches).*
 
 Every published release package archive includes:
 - **Executable**: `NaikAVPlayer.exe` (or local native `NaikAVPlayer`)
@@ -469,11 +491,11 @@ Every published release package archive includes:
   - `LICENSE.sdl3` (SDL3 Zlib License)
   - `LICENSE.imgui` (Dear ImGui MIT License)
   - `LICENSE.nfd` (nativefiledialog-extended Zlib License)
-  - `LICENSE.winpthread` (MinGW Winpthread License)
-- **Documentation**: Project `README.md`
+  - `LICENSE.winpthread` (MinGW Winpthread License — retained for locally MinGW-built binaries; not applicable to the MSVC release build above)
+- **Documentation**: `README.md` and `help.md`
 - **Assets**: Fonts and icons in `assets/`
 
-Automated CI package compliance verification asserts that all executable, library, documentation, and license files are present before publishing artifacts.
+Automated CI package compliance verification asserts that the executable, `LICENSE`, `README.md`, `help.md`, and non-empty `licenses/` **and** `LICENSES/` directories are all present before publishing artifacts.
 
 ---
 
