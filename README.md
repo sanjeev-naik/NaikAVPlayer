@@ -16,11 +16,22 @@ NaikAVPlayer is a native, multi-threaded C++17 media engine and video player bui
 - **Stall-Proof Pipeline Backpressure:** Producer threads never block indefinitely on a full queue — bounded-wait pushes fall back to dropping the oldest queued item once a timeout elapses, so a paused audio device, a stalled render loop, or a wedged decoder can never freeze the single demuxer thread that feeds both the video and audio queues.
 - **Dynamic Hardware Decoder Fallback:** Tries platform-specific hardware decoders (D3D11VA, DXVA2, QSV, CUVID on Windows; V4L2M2M, VAAPI, QSV, CUVID on Linux), falling back dynamically to software H.264 decoding if hardware context allocation fails or encounters runtime surface mapping errors.
 - **Sub-10ms Audio-Video Synchronization:** Reconstructs the audio clock sample-accurately from PCM sample offsets to maintain A/V drift under 10ms.
+- **Multichannel Audio Preservation:** Reads the source stream's real channel layout and drives 2.1/5.1/5.1(back)/7.1 straight through to a matching SDL3 multichannel device instead of always downmixing to stereo, with a device-native-channel check that flags when the OS is silently downmixing anyway, and a manual Auto / Force Stereo / Virtual Surround override.
+- **Virtual Surround & 3D Spatial Audio:** `VIRTUAL_SURROUND` folds a discrete 2.1/5.1/5.1(back)/7.1 source down to stereo with positional delay/filter cues (`SpatialDownmixer`) instead of a flat downmix, so surround content stays spatial on headphones/stereo speakers; a separate "3D Surround" ambience synthesizer (`Surround3D`) adds a similar spatial feel to any plain stereo source, and a mid-side Stereo Widener adjusts the perceived image width independently of either.
+- **Studio DSP Chain:** Live-adjustable true parametric 5-band EQ (frequency, Q, and gain all independently adjustable per band), a noise gate/expander, a soft-knee full-band compressor plus an independent 3-band multiband compressor (two crossover-split bands, each with its own threshold/ratio), a lookahead peak limiter (delay-line based, so the gain envelope reduces *ahead of* fast transients instead of only clamping after the fact), and a Linkwitz-Riley bass-management crossover — LFE tone control by default, with an optional true bass-redirect mode that highpasses every other channel and sums exactly what was removed into the LFE channel. A left/right balance control and 9 presets (see below) round out the chain. Runs on a float-internal signal path — every stage is a true no-op until explicitly configured.
+- **EBU R128 Loudness Normalization — Real-Time, Two-Pass, or Tag-Based:** Real-time integrated/momentary LUFS metering with a smoothed gain correction toward a configurable target. A file is also pre-scanned once (decode-only, no video, no device I/O) before playback starts and on seek, so the correct gain applies from the very first sample instead of ramping in — see `naikav::dsp::prescanIntegratedLufs()`. When a file already carries a ReplayGain or EBU R128 gain tag (`REPLAYGAIN_TRACK_GAIN`/`R128_TRACK_GAIN`, from taggers like `mp3gain`/`rsgain`/`loudgain` or the encoder itself), that's used instead — no decoding needed at all, and at least as accurate since it's exactly what already measured the whole file. See `naikav::dsp::readTaggedLoudnessAsLufs()`.
+- **Automatic Genre-Based Presets (opt-in):** When enabled, reads a file's genre tag on open and applies a matching preset (e.g. "Podcast"/"Speech" → Podcast, "Soundtrack" → Cinema) via simple keyword matching — see `naikav::dsp::presetForGenreTag()`.
+- **Real-Time Spectrum Analyzer:** Opt-in FFT-based magnitude spectrum visualizer (`SpectrumAnalyzer`, 1024-point hand-rolled radix-2 FFT, Hann-windowed, frame-smoothed) in the Audio Processing panel, reading the final post-DSP-chain signal — display only, never modifies the audio.
+- **High-Quality Resampling & Dither:** libsoxr resampling engine (in place of swresample's default), with a user-facing Low/Medium/High/Very High quality selector (soxr's `precision` bits-of-precision option), plus triangular (TPDF) dither applied only at the final truncation. Resampler buffering latency is handled explicitly, so raising the quality tier never trades clean audio for precision.
+- **Audio Underrun Instrumentation:** Always-on counters (M10-M12) track how often the SDL audio callback has to emit silence because no samples were available — the direct, quantitative measure of playback glitching, and the signal `SDL_GetAudioStreamQueued()` cannot provide in this architecture. A standalone smoke test (`tests/audio_underrun_smoke.cpp`) drives the real audio path against a real file and attributes any underrun to a specific cause.
+- **Selectable Output Format & Device:** 16-bit integer (default), 32-bit integer, or 32-bit float device output (the internal pipeline is always float — 32-bit float skips dithering/truncation entirely), and a playback device picker (`AudioDecoder::enumeratePlaybackDeviceNames()`) instead of always using the OS default device.
+- **DSP Presets & Persistent Settings:** One-click Flat / Music / Cinema / Night / Podcast / Gaming / Live / Bass Boost / Vocal Boost presets for the whole audio chain, all settings (resolution, DSP, loudness, output format/device, channel selection) surviving restarts via `player_settings.txt`.
 - **Dynamic Resolution Scaling:** Real-time playback scaling supporting dynamic output resolution selection (Original source, 360p, 480p, 720p, 1080p, 1440p, 4K) from the UI dropdown to optimize GPU upload bandwidth.
 - **Software Volume Attenuation:** Scalable audio output level adjustments with memcpy/memset bypasses for 100% and 0% volume states.
 - **Loop Playback:** Wraparound seek to 0.0 upon reaching end-of-file for continuous playback.
 - **Native File Picker:** Cross-platform native file picker integration using `nativefiledialog-extended` (NFD) on Win32 and GTK3/Portal backends.
 - **Pipeline Diagnostics & System Info HUD:** Real-time overlay (`--metrics` or `D` key) displaying active player states, media telemetry (native vs. playback resolution, pixel format, hardware vs. software decoder type), Color & HDR pipeline characteristics (Color Space, Primaries, TRC, Range, Chroma Subsampling, Bit Depth, HDR10/HDR10+/Dolby Vision/HLG standard), pipeline queue depth levels, decode/render frame pacing budgets, and rolling clock synchronization offsets.
+- **Audio Processing Panel:** Dedicated overlay (`A` key) for the full DSP chain (EQ, noise gate, compressor, multiband compressor, limiter, crossover, loudness, 3D surround, widener, balance), a live FFT spectrum visualizer, plus channel/output-device/bit-depth/resampler-quality selection, separate from the diagnostics HUD.
 - **Translucent User Interface:** ImGui-based desktop interface using bundled Noto Sans typography.
 
 ---
@@ -28,6 +39,22 @@ NaikAVPlayer is a native, multi-threaded C++17 media engine and video player bui
 ## Architecture
 
 NaikAVPlayer follows a multi-threaded media player design with decoupled worker threads coordinated through bounded thread-safe queues and an audio-master clock reference.
+
+### Source Layout
+
+Sources are grouped by subsystem under `src/`, and headers are included by that path (e.g. `#include "audio/dsp/DspChain.hpp"`):
+
+```text
+src/
+├── app/       main.cpp — entry point, SDL window/event loop, render loop, CLI flags
+├── audio/     AudioDecoder.{hpp,cpp} — decode, resample, SDL callback, output selectors
+│   └── dsp/   header-only DSP module (see Audio DSP & Loudness Pipeline below)
+├── core/      ThreadSafeQueue.hpp, MetricRing.hpp, PipelineMetrics.hpp
+├── media/     Demuxer.{hpp,cpp} — packet reading and routing
+├── player/    PlayerController.{hpp,cpp} — state machine, seeking, settings persistence
+├── ui/        PlayerUI.{hpp,cpp} — ImGui controls dock, diagnostics HUD, audio panel
+└── video/     VideoDecoder.{hpp,cpp} — HW/SW decode, frame conversion
+```
 
 ### Thread Model
 
@@ -51,6 +78,8 @@ NaikAVPlayer follows a multi-threaded media player design with decoupled worker 
   ┌───────────────────────────┐  ┌───────────────────────────┐
   │   Video Decoder Thread    │  │   Audio Decoder Callback  │
   │    (HW / SW Fallback)     │  │   (SDL3 Audio Thread)     │
+  │Decode -> Convert -> Queue │  │ Resample(soxr)->DSP Chain │
+  │  (GPU-Mapped YUV Planes)  │  │  ->Loudness->Dither->S16  │
   └─────────────┬─────────────┘  └─────────────┬─────────────┘
                 │ decoded frames               │ PCM Audio & PTS
                 ▼                              ▼
@@ -75,7 +104,7 @@ NaikAVPlayer follows a multi-threaded media player design with decoupled worker 
 
 - **Demuxer Thread**: Reads raw packets via `av_read_frame` and routes them into bounded `ThreadSafeQueue<AVPacket*>` instances (video capacity: 100 packets, audio capacity: 150 packets). Pushes never block indefinitely — see [Stall-Proof Queue Backpressure](#stall-proof-queue-backpressure-deadlock-prevention) below.
 - **Video Decoder Thread**: Background worker thread that pops packets from the video queue, decodes them (via hardware or software fallback), converts frames, and pushes them into the bounded `m_decodedFrameQueue` (capacity: 8 frames), using the same bounded-wait backpressure.
-- **Audio Decoding**: Executed sample-accurately inside the SDL3 Audio Stream callback thread. It pulls packets from the audio queue, decodes them to PCM, resamples as necessary via `swr_convert`, and feeds the output stream buffer.
+- **Audio Decoding**: Executed sample-accurately inside the SDL3 Audio Stream callback thread. It pulls packets from the audio queue, decodes them, resamples to the output layout/rate as interleaved float (`swr_convert`, libsoxr engine), runs the DSP chain and loudness normalization in place, then dithers and truncates to the device's 16-bit format — see [Audio DSP & Loudness Pipeline](#audio-dsp--loudness-pipeline) below.
 - **Main / Render Thread**: Dequeues decoded frames from `m_decodedFrameQueue` whose PTS matches the master clock time, updates the SDL YUV texture on the GPU, and renders the Dear ImGui interface overlay.
 
 #### GPU-Mapped Planar YUV Uploads
@@ -100,6 +129,69 @@ audio_clock = base_pts_of_current_frame + (bytes_already_consumed_by_SDL / bytes
 ```
 
 `AudioDecoder::getAudioClock()` combines the PTS of the current frame with the progress of the SDL audio stream callback into that frame's buffer, delivering sub-frame timing resolution to maintain `<10ms` drift. When no audio stream is present, the engine falls back to a wall-clock `m_videoClock` driven by `std::chrono::steady_clock` deltas.
+
+### Multichannel Output & Channel Selection
+
+`AudioDecoder` reads the source stream's real `AVCodecContext::ch_layout` and, for layouts it can drive directly (2.1, 5.1, 5.1(back), 7.1), requests a matching multichannel `SDL_AudioSpec` instead of always downmixing to stereo. If the audio device rejects the surround request, it falls back to a stereo downmix automatically rather than failing playback.
+
+> [!NOTE]
+> A successful device open does **not** by itself prove real multichannel speakers are connected — Windows/Linux audio APIs accept a high channel-count request in shared mode and silently downmix it to whatever the physical device actually supports. NaikAVPlayer also queries the device's *native* channel count (`SDL_GetAudioDeviceFormat`) and surfaces both numbers side by side in the Audio Processing panel (`A` key), flagging when a layout labeled "5.1" is actually being downmixed by the OS. Users who know their real output is stereo can force it explicitly via the panel's Output Channels selector (`Auto` / `Force Stereo`); the choice is persisted across sessions and takes effect on the next file opened (changing channel count requires reopening the audio device, so it isn't hot-swapped mid-playback).
+
+### Audio DSP & Loudness Pipeline
+
+Every decoded audio buffer passes through a fixed, in-place signal chain inside the SDL3 audio callback, entirely on interleaved float samples (not the final 16-bit output format) so each stage has full headroom and precision before the very last truncation step:
+
+```text
+Decode (FFmpeg)
+     │
+     ▼
+Resample to output rate/layout (swresample, libsoxr engine)
+     │   (a 0-sample result here means the resampler is still
+     │    buffering — decode another frame, never emit silence)
+     ▼
+DSP Chain  ── Parametric EQ (5-band biquad, freq/Q/gain all adjustable)
+           ──► Noise Gate (downward expander below threshold)
+           ──► Compressor (soft-knee, linked multichannel)
+           ──► Multiband Compressor (3 bands, 2 crossover splits)
+           ──► Limiter (lookahead delay line + fast attack, hard-ceiling backstop)
+           ──► Bass-Management Crossover (Linkwitz-Riley 4th-order:
+               LFE lowpass, optional highpass + redirect on other channels)
+     │
+     ▼
+Loudness Normalization (EBU R128; real-time smoothed gain, a
+whole-file prescan, or a ReplayGain/R128 tag primes the gain)
+     │
+     ▼
+3D Surround synthesis ──► Stereo Widener ──► Balance (final output-width/pan stage)
+     │
+     ▼
+Spectrum Analyzer (display tap -- reads the signal, never modifies it)
+     │
+     ▼
+Final safety limiter (always-on backstop)
+     │
+     ▼
+TPDF Dither → device-format truncation (16-bit int / 32-bit int / 32-bit float) → SDL3 device output
+```
+
+- **Float-internal, dither only at the end:** `swr_convert` outputs `AV_SAMPLE_FMT_FLT`, not the device format — every DSP stage runs at full float precision, with quantization noise (triangular/TPDF dither) introduced exactly once, at the final truncation. 32-bit float output skips that truncation/dither step entirely (see [Selectable Output Format & Device](#key-features) above).
+- **Zero cost when disabled:** default settings (0 dB EQ, gate/compressor/multiband ratio 1:1, 0 dB limiter ceiling, loudness off) make each stage a true no-op — enabling the chain doesn't change the sound, or add measurable overhead, until something is actually configured.
+- **True parametric EQ:** each of the 5 bands has independently adjustable center frequency, Q (bandwidth), and gain — not just gain around a fixed set of frequencies.
+- **Noise gate:** a downward expander below threshold (the mirror of the compressor), with fast-open/slow-close attack-release and its own short detector-smoothing stage so a sustained tone's own zero-crossings don't chatter the gate.
+- **Multiband compressor:** splits into low/mid/high bands via two Linkwitz-Riley crossover points and compresses each independently, so taming one frequency range doesn't drag the others down with it the way the single full-band compressor does.
+- **Lookahead limiter:** holds a short (a few milliseconds) internal delay line so the gain-reduction envelope has time to react *before* a fast transient reaches the output, rather than only clamping it after the fact once it's already passed through at full level.
+- **True bass management, optionally:** the crossover's LFE lowpass is always available; enabling bass redirect additionally highpasses every non-LFE channel and sums exactly the content removed from each into the LFE channel, for setups where the main/surround speakers can't reproduce bass well.
+- **Live, thread-safe control:** `AudioDecoder::applyDspSettings()` lets the UI thread update every parameter (EQ bands, gate, compressor, multiband, limiter, crossover, loudness target, surround/widener/balance) while the SDL audio callback thread concurrently processes audio — both sides are guarded by one short-held mutex, so switching presets never blocks or glitches playback.
+- **EBU R128 via FFmpeg, not a hand-rolled meter:** loudness measurement uses FFmpeg's own `ebur128` `libavfilter` filter (a minimal `abuffer → ebur128 → abuffersink` graph, reading momentary/integrated LUFS back via frame metadata) rather than a custom K-weighting/gating implementation — spec-compliance for loudness numbers matters in a way DSP *effects* don't.
+- **Two-pass loudness priming:** `naikav::dsp::prescanIntegratedLufs()` decodes a file's whole audio stream once (no video, no device output) to get a stable whole-file LUFS figure before playback begins, which primes the real-time normalizer to the correct gain immediately — avoiding both the multi-second startup ramp and the reset-to-zero-gain a plain real-time meter would otherwise hit on every seek.
+- **ReplayGain/R128 tag priming, when present:** `naikav::dsp::readTaggedLoudnessAsLufs()` checks for `R128_TRACK_GAIN`/`REPLAYGAIN_TRACK_GAIN` (and their `_ALBUM_` fallbacks) before falling back to the decode-based prescan above — no decoding needed at all when the tag is already there.
+- **Spectrum analyzer:** `SpectrumAnalyzer` downmixes the final signal to mono, accumulates it into a ring buffer, and runs a hand-rolled 1024-point radix-2 FFT every full block (~21ms at 48kHz), Hann-windowed and frame-to-frame smoothed for a stable display. A read-only tap (via a self-synchronized snapshot getter, no shared locking needed) -- it never touches the signal it's analyzing.
+- **Presets & persistence:** Flat / Music / Cinema / Night / Podcast / Gaming / Live / Bass Boost / Vocal Boost presets (Audio Processing panel, `A` key) apply a canned combination of every parameter in one step, optionally auto-selected by a file's genre tag; all settings persist to `player_settings.txt` across sessions.
+
+> [!NOTE]
+> **Not implemented (deliberately scoped out):**
+> - **HRTF/binaural rendering** — the existing "3D Surround"/Virtual Surround features are hand-rolled ambience/positional-cue synthesis, explicitly *not* real HRTF (no licensed decoder or measured head-related impulse response data involved, and this project doesn't vendor one). Real HRTF rendering needs an actual measured HRIR dataset (e.g. MIT KEMAR, SADIE, CIPIC) to convolve against, which is a data/licensing decision for a future contribution, not something fabricated here.
+> - **Gapless playback & crossfade** — both need a real playlist/track-queue engine, which doesn't exist yet (NaikAVPlayer is currently a single-file player). A meaningful gapless/crossfade implementation is a larger architectural addition (queue management, cross-instance `AudioDecoder` handoff, a crossfade DSP stage) than the rest of the DSP chain above and is left for a future iteration.
 
 ### State Machine Transitions
 * **`UNINITIALIZED`**: Initial state. Loading media starts background demuxing and transitions to `OPENED`.
@@ -155,6 +247,7 @@ sudo apt-get install -y \
   libavutil-dev \
   libswscale-dev \
   libswresample-dev \
+  libavfilter-dev \
   libgtk-3-dev \
   libxss-dev \
   libasound2-dev \
@@ -289,7 +382,11 @@ To build native Windows 64-bit `.exe` binaries on a Linux workstation:
    cmake --build build-windows -j$(nproc)
    ```
 
-> **Advanced Build Flags**: Additional CMake options such as `-DENABLE_SANITIZERS=ON` (ASan/UBSan), `-DENABLE_TSAN=ON` (ThreadSanitizer), `RelWithDebInfo`, and `MinSizeRel` are fully supported for analysis across build configurations.
+> **Advanced Build Flags**: Additional CMake options are supported for analysis across build configurations:
+> `-DENABLE_SANITIZERS=ON` (ASan/UBSan, default `OFF`), `-DENABLE_TSAN=ON` (ThreadSanitizer, default `OFF`),
+> `-DTREAT_WARNINGS_AS_ERRORS=OFF` (`-Werror`, default `ON`), `-DENABLE_COVERAGE=OFF` (gcov/lcov
+> instrumentation, default `ON`), `-DNAIKAV_FORCE_BUNDLED_FFMPEG=OFF` (use the system FFmpeg instead of the
+> downloaded prebuilt one), plus the `RelWithDebInfo` and `MinSizeRel` build types.
 
 ---
 
@@ -325,6 +422,16 @@ sudo cmake --build build --target uninstall
 ./build/NaikAVPlayer --metrics "/home/user/Videos/video.mp4"
 ```
 
+**Launch with console log output (Windows):**
+```bash
+./build/NaikAVPlayer.exe --console "/home/user/Videos/video.mp4"
+```
+The Windows build is a GUI-subsystem executable with no console of its own, so
+its log output is discarded by default. `--console` attaches it to the terminal
+that launched it. Opt-in by design: automatic console attachment at startup
+matches a console-hiding pattern that generic antivirus heuristics flag. No
+effect when launched by double-click, and ignored on Linux.
+
 ### Keyboard Controls
 
 | Key | Action |
@@ -334,6 +441,7 @@ sudo cmake --build build --target uninstall
 | **`Right Arrow`** | Seek forward by 10 seconds |
 | **`L`** | Toggle Loop Mode |
 | **`D`** | Toggle Diagnostics HUD & Telemetry Metrics |
+| **`A`** | Toggle Audio Processing Panel (EQ, Noise Gate, Compressor, Multiband, Limiter, Crossover, Loudness, Surround, Balance, Channel/Device/Format Selection) |
 | **`Escape`** | Exit Application |
 
 ---
@@ -348,6 +456,18 @@ This means SDL3 was compiled with only its `dummy`/`disk` audio drivers, because
 
 This is expected on Raspberry Pi 5 and is not a bug. The Pi 5's SoC (BCM2712) only exposes a hardware **HEVC/H.265** decode block (`rpi-hevc-dec`, visible as `/dev/video19`); unlike the Pi 4 (BCM2711), it has **no hardware H.264 M2M decoder**. FFmpeg's `h264_v4l2m2m` decoder therefore can't find a matching V4L2 device, and `NaikAVPlayer`'s [Dynamic Hardware Decoder Fallback](#dynamic-hardware-decoder-fallback) correctly drops to software `h264` decoding, as logged. The Pi 5's Cortex-A76 cores decode 1080p H.264 in software without issue; only very high bitrate/resolution H.264 content may need to be transcoded to HEVC to make use of hardware decode.
 
+### Crackling / clicking audio during otherwise normal playback
+
+Fixed. `swr_convert()` returning **0** — the normal state while the resampler is still filling its internal buffer — was only handled for the `< 0` (genuine error) case. A zero-sample result fell through to setting the internal audio buffer size to zero, which the SDL audio callback cannot distinguish from a starved packet queue, so it wrote a full block of digital silence into a perfectly healthy stream. Each of those blocks is a hard discontinuity in the output: an audible click.
+
+Since libsoxr's internal latency grows with its precision setting, the severity scaled directly with **Resampler Quality**, and it only occurred when the source sample rate differed from the 48 kHz output — so 44.1 kHz content (most music) at the *Very High* tier was the worst case. Measured there: **17.25% of all audio callbacks** emitted silence while the audio packet queue sat at 149/150 the entire time. After the fix: **0.00%**, verified across mono, stereo and 5.1 sources. The always-on underrun counters (M10-M12) that quantify this are described in [help.md Section 8](help.md#8-pipeline-instrumentation--metrics-reference).
+
+### Audio sounds distorted, harsh, or pumping (not clicking)
+
+This is gain staging, not a pipeline defect. Parametric EQ bands overlap and stack — five bands at +6 dB each is roughly **+10 to +15 dB broadband**, not +6 dB — which pushes normal material well past full scale and leaves the limiters in continuous heavy gain reduction. Loudness normalization can apply up to a further +24 dB.
+
+Press **Flat** in the Audio Processing panel, or delete `player_settings.txt` and relaunch. Be aware that the master **Enable Audio Processing** checkbox is not enough on its own: loudness normalization, 3D surround, stereo widener, balance and the spectrum analyzer sit deliberately *outside* it (it gates only EQ / noise gate / compressor / multiband / limiter / crossover), so each has to be disabled separately.
+
 ### Playback freezes / whole system appears to hang after rapid seeking or seeking while paused
 
 Fixed. This was caused by the demuxer thread — the single thread that reads both the video and audio streams — blocking indefinitely on a plain `push()` into the audio packet queue whenever nothing was draining it (audio is muted during a seek catch-up, and stays paused for as long as playback is paused). Once blocked there, it stopped calling `av_read_frame` entirely, so the video packet queue and decoded frame queue also drained to empty and playback appeared to hang. The only thing that used to "fix" it was issuing another seek, which happened to force a queue `clear()` that woke the blocked push. See [Stall-Proof Queue Backpressure](#stall-proof-queue-backpressure-deadlock-prevention) above for the fix — the pipeline now self-recovers from rapid seek storms and paused-seek sequences without any further nudge.
@@ -358,22 +478,24 @@ Fixed. This was caused by the demuxer thread — the single thread that reads bo
 
 Release packages generated and published by the CI/CD pipeline (`NaikAVPlayer-windows-x64`) are validated for full open-source redistribution compliance.
 
-*(Note: Linux release binary artifact uploads are currently suspended until a portable AppImage/containerized build process is available. Windows release executables continue to be published for every release).*
+The Windows release is built with the **native MSVC toolchain on a Windows runner**, not MinGW cross-compiled from Linux: MinGW PE binaries trip generic antivirus heuristics, while MSVC output trips far fewer and supports Control Flow Guard. It links the static CRT (`/MT`), so neither a VC++ redistributable nor MinGW's `libwinpthread` is bundled.
+
+*(Note: Linux release binary artifact uploads are currently suspended until a portable AppImage/containerized build process is available. Windows release executables continue to be published — uploads run only for `release*` branches).*
 
 Every published release package archive includes:
 - **Executable**: `NaikAVPlayer.exe` (or local native `NaikAVPlayer`)
 - **Dynamic Libraries**: Bundled shared libraries (`.dll` or `lib/*.so*`)
 - **Licenses Directory**: Complete `licenses/` and `LICENSES/` folder containing project and third-party license text files:
   - Project `LICENSE` (MIT License)
-  - `LICENSE.lgpl-2.1` & `FFMPEG_CREDITS.txt` (FFmpeg LGPL v2.1+)
+  - `LICENSE.lgpl-3` & `FFMPEG_CREDITS.txt` (FFmpeg LGPL v3 -- this build uses `--enable-version3`; also credits the bundled libsoxr resampler and the `avfilter`/`ebur128` loudness metering it ships)
   - `LICENSE.sdl3` (SDL3 Zlib License)
   - `LICENSE.imgui` (Dear ImGui MIT License)
   - `LICENSE.nfd` (nativefiledialog-extended Zlib License)
-  - `LICENSE.winpthread` (MinGW Winpthread License)
-- **Documentation**: Project `README.md`
+  - `LICENSE.winpthread` (MinGW Winpthread License — retained for locally MinGW-built binaries; not applicable to the MSVC release build above)
+- **Documentation**: `README.md` and `help.md`
 - **Assets**: Fonts and icons in `assets/`
 
-Automated CI package compliance verification asserts that all executable, library, documentation, and license files are present before publishing artifacts.
+Automated CI package compliance verification asserts that the executable, `LICENSE`, `README.md`, `help.md`, and non-empty `licenses/` **and** `LICENSES/` directories are all present before publishing artifacts.
 
 ---
 
@@ -382,7 +504,8 @@ Automated CI package compliance verification asserts that all executable, librar
 NaikAVPlayer is released under the **[MIT License](LICENSE)**.
 
 Third-party component licensing:
-- **FFmpeg** (n8.1.2): Licensed under **LGPL v2.1+**
+- **FFmpeg** (n8.1.2): Licensed under **LGPL v3** (this vendored build was compiled with `--enable-version3`; see [`licenses/FFMPEG_CREDITS.txt`](licenses/FFMPEG_CREDITS.txt) and [`licenses/LICENSE.lgpl-3`](licenses/LICENSE.lgpl-3))
+- **libsoxr** (SoX Resampler, bundled inside the FFmpeg build above): Licensed under **LGPL v2.1+** — used as swresample's resampling engine; see [`licenses/FFMPEG_CREDITS.txt`](licenses/FFMPEG_CREDITS.txt) for details. Not shipped as a separate DLL, and licensed independently of the LGPL v3 term above (it wasn't compiled with any GPLv3-requiring option).
 - **SDL3** (v3.4.0): Licensed under the **Zlib License**
 - **Dear ImGui** (v1.91.9): Licensed under the **MIT License**
 - **nativefiledialog-extended** (v1.2.1): Licensed under the **Zlib License**

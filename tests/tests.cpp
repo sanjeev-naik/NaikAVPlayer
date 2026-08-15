@@ -6,9 +6,11 @@
 #include <cmath>
 #include <vector>
 #include <cstdlib>
+#include <cstdio>
 #include <atomic>
 #include <mutex>
 #include <sstream>
+#include <numeric>
 
 class ExpectedErrorRedirector {
 private:
@@ -68,6 +70,9 @@ static std::atomic<bool> force_sws_context_fail{false};
 static std::atomic<bool> force_read_eof{false};
 
 static std::atomic<bool> force_zero_channels{false};
+static std::atomic<bool> force_channel_layout_5_1{false};
+static std::atomic<bool> force_channel_layout_2_1{false};
+static std::atomic<bool> force_sdl_reject_surround{false};
 static std::atomic<bool> force_sdl_init_fail{false};
 static std::atomic<bool> open_finished{false};
 static std::atomic<int> packet_alloc_count{0};
@@ -110,6 +115,28 @@ inline int mock_avcodec_open2(AVCodecContext* avctx, const AVCodec* codec, AVDic
 #else
             avctx->channels = 0;
             avctx->channel_layout = 0;
+#endif
+        }
+        if (force_channel_layout_5_1) {
+            // Pretend the source is a 5.1 stream regardless of what the real
+            // (stereo) test asset actually decodes as, so the channel-layout
+            // resolution logic can be tested without a real 5.1 fixture.
+#if LIBAVUTIL_VERSION_MAJOR >= 57
+            av_channel_layout_uninit(&avctx->ch_layout);
+            av_channel_layout_from_mask(&avctx->ch_layout, AV_CH_LAYOUT_5POINT1);
+#else
+            avctx->channels = 6;
+            avctx->channel_layout = AV_CH_LAYOUT_5POINT1;
+#endif
+        }
+        if (force_channel_layout_2_1) {
+            // Same idea as force_channel_layout_5_1, for a 2.1 (stereo + LFE) source.
+#if LIBAVUTIL_VERSION_MAJOR >= 57
+            av_channel_layout_uninit(&avctx->ch_layout);
+            av_channel_layout_from_mask(&avctx->ch_layout, AV_CH_LAYOUT_2POINT1);
+#else
+            avctx->channels = 3;
+            avctx->channel_layout = AV_CH_LAYOUT_2POINT1;
 #endif
         }
     }
@@ -202,6 +229,7 @@ inline int mock_avcodec_parameters_to_context(AVCodecContext* codec, const AVCod
 
 inline SDL_AudioStream* mock_SDL_OpenAudioDeviceStream(SDL_AudioDeviceID devid, const SDL_AudioSpec* spec, SDL_AudioStreamCallback callback, void* userdata) {
     if (force_sdl_audio_fail) return nullptr;
+    if (force_sdl_reject_surround && spec && spec->channels > 2) return nullptr;
 #if defined(__linux__)
     // On Linux CI/headless environments, avoid initializing real ALSA audio subsystem to prevent system driver leaks
     (void)devid;
@@ -301,10 +329,10 @@ inline bool mock_SDL_Init(SDL_InitFlags flags) {
 // Direct C++ sources inclusion with private visibility bypass
 // -------------------------------------------------------------
 #define private public
-#include "../src/PlayerController.cpp"
-#include "../src/Demuxer.cpp"
-#include "../src/VideoDecoder.cpp"
-#include "../src/AudioDecoder.cpp"
+#include "player/PlayerController.cpp"
+#include "media/Demuxer.cpp"
+#include "video/VideoDecoder.cpp"
+#include "audio/AudioDecoder.cpp"
 #undef private
 
 // Simple assert helper
@@ -1092,6 +1120,119 @@ int real_main(int argc, char* argv[]) {
         avcodec_parameters_free(&paramsSdlFail);
         force_sdl_audio_fail = false;
 
+        // 11b. Multichannel (5.1) source: output layout should be preserved,
+        // not forced down to stereo, when the device accepts it.
+        force_channel_layout_5_1 = true;
+        AVCodecParameters* params51 = avcodec_parameters_alloc();
+        if (controller.m_demuxer && controller.m_demuxer->getAudioCodecParams()) {
+            avcodec_parameters_copy(params51, controller.m_demuxer->getAudioCodecParams());
+        }
+        AudioDecoder audio51(params51, {1, 48000}, 0, controller.m_audioQueue);
+        test_assert(audio51.init(), "AudioDecoder initializes on a 5.1 source");
+        test_assert(audio51.getOutputChannelCount() == 6,
+                    "5.1 source preserves 6-channel output instead of downmixing to stereo");
+        // FFmpeg's av_channel_layout_describe() names the AV_CH_LAYOUT_5POINT1
+        // (side-surround) mask "5.1(side)", reserving plain "5.1" for the
+        // back-surround variant -- match its actual naming, not an assumed one.
+        test_assert(audio51.getOutputChannelLayoutName() == "5.1(side)",
+                    "5.1 source reports '5.1(side)' as the resolved output layout name");
+        // Whatever the real device reports (0 if the query failed/no
+        // device), it must never be negative -- just confirms the
+        // SDL_GetAudioDeviceFormat query path doesn't misbehave.
+        test_assert(audio51.getDeviceNativeChannels() >= 0,
+                    "getDeviceNativeChannels() returns a sane (non-negative) value");
+        avcodec_parameters_free(&params51);
+
+        // 11b2. Same 5.1 source, but with AudioChannelOption::FORCE_STEREO
+        // set before init(): must downmix regardless of the source layout
+        // and regardless of what the device would have accepted.
+        AVCodecParameters* params51Forced = avcodec_parameters_alloc();
+        if (controller.m_demuxer && controller.m_demuxer->getAudioCodecParams()) {
+            avcodec_parameters_copy(params51Forced, controller.m_demuxer->getAudioCodecParams());
+        }
+        AudioDecoder audio51Forced(params51Forced, {1, 48000}, 0, controller.m_audioQueue);
+        audio51Forced.setChannelOption(AudioChannelOption::FORCE_STEREO);
+        test_assert(audio51Forced.init(), "AudioDecoder initializes on a 5.1 source with FORCE_STEREO set");
+        test_assert(audio51Forced.getOutputChannelCount() == 2,
+                    "FORCE_STEREO downmixes a 5.1 source to stereo despite the source having 5.1");
+        test_assert(audio51Forced.getOutputChannelLayoutName() == "stereo",
+                    "FORCE_STEREO reports 'stereo' as the resolved output layout name");
+        avcodec_parameters_free(&params51Forced);
+        force_channel_layout_5_1 = false;
+
+        // 11c. Multichannel source but the device/driver only accepts stereo
+        // (e.g. an unconfigured surround sink): must fall back to a working
+        // stereo stream instead of failing audio entirely.
+        force_channel_layout_5_1 = true;
+        force_sdl_reject_surround = true;
+        AVCodecParameters* params51Fallback = avcodec_parameters_alloc();
+        if (controller.m_demuxer && controller.m_demuxer->getAudioCodecParams()) {
+            avcodec_parameters_copy(params51Fallback, controller.m_demuxer->getAudioCodecParams());
+        }
+        AudioDecoder audio51Fallback(params51Fallback, {1, 48000}, 0, controller.m_audioQueue);
+        test_assert(audio51Fallback.init(),
+                    "AudioDecoder falls back to stereo (not a hard failure) when the device rejects surround");
+        test_assert(audio51Fallback.getOutputChannelCount() == 2,
+                    "Stereo-only device forces output channel count back to 2 after surround rejection");
+        test_assert(audio51Fallback.getOutputChannelLayoutName() == "stereo",
+                    "Stereo fallback reports 'stereo' as the resolved output layout name");
+        avcodec_parameters_free(&params51Fallback);
+        force_channel_layout_5_1 = false;
+        force_sdl_reject_surround = false;
+
+        // 11d. 2.1 (stereo + LFE) source: also preserved directly, not
+        // downmixed to plain stereo (which would silently drop the LFE).
+        force_channel_layout_2_1 = true;
+        AVCodecParameters* params21 = avcodec_parameters_alloc();
+        if (controller.m_demuxer && controller.m_demuxer->getAudioCodecParams()) {
+            avcodec_parameters_copy(params21, controller.m_demuxer->getAudioCodecParams());
+        }
+        AudioDecoder audio21(params21, {1, 48000}, 0, controller.m_audioQueue);
+        test_assert(audio21.init(), "AudioDecoder initializes on a 2.1 source");
+        test_assert(audio21.getOutputChannelCount() == 3,
+                    "2.1 source preserves 3-channel output (stereo + LFE) instead of dropping the LFE channel");
+        test_assert(audio21.getOutputChannelLayoutName() == "2.1",
+                    "2.1 source reports '2.1' as the resolved output layout name");
+        avcodec_parameters_free(&params21);
+        force_channel_layout_2_1 = false;
+
+        // 11e. Same 5.1 source, but with AudioChannelOption::VIRTUAL_SURROUND:
+        // must preserve the surround layout internally (for the reported
+        // layout name and the LFE crossover) while always landing on a
+        // genuine 2-channel device stream, with the spatial downmix active.
+        force_channel_layout_5_1 = true;
+        AVCodecParameters* params51Virtual = avcodec_parameters_alloc();
+        if (controller.m_demuxer && controller.m_demuxer->getAudioCodecParams()) {
+            avcodec_parameters_copy(params51Virtual, controller.m_demuxer->getAudioCodecParams());
+        }
+        AudioDecoder audio51Virtual(params51Virtual, {1, 48000}, 0, controller.m_audioQueue);
+        audio51Virtual.setChannelOption(AudioChannelOption::VIRTUAL_SURROUND);
+        test_assert(audio51Virtual.init(), "AudioDecoder initializes on a 5.1 source with VIRTUAL_SURROUND set");
+        test_assert(audio51Virtual.getOutputChannelCount() == 2,
+                    "VIRTUAL_SURROUND always lands on a 2-channel device stream");
+        test_assert(audio51Virtual.isVirtualSurroundActive(),
+                    "VIRTUAL_SURROUND reports the spatial downmix as active for a supported surround source");
+        test_assert(audio51Virtual.getOutputChannelLayoutName() == "5.1(side)",
+                    "VIRTUAL_SURROUND still reports the internal surround layout name being folded down");
+        avcodec_parameters_free(&params51Virtual);
+        force_channel_layout_5_1 = false;
+
+        // 11f. VIRTUAL_SURROUND on a source that ISN'T one of the directly
+        // supported surround layouts (the plain-stereo test asset): nothing
+        // to virtualize, so it must behave exactly like AUTO/stereo.
+        AVCodecParameters* paramsStereoVirtual = avcodec_parameters_alloc();
+        if (controller.m_demuxer && controller.m_demuxer->getAudioCodecParams()) {
+            avcodec_parameters_copy(paramsStereoVirtual, controller.m_demuxer->getAudioCodecParams());
+        }
+        AudioDecoder audioStereoVirtual(paramsStereoVirtual, {1, 48000}, 0, controller.m_audioQueue);
+        audioStereoVirtual.setChannelOption(AudioChannelOption::VIRTUAL_SURROUND);
+        test_assert(audioStereoVirtual.init(), "AudioDecoder initializes on a stereo source with VIRTUAL_SURROUND set");
+        test_assert(audioStereoVirtual.getOutputChannelCount() == 2,
+                    "VIRTUAL_SURROUND on an already-stereo source stays at 2 channels");
+        test_assert(!audioStereoVirtual.isVirtualSurroundActive(),
+                    "VIRTUAL_SURROUND has nothing to fold down for an already-stereo source");
+        avcodec_parameters_free(&paramsStereoVirtual);
+
         // 12. Demuxer finds no video/audio streams path
         force_no_streams = true;
         PlayerController noStreamsController;
@@ -1340,6 +1481,52 @@ int real_main(int argc, char* argv[]) {
             testEndController.stop();
         }
 
+        }
+
+        // -------------------------------------------------------------
+        // H2. Reopen a file on an already-used PlayerController (the
+        // "load a new video while one is already open/playing" user
+        // flow) -- never exercised anywhere else in this suite; every
+        // other openFile() call above uses a freshly-constructed
+        // PlayerController.
+        // -------------------------------------------------------------
+        {
+            bool reopenSuccess = controller.openFile(testFile);
+            test_assert(reopenSuccess, "Reopening a file on an already-used PlayerController succeeds");
+            controller.play();
+            drive_playback(controller, 0.5);
+            test_assert(controller.getState() == PlayerState::PLAYING, "State is PLAYING after reopening and playing");
+        }
+
+        // -------------------------------------------------------------
+        // H3. TEMP DEBUG REPRO: open files with genuinely different
+        // channel layouts back-to-back on the same PlayerController.
+        // -------------------------------------------------------------
+        {
+            const char* channelTestFile = std::getenv("NAIKAV_CHANNEL_TEST_FILE");
+            const char* mono51TestFile = std::getenv("NAIKAV_51_TEST_FILE");
+            if (channelTestFile && mono51TestFile) {
+                std::cout << "[REPRO] Opening stereo file..." << std::endl;
+                test_assert(controller.openFile(testFile), "[REPRO] stereo open");
+                controller.play();
+                drive_playback(controller, 0.3);
+
+                std::cout << "[REPRO] Opening mono file..." << std::endl;
+                test_assert(controller.openFile(channelTestFile), "[REPRO] mono open");
+                controller.play();
+                drive_playback(controller, 0.3);
+
+                std::cout << "[REPRO] Opening 5.1 file..." << std::endl;
+                test_assert(controller.openFile(mono51TestFile), "[REPRO] 5.1 open");
+                controller.play();
+                drive_playback(controller, 0.3);
+
+                std::cout << "[REPRO] Opening stereo file again..." << std::endl;
+                test_assert(controller.openFile(testFile), "[REPRO] stereo open again");
+                controller.play();
+                drive_playback(controller, 0.3);
+                std::cout << "[REPRO] All reopen cycles completed without crashing." << std::endl;
+            }
         }
 
         // -------------------------------------------------------------
@@ -2014,6 +2201,1654 @@ int main(int argc, char* argv[]) {
             test_assert(!info.isHDR, "ColorInfo default HDR flag");
             test_assert(info.hdrType == "SDR", "ColorInfo default HDR type");
             std::cout << "ColorPipelineInfo Unit Test passed!" << std::endl;
+        }
+
+        // -------------------------------------------------------------
+        // Phase 2b: DSP Chain Unit Tests (Biquad / ParametricEQ /
+        // Compressor / Limiter / Crossover / DspChain)
+        // -------------------------------------------------------------
+        {
+            std::cout << "Running DSP chain unit tests..." << std::endl;
+            constexpr double kSR = 48000.0;
+
+            auto genSine = [&](double freqHz, int numFrames, int channels, float amplitude, int targetChannel = -1) {
+                std::vector<float> buf(static_cast<size_t>(numFrames) * channels, 0.0f);
+                for (int f = 0; f < numFrames; ++f) {
+                    float sample = amplitude * static_cast<float>(std::sin(2.0 * M_PI * freqHz * f / kSR));
+                    for (int ch = 0; ch < channels; ++ch) {
+                        if (targetChannel < 0 || ch == targetChannel) {
+                            buf[static_cast<size_t>(f) * channels + ch] = sample;
+                        }
+                    }
+                }
+                return buf;
+            };
+            auto peakOfChannel = [&](const std::vector<float>& buf, int channels, int ch, int startFrame, int numFrames) {
+                float peak = 0.0f;
+                for (int f = startFrame; f < startFrame + numFrames; ++f) {
+                    peak = std::max(peak, std::fabs(buf[static_cast<size_t>(f) * channels + ch]));
+                }
+                return peak;
+            };
+
+            // --- Biquad ---
+            {
+                naikav::dsp::Biquad flat;
+                flat.setPeaking(1000.0, 1.0, 0.0, kSR); // 0 dB gain = identity
+                float maxDiff = 0.0f;
+                for (int i = 0; i < 2000; ++i) {
+                    float x = static_cast<float>(std::sin(2.0 * M_PI * 1000.0 * i / kSR));
+                    float y = flat.process(x);
+                    maxDiff = std::max(maxDiff, std::fabs(y - x));
+                }
+                test_assert(maxDiff < 0.01f, "Biquad: 0dB peaking band is near-identity");
+
+                naikav::dsp::Biquad lp;
+                lp.setLowpass(200.0, 0.70710678f, kSR);
+                double lowInRms = 0.0, lowOutRms = 0.0, highInRms = 0.0, highOutRms = 0.0;
+                int settle = 4000, measure = 2000;
+                for (int i = 0; i < settle + measure; ++i) {
+                    float xLow = static_cast<float>(std::sin(2.0 * M_PI * 50.0 * i / kSR));
+                    float yLow = lp.process(xLow);
+                    if (i >= settle) { lowInRms += xLow * xLow; lowOutRms += yLow * yLow; }
+                }
+                naikav::dsp::Biquad lp2;
+                lp2.setLowpass(200.0, 0.70710678f, kSR);
+                for (int i = 0; i < settle + measure; ++i) {
+                    float xHigh = static_cast<float>(std::sin(2.0 * M_PI * 8000.0 * i / kSR));
+                    float yHigh = lp2.process(xHigh);
+                    if (i >= settle) { highInRms += xHigh * xHigh; highOutRms += yHigh * yHigh; }
+                }
+                double lowRatio = std::sqrt(lowOutRms / lowInRms);
+                double highRatio = std::sqrt(highOutRms / highInRms);
+                test_assert(lowRatio > 0.9, "Biquad lowpass: 50Hz passes through a 200Hz cutoff mostly unattenuated");
+                test_assert(highRatio < 0.1, "Biquad lowpass: 8kHz is strongly attenuated by a 200Hz cutoff");
+            }
+
+            // --- ParametricEQ ---
+            {
+                naikav::dsp::ParametricEQ eq;
+                eq.configure(2, kSR); // all bands default to 0 dB
+                auto flatBuf = genSine(1000.0, 4000, 2, 0.5f);
+                auto flatOriginal = flatBuf;
+                eq.process(flatBuf.data(), 4000);
+                double maxDiff = 0.0;
+                for (size_t i = 0; i < flatBuf.size(); ++i) {
+                    maxDiff = std::max(maxDiff, static_cast<double>(std::fabs(flatBuf[i] - flatOriginal[i])));
+                }
+                test_assert(maxDiff < 0.01, "ParametricEQ: default (all bands 0dB) is near-identity");
+
+                naikav::dsp::ParametricEQ eqBoost;
+                eqBoost.configure(1, kSR);
+                eqBoost.setBandGainDb(2, 12.0f); // band 2 = 1000 Hz center
+                test_assert(std::fabs(eqBoost.getBandGainDb(2) - 12.0f) < 0.001f, "ParametricEQ: band gain getter matches setter");
+                int settle = 2000, measure = 2000;
+                double inRms = 0.0, outRms = 0.0;
+                for (int i = 0; i < settle + measure; ++i) {
+                    float x = 0.2f * static_cast<float>(std::sin(2.0 * M_PI * 1000.0 * i / kSR));
+                    float frame[1] = {x};
+                    eqBoost.process(frame, 1);
+                    if (i >= settle) { inRms += x * x; outRms += frame[0] * frame[0]; }
+                }
+                double ratioDb = 20.0 * std::log10(std::sqrt(outRms / inRms));
+                test_assert(ratioDb > 8.0, "ParametricEQ: +12dB band boost measurably raises level at its center frequency");
+
+                // --- True parametric behavior: frequency and Q are
+                // independently adjustable, not just gain. ---
+                naikav::dsp::ParametricEQ eqMove;
+                eqMove.configure(1, kSR);
+                eqMove.setBandFrequencyHz(2, 3000.0);
+                eqMove.setBandQ(2, 2.0);
+                eqMove.setBandGainDb(2, 12.0f);
+                test_assert(std::fabs(eqMove.getBandFrequencyHz(2) - 3000.0) < 0.001,
+                            "ParametricEQ: band frequency getter matches setter");
+                test_assert(std::fabs(eqMove.getBandQ(2) - 2.0) < 0.001,
+                            "ParametricEQ: band Q getter matches setter");
+
+                // A band moved to 3kHz should now boost a 3kHz tone, not
+                // the 1kHz tone it used to be centered on.
+                double movedInRms = 0.0, movedOutRms = 0.0;
+                for (int i = 0; i < settle + measure; ++i) {
+                    float x = 0.2f * static_cast<float>(std::sin(2.0 * M_PI * 3000.0 * i / kSR));
+                    float frame[1] = {x};
+                    eqMove.process(frame, 1);
+                    if (i >= settle) { movedInRms += x * x; movedOutRms += frame[0] * frame[0]; }
+                }
+                double movedRatioDb = 20.0 * std::log10(std::sqrt(movedOutRms / movedInRms));
+                test_assert(movedRatioDb > 8.0,
+                            "ParametricEQ: moving a band's frequency to 3kHz measurably boosts a 3kHz tone");
+
+                // The same band should now leave the *old* 1kHz center
+                // (near) untouched, since it moved away.
+                naikav::dsp::ParametricEQ eqMove2;
+                eqMove2.configure(1, kSR);
+                eqMove2.setBandFrequencyHz(2, 3000.0);
+                eqMove2.setBandGainDb(2, 12.0f);
+                double oldCenterInRms = 0.0, oldCenterOutRms = 0.0;
+                for (int i = 0; i < settle + measure; ++i) {
+                    float x = 0.2f * static_cast<float>(std::sin(2.0 * M_PI * 1000.0 * i / kSR));
+                    float frame[1] = {x};
+                    eqMove2.process(frame, 1);
+                    if (i >= settle) { oldCenterInRms += x * x; oldCenterOutRms += frame[0] * frame[0]; }
+                }
+                double oldCenterRatioDb = 20.0 * std::log10(std::sqrt(oldCenterOutRms / oldCenterInRms));
+                test_assert(oldCenterRatioDb < 3.0,
+                            "ParametricEQ: after moving a band away from 1kHz, a 1kHz tone is no longer significantly boosted");
+            }
+
+            // --- Compressor ---
+            {
+                naikav::dsp::Compressor comp;
+                comp.configure(1, kSR); // default ratio 1:1 = true no-op
+                auto buf = genSine(200.0, 2000, 1, 0.9f);
+                auto original = buf;
+                comp.process(buf.data(), 2000);
+                double maxDiff = 0.0;
+                for (size_t i = 0; i < buf.size(); ++i) {
+                    maxDiff = std::max(maxDiff, static_cast<double>(std::fabs(buf[i] - original[i])));
+                }
+                test_assert(maxDiff < 1e-5, "Compressor: default ratio 1:1 is a true no-op regardless of input level");
+
+                naikav::dsp::Compressor comp2;
+                comp2.configure(1, kSR);
+                comp2.setThresholdDb(-20.0f);
+                comp2.setRatio(4.0f);
+                comp2.setKneeDb(0.0f);
+                comp2.setAttackMs(5.0f);
+                comp2.setReleaseMs(50.0f);
+                int total = 20000;
+                std::vector<float> loud(total);
+                for (int i = 0; i < total; ++i) {
+                    loud[i] = static_cast<float>(std::sin(2.0 * M_PI * 200.0 * i / kSR)); // 0 dBFS sine
+                }
+                comp2.process(loud.data(), total);
+                float steadyPeak = peakOfChannel(loud, 1, 0, total - 2000, 2000);
+                test_assert(steadyPeak < 0.5f, "Compressor: 4:1 ratio above threshold measurably reduces a 0dBFS signal's steady-state peak");
+            }
+
+            // --- Limiter ---
+            {
+                naikav::dsp::Limiter lim;
+                lim.configure(1, kSR); // default ceiling 0dB = inert (gain-wise) on normal content
+                const int lookahead = lim.getLookaheadFrames();
+                test_assert(lookahead > 0, "Limiter: lookahead delay line is configured to a positive frame count");
+                auto buf = genSine(200.0, 2000, 1, 0.8f);
+                auto original = buf;
+                lim.process(buf.data(), 2000);
+                // Gain-wise inert (0dB ceiling never engages), but the
+                // lookahead delay line still shifts every sample later by
+                // exactly getLookaheadFrames() -- compare against that
+                // shifted reference instead of assuming zero latency.
+                double maxDiff = 0.0;
+                for (int i = lookahead; i < 2000; ++i) {
+                    maxDiff = std::max(maxDiff, static_cast<double>(std::fabs(buf[i] - original[i - lookahead])));
+                }
+                test_assert(maxDiff < 1e-5, "Limiter: default 0dB ceiling is gain-inert (aside from lookahead delay) on a sub-ceiling signal");
+                bool leadingSilence = std::all_of(buf.begin(), buf.begin() + lookahead,
+                                                   [](float s) { return s == 0.0f; });
+                test_assert(leadingSilence, "Limiter: the first getLookaheadFrames() output samples are silence from the empty delay line");
+
+                naikav::dsp::Limiter lim2;
+                lim2.configure(1, kSR);
+                lim2.setCeilingDb(-6.0f);
+                auto loudBuf = genSine(200.0, 4000, 1, 1.0f); // 0 dBFS, well over the -6dB ceiling
+                lim2.process(loudBuf.data(), 4000);
+                float ceilingLinear = std::pow(10.0f, -6.0f / 20.0f);
+                bool everExceeded = std::any_of(loudBuf.begin(), loudBuf.end(), [&](float s) {
+                    return std::fabs(s) > ceilingLinear + 1e-4f;
+                });
+                test_assert(!everExceeded, "Limiter: output never exceeds a lowered ceiling, sample-by-sample, on every sample");
+
+                // Lookahead should let the gain envelope start reducing
+                // *before* a loud transient itself reaches the output. Feed
+                // a quiet run (well under the ceiling on its own) followed
+                // by an abrupt full-scale step, and inspect the delayed
+                // output of the very LAST quiet input sample: on its own,
+                // that sample's amplitude would never need any gain
+                // reduction, but by the time it's finally emitted (delayed
+                // by getLookaheadFrames()), the lookahead window has
+                // already been staring at the incoming loud transient for
+                // a full lookahead window's worth of samples. If the
+                // emitted sample is measurably quieter than its own
+                // (unreduced) input level, that reduction can only have
+                // come from content the limiter hadn't reached yet --
+                // exactly the anti-overshoot mechanism a zero-lookahead
+                // design cannot provide.
+                naikav::dsp::Limiter lookaheadLim;
+                lookaheadLim.configure(1, kSR);
+                lookaheadLim.setCeilingDb(-6.0f);
+                const int lookahead2 = lookaheadLim.getLookaheadFrames();
+
+                const int quietLen = lookahead2 + 20;
+                const int loudLen = lookahead2 + 20;
+                std::vector<float> sig(static_cast<size_t>(quietLen + loudLen), 0.0f);
+                for (int i = 0; i < quietLen; ++i) sig[static_cast<size_t>(i)] = 0.1f; // well under the -6dB ceiling alone
+                for (int i = quietLen; i < quietLen + loudLen; ++i) sig[static_cast<size_t>(i)] = 1.0f; // abrupt full-scale step
+                auto out = sig;
+                lookaheadLim.process(out.data(), static_cast<int>(out.size()));
+
+                float preTransientOut = std::fabs(out[static_cast<size_t>(quietLen - 1 + lookahead2)]);
+                test_assert(preTransientOut < 0.099f,
+                            "Limiter: lookahead measurably reduces gain on a quiet sample immediately preceding a loud transient, before that transient itself is reached");
+            }
+
+            // --- Crossover ---
+            {
+                naikav::dsp::Crossover xover;
+                xover.configure(2, kSR, 1); // channel 1 = target (e.g. LFE)
+                test_assert(!xover.isEnabled(), "Crossover: disabled by default");
+                auto buf = genSine(1000.0, 1000, 2, 0.7f, 1);
+                auto original = buf;
+                xover.process(buf.data(), 1000); // no-op while disabled
+                bool unchanged = (buf == original);
+                test_assert(unchanged, "Crossover: process() is a no-op while disabled");
+
+                naikav::dsp::Crossover xover2;
+                xover2.configure(2, kSR, 1);
+                xover2.setEnabled(true);
+                xover2.setCutoffHz(120.0);
+                int settle = 4000, measure = 2000;
+
+                // High tone (1kHz, well above cutoff): should be strongly attenuated.
+                double highInRms = 0.0, highOutRms = 0.0;
+                for (int i = 0; i < settle + measure; ++i) {
+                    float frame[2] = {0.0f, static_cast<float>(0.6 * std::sin(2.0 * M_PI * 1000.0 * i / kSR))};
+                    float xIn = frame[1];
+                    xover2.process(frame, 1);
+                    if (i >= settle) { highInRms += xIn * xIn; highOutRms += frame[1] * frame[1]; }
+                }
+                double highRatio = std::sqrt(highOutRms / highInRms);
+                test_assert(highRatio < 0.1, "Crossover: 1kHz tone is strongly attenuated by a 120Hz LR4 lowpass");
+
+                // Low tone (30Hz, well below cutoff): should pass through mostly intact.
+                naikav::dsp::Crossover xover3;
+                xover3.configure(2, kSR, 1);
+                xover3.setEnabled(true);
+                xover3.setCutoffHz(120.0);
+                double lowInRms = 0.0, lowOutRms = 0.0;
+                for (int i = 0; i < settle + measure; ++i) {
+                    float frame[2] = {0.0f, static_cast<float>(0.6 * std::sin(2.0 * M_PI * 30.0 * i / kSR))};
+                    float xIn = frame[1];
+                    xover3.process(frame, 1);
+                    if (i >= settle) { lowInRms += xIn * xIn; lowOutRms += frame[1] * frame[1]; }
+                }
+                double lowRatio = std::sqrt(lowOutRms / lowInRms);
+                test_assert(lowRatio > 0.8, "Crossover: 30Hz tone passes a 120Hz LR4 lowpass mostly unattenuated");
+
+                // Non-target channel (0) must never be touched, even while enabled.
+                naikav::dsp::Crossover xover4;
+                xover4.configure(2, kSR, 1);
+                xover4.setEnabled(true);
+                auto chBuf = genSine(1000.0, 500, 2, 0.5f); // both channels carry signal
+                auto chOriginal = chBuf;
+                xover4.process(chBuf.data(), 500);
+                bool channel0Untouched = true;
+                for (int f = 0; f < 500; ++f) {
+                    if (chBuf[static_cast<size_t>(f) * 2 + 0] != chOriginal[static_cast<size_t>(f) * 2 + 0]) {
+                        channel0Untouched = false;
+                        break;
+                    }
+                }
+                test_assert(channel0Untouched, "Crossover: non-target channel is bit-identical, untouched by the LFE filter");
+
+                // --- Bass redirect: true bass management ---
+                naikav::dsp::Crossover xoverRedirect;
+                xoverRedirect.configure(2, kSR, 1); // channel 1 = LFE target
+                xoverRedirect.setEnabled(true);
+                xoverRedirect.setCutoffHz(120.0);
+                test_assert(!xoverRedirect.isBassRedirectEnabled(), "Crossover: bass redirect disabled by default");
+                xoverRedirect.setBassRedirectEnabled(true);
+                test_assert(xoverRedirect.isBassRedirectEnabled(), "Crossover: bass redirect enabled flag getter matches setter");
+
+                // A 30Hz tone (below cutoff) fed only into the main channel
+                // (0) should be highpassed out of that channel and instead
+                // appear in the previously-silent LFE channel (1).
+                double mainInRms = 0.0, mainOutRms = 0.0, lfeOutRms = 0.0;
+                for (int i = 0; i < settle + measure; ++i) {
+                    float frame[2] = {static_cast<float>(0.6 * std::sin(2.0 * M_PI * 30.0 * i / kSR)), 0.0f};
+                    float mainIn = frame[0];
+                    xoverRedirect.process(frame, 1);
+                    if (i >= settle) {
+                        mainInRms += mainIn * mainIn;
+                        mainOutRms += frame[0] * frame[0];
+                        lfeOutRms += frame[1] * frame[1];
+                    }
+                }
+                double mainRatio = std::sqrt(mainOutRms / mainInRms);
+                test_assert(mainRatio < 0.2, "Crossover bass redirect: a 30Hz tone below the cutoff is highpassed out of the main channel");
+                test_assert(lfeOutRms > 0.0, "Crossover bass redirect: the redirected bass appears in the previously-silent LFE channel");
+
+                // A 1kHz tone (above cutoff) on the main channel should
+                // pass its own highpass mostly unattenuated, and must NOT
+                // be redirected into the LFE channel.
+                naikav::dsp::Crossover xoverRedirectHigh;
+                xoverRedirectHigh.configure(2, kSR, 1);
+                xoverRedirectHigh.setEnabled(true);
+                xoverRedirectHigh.setCutoffHz(120.0);
+                xoverRedirectHigh.setBassRedirectEnabled(true);
+                double highMainInRms = 0.0, highMainOutRms = 0.0, highLfeOutRms = 0.0;
+                for (int i = 0; i < settle + measure; ++i) {
+                    float frame[2] = {static_cast<float>(0.6 * std::sin(2.0 * M_PI * 1000.0 * i / kSR)), 0.0f};
+                    float mainIn = frame[0];
+                    xoverRedirectHigh.process(frame, 1);
+                    if (i >= settle) {
+                        highMainInRms += mainIn * mainIn;
+                        highMainOutRms += frame[0] * frame[0];
+                        highLfeOutRms += frame[1] * frame[1];
+                    }
+                }
+                double highMainRatio = std::sqrt(highMainOutRms / highMainInRms);
+                test_assert(highMainRatio > 0.8, "Crossover bass redirect: a 1kHz tone above the cutoff passes the main channel's highpass mostly unattenuated");
+                // A 4th-order lowpass still leaks some residual energy this
+                // many octaves above its cutoff (not literally zero), so
+                // compare against the below-cutoff case's redirected energy
+                // instead of an absolute threshold: it should be several
+                // orders of magnitude smaller, not just "smaller".
+                test_assert(highLfeOutRms < lfeOutRms * 0.001,
+                            "Crossover bass redirect: content above the cutoff is redirected into the LFE channel at far lower energy than content below the cutoff");
+            }
+
+            // --- BalanceControl ---
+            {
+                naikav::dsp::BalanceControl bal;
+                bal.configure(2);
+                test_assert(std::fabs(bal.getBalance()) < 1e-6f, "BalanceControl: centered (0.0) by default");
+
+                std::vector<float> centered = {0.5f, 0.5f, -0.3f, -0.3f};
+                auto centeredOriginal = centered;
+                bal.process(centered.data(), 2);
+                test_assert(centered == centeredOriginal, "BalanceControl: centered balance is a true no-op");
+
+                bal.setBalance(1.0f); // full right
+                test_assert(std::fabs(bal.getBalance() - 1.0f) < 1e-6f, "BalanceControl: balance getter matches setter");
+                std::vector<float> fullRight = {0.5f, 0.5f};
+                bal.process(fullRight.data(), 1);
+                test_assert(fullRight[0] == 0.0f, "BalanceControl: full-right balance silences the left channel");
+                test_assert(fullRight[1] == 0.5f, "BalanceControl: full-right balance leaves the right channel untouched");
+
+                naikav::dsp::BalanceControl balLeft;
+                balLeft.configure(2);
+                balLeft.setBalance(-1.0f); // full left
+                std::vector<float> fullLeft = {0.5f, 0.5f};
+                balLeft.process(fullLeft.data(), 1);
+                test_assert(fullLeft[0] == 0.5f, "BalanceControl: full-left balance leaves the left channel untouched");
+                test_assert(fullLeft[1] == 0.0f, "BalanceControl: full-left balance silences the right channel");
+
+                naikav::dsp::BalanceControl balMulti;
+                balMulti.configure(6); // e.g. 5.1 -- balance is only defined for 2ch
+                balMulti.setBalance(1.0f);
+                std::vector<float> multiBuf(6, 0.25f);
+                auto multiOriginal = multiBuf;
+                balMulti.process(multiBuf.data(), 1);
+                test_assert(multiBuf == multiOriginal, "BalanceControl: no-op for channel counts other than 2");
+            }
+
+            // --- NoiseGate ---
+            {
+                naikav::dsp::NoiseGate gate;
+                gate.configure(1, kSR); // default ratio 1:1 = true no-op
+                auto buf = genSine(200.0, 2000, 1, 0.02f); // quiet, well below any plausible threshold
+                auto original = buf;
+                gate.process(buf.data(), 2000);
+                double maxDiff = 0.0;
+                for (size_t i = 0; i < buf.size(); ++i) {
+                    maxDiff = std::max(maxDiff, static_cast<double>(std::fabs(buf[i] - original[i])));
+                }
+                test_assert(maxDiff < 1e-5, "NoiseGate: default ratio 1:1 is a true no-op regardless of input level");
+
+                naikav::dsp::NoiseGate gate2;
+                gate2.configure(1, kSR);
+                gate2.setThresholdDb(-30.0f);
+                gate2.setRatio(10.0f); // aggressive, close to a hard gate
+                gate2.setAttackMs(1.0f);
+                gate2.setReleaseMs(50.0f);
+                int total = 20000;
+                std::vector<float> quiet(total);
+                for (int i = 0; i < total; ++i) {
+                    quiet[i] = 0.01f * static_cast<float>(std::sin(2.0 * M_PI * 200.0 * i / kSR)); // ~-40dBFS, below -30dB threshold
+                }
+                gate2.process(quiet.data(), total);
+                float steadyPeak = peakOfChannel(quiet, 1, 0, total - 2000, 2000);
+                test_assert(steadyPeak < 0.01f * 0.5f, "NoiseGate: a signal below threshold is measurably attenuated once the envelope settles");
+
+                naikav::dsp::NoiseGate gate3;
+                gate3.configure(1, kSR);
+                gate3.setThresholdDb(-30.0f);
+                gate3.setRatio(10.0f);
+                // The very first ~1ms is a startup transient (both the
+                // envelope and the detector's own level-smoothing state
+                // start at 0/"silent"), not a steady-state reading -- give
+                // it a settle window before measuring, the same convention
+                // Compressor's near-identical test above uses.
+                int gateSettle = 4000, gateMeasure = 4000;
+                auto loudBuf = genSine(200.0, gateSettle + gateMeasure, 1, 0.5f); // well above the -30dB threshold
+                auto loudOriginal = loudBuf;
+                gate3.process(loudBuf.data(), gateSettle + gateMeasure);
+                double loudMaxDiff = 0.0;
+                for (int i = gateSettle; i < gateSettle + gateMeasure; ++i) {
+                    loudMaxDiff = std::max(loudMaxDiff, static_cast<double>(std::fabs(loudBuf[i] - loudOriginal[i])));
+                }
+                test_assert(loudMaxDiff < 0.01, "NoiseGate: a signal above threshold settles to fully open (near-identity)");
+            }
+
+            // --- MultibandCompressor ---
+            {
+                naikav::dsp::MultibandCompressor mb;
+                mb.configure(1, kSR);
+                test_assert(!mb.isEnabled(), "MultibandCompressor: disabled by default");
+                auto buf = genSine(1000.0, 1000, 1, 0.5f);
+                auto original = buf;
+                mb.process(buf.data(), 1000); // no-op while disabled
+                test_assert(buf == original, "MultibandCompressor: process() is a true no-op while disabled");
+
+                // A cascaded LR4 crossover's "sums back flat" property is a
+                // *magnitude/energy* guarantee (an allpass identity: flat
+                // |H(jw)|, but with a frequency-dependent phase rotation
+                // through each crossover point), not sample-for-sample
+                // time-domain identity -- so this has to be checked via
+                // RMS/energy preservation, not a raw per-sample diff, same
+                // idea as the Biquad lowpass RMS-ratio test above.
+                mb.setEnabled(true); // all three bands still at their inert 1:1 ratio
+                int mbSettle = 4000, mbMeasure = 4000;
+                auto buf2 = genSine(1000.0, mbSettle + mbMeasure, 1, 0.5f);
+                auto original2 = buf2;
+                mb.process(buf2.data(), mbSettle + mbMeasure);
+                double inRms = 0.0, outRms = 0.0;
+                for (int i = mbSettle; i < mbSettle + mbMeasure; ++i) {
+                    inRms += static_cast<double>(original2[i]) * original2[i];
+                    outRms += static_cast<double>(buf2[i]) * buf2[i];
+                }
+                double rmsRatio = std::sqrt(outRms / inRms);
+                test_assert(std::fabs(rmsRatio - 1.0) < 0.05,
+                            "MultibandCompressor: enabled with all-default (1:1) band ratios preserves RMS energy (LR crossovers sum flat in magnitude)");
+
+                // Compressing only the low band should tame a low-frequency
+                // tone but leave a high-frequency tone (in a separate,
+                // otherwise-identical instance) unaffected by that band's
+                // compressor.
+                naikav::dsp::MultibandCompressor mbLow;
+                mbLow.configure(1, kSR);
+                mbLow.setEnabled(true);
+                mbLow.setCrossoverFrequencies(250.0, 4000.0);
+                mbLow.low.setThresholdDb(-40.0f);
+                mbLow.low.setRatio(8.0f);
+                int total = 20000;
+                std::vector<float> lowTone(total);
+                for (int i = 0; i < total; ++i) {
+                    lowTone[i] = 0.8f * static_cast<float>(std::sin(2.0 * M_PI * 100.0 * i / kSR)); // below the low/mid split
+                }
+                mbLow.process(lowTone.data(), total);
+                float lowSteadyPeak = peakOfChannel(lowTone, 1, 0, total - 2000, 2000);
+                test_assert(lowSteadyPeak < 0.8f * 0.9f, "MultibandCompressor: compressing only the low band measurably tames a low-frequency tone");
+
+                naikav::dsp::MultibandCompressor mbLowVsHigh;
+                mbLowVsHigh.configure(1, kSR);
+                mbLowVsHigh.setEnabled(true);
+                mbLowVsHigh.setCrossoverFrequencies(250.0, 4000.0);
+                mbLowVsHigh.low.setThresholdDb(-40.0f);
+                mbLowVsHigh.low.setRatio(8.0f);
+                std::vector<float> highTone(total);
+                for (int i = 0; i < total; ++i) {
+                    highTone[i] = 0.8f * static_cast<float>(std::sin(2.0 * M_PI * 8000.0 * i / kSR)); // above the mid/high split
+                }
+                mbLowVsHigh.process(highTone.data(), total);
+                float highSteadyPeak = peakOfChannel(highTone, 1, 0, total - 2000, 2000);
+                test_assert(highSteadyPeak > 0.8f * 0.5f,
+                            "MultibandCompressor: the low band's compressor doesn't touch a high-frequency tone routed to the high band");
+            }
+
+            // --- SpectrumAnalyzer ---
+            {
+                naikav::dsp::SpectrumAnalyzer spec;
+                spec.configure(1, kSR);
+                test_assert(!spec.isEnabled(), "SpectrumAnalyzer: disabled by default");
+
+                auto flatMags = spec.getMagnitudesDb();
+                test_assert(static_cast<int>(flatMags.size()) == naikav::dsp::SpectrumAnalyzer::kNumBins,
+                            "SpectrumAnalyzer: magnitude snapshot has kNumBins entries");
+                bool allAtFloor = std::all_of(flatMags.begin(), flatMags.end(),
+                                               [](float m) { return m == naikav::dsp::SpectrumAnalyzer::kFloorDb; });
+                test_assert(allAtFloor, "SpectrumAnalyzer: magnitudes start at the floor sentinel before any audio is fed");
+
+                // Feeding audio while disabled must not change anything --
+                // matches the rest of this DSP pipeline's "disabled = truly
+                // zero cost" convention.
+                auto silentTone = genSine(1000.0, naikav::dsp::SpectrumAnalyzer::kFftSize * 4, 1, 0.8f);
+                spec.process(silentTone.data(), static_cast<int>(silentTone.size()));
+                auto stillFlat = spec.getMagnitudesDb();
+                test_assert(stillFlat == flatMags, "SpectrumAnalyzer: process() is a true no-op while disabled");
+
+                // Enabled: a steady 1kHz tone should produce a clear peak
+                // at the FFT bin closest to 1kHz, well above the noise
+                // floor elsewhere in the spectrum.
+                spec.setEnabled(true);
+                int toneFreqHz = 1000;
+                int expectedBin = static_cast<int>(std::lround(
+                    static_cast<double>(toneFreqHz) * naikav::dsp::SpectrumAnalyzer::kFftSize / kSR));
+                // Several FFT blocks so the frame-to-frame smoothing settles.
+                auto tone = genSine(toneFreqHz, naikav::dsp::SpectrumAnalyzer::kFftSize * 8, 1, 0.8f);
+                spec.process(tone.data(), static_cast<int>(tone.size()));
+                auto toneMags = spec.getMagnitudesDb();
+
+                int peakBin = 0;
+                float peakMag = toneMags[0];
+                for (int i = 1; i < naikav::dsp::SpectrumAnalyzer::kNumBins; ++i) {
+                    if (toneMags[static_cast<size_t>(i)] > peakMag) {
+                        peakMag = toneMags[static_cast<size_t>(i)];
+                        peakBin = i;
+                    }
+                }
+                test_assert(std::abs(peakBin - expectedBin) <= 1,
+                            "SpectrumAnalyzer: a 1kHz tone's peak bin lands at (or immediately next to) the expected FFT bin");
+
+                // A bin far away from the tone (e.g. near DC) should read
+                // much quieter than the peak.
+                float farBinMag = toneMags[2];
+                test_assert(peakMag - farBinMag > 20.0f,
+                            "SpectrumAnalyzer: the tone's peak bin is measurably (>20dB) louder than a bin far from it");
+
+                test_assert(std::fabs(spec.binFrequencyHz(expectedBin) - toneFreqHz) < (kSR / naikav::dsp::SpectrumAnalyzer::kFftSize),
+                            "SpectrumAnalyzer: binFrequencyHz() reports a frequency within one bin-width of the actual tone");
+
+                spec.reset();
+                auto resetMags = spec.getMagnitudesDb();
+                bool allAtFloorAfterReset = std::all_of(resetMags.begin(), resetMags.end(),
+                                                         [](float m) { return m == naikav::dsp::SpectrumAnalyzer::kFloorDb; });
+                test_assert(allAtFloorAfterReset, "SpectrumAnalyzer: reset() clears the magnitude snapshot back to the floor sentinel");
+            }
+
+            // --- DspChain orchestration ---
+            {
+                naikav::dsp::DspChain chain;
+                chain.configure(2, kSR, -1); // no LFE channel
+                test_assert(!chain.isEnabled(), "DspChain: disabled by default");
+                auto buf = genSine(1000.0, 1000, 2, 0.5f);
+                auto original = buf;
+                chain.process(buf.data(), 1000); // no-op while disabled
+                test_assert(buf == original, "DspChain: process() is a true no-op while disabled");
+
+                chain.setEnabled(true); // all sub-components still at their inert defaults
+                // The chain's Limiter stage still holds a fixed lookahead
+                // delay even at its inert (0dB ceiling) default -- see
+                // Limiter.hpp -- so "near-identity" has to account for that
+                // constant frame shift rather than comparing sample-for-sample.
+                const int lookahead = chain.limiter.getLookaheadFrames();
+                const int numFrames = 4000;
+                auto buf2 = genSine(1000.0, numFrames, 2, 0.5f);
+                auto original2 = buf2;
+                chain.process(buf2.data(), numFrames);
+                double maxDiff = 0.0;
+                for (int f = lookahead; f < numFrames; ++f) {
+                    for (int ch = 0; ch < 2; ++ch) {
+                        size_t outIdx = static_cast<size_t>(f) * 2 + ch;
+                        size_t inIdx = static_cast<size_t>(f - lookahead) * 2 + ch;
+                        maxDiff = std::max(maxDiff, static_cast<double>(std::fabs(buf2[outIdx] - original2[inIdx])));
+                    }
+                }
+                test_assert(maxDiff < 0.01, "DspChain: enabled with all-default (flat/unity/inert) settings is near-identity, aside from the Limiter's fixed lookahead delay");
+            }
+
+            std::cout << "DSP chain unit tests passed!" << std::endl;
+        }
+
+        // -------------------------------------------------------------
+        // Phase 8: Stereo Widener & Spatial (Virtual Surround) Downmixer
+        // Unit Tests
+        // -------------------------------------------------------------
+        {
+            std::cout << "Running stereo widener / spatial downmixer unit tests..." << std::endl;
+            constexpr double kSR = 48000.0;
+
+            // --- StereoWidener ---
+            {
+                naikav::dsp::StereoWidener widener;
+                widener.configure(2);
+                test_assert(!widener.isEnabled(), "StereoWidener: disabled by default");
+
+                std::vector<float> buf = {0.5f, -0.3f, 0.2f, 0.2f, -0.4f, 0.1f};
+                auto original = buf;
+                widener.process(buf.data(), 3);
+                test_assert(buf == original, "StereoWidener: process() is a no-op while disabled");
+
+                widener.setEnabled(true);
+                widener.setWidth(1.0f);
+                std::vector<float> unity = original;
+                widener.process(unity.data(), 3);
+                double maxDiff = 0.0;
+                for (size_t i = 0; i < unity.size(); ++i) {
+                    maxDiff = std::max(maxDiff, static_cast<double>(std::fabs(unity[i] - original[i])));
+                }
+                test_assert(maxDiff < 1e-5, "StereoWidener: width=1.0 is the identity transform");
+
+                naikav::dsp::StereoWidener mono;
+                mono.configure(2);
+                mono.setEnabled(true);
+                mono.setWidth(0.0f);
+                std::vector<float> monoBuf = {0.5f, -0.3f};
+                mono.process(monoBuf.data(), 1);
+                test_assert(std::fabs(monoBuf[0] - monoBuf[1]) < 1e-5f,
+                            "StereoWidener: width=0.0 collapses L/R to identical (mono) samples");
+                float expectedMid = 0.5f * (0.5f + -0.3f);
+                test_assert(std::fabs(monoBuf[0] - expectedMid) < 1e-5f,
+                            "StereoWidener: width=0.0 collapses to the mid (L+R)/2 signal");
+
+                naikav::dsp::StereoWidener wide;
+                wide.configure(2);
+                wide.setEnabled(true);
+                wide.setWidth(2.0f);
+                std::vector<float> wideBuf = {0.5f, -0.3f};
+                wide.process(wideBuf.data(), 1);
+                float widenedDiff = wideBuf[0] - wideBuf[1];
+                float originalDiff = 0.5f - (-0.3f);
+                test_assert(widenedDiff > originalDiff,
+                            "StereoWidener: width>1.0 exaggerates the L/R difference (wider image)");
+
+                naikav::dsp::StereoWidener multi;
+                multi.configure(6); // e.g. 5.1 -- widener is only defined for 2ch
+                multi.setEnabled(true);
+                multi.setWidth(2.0f);
+                std::vector<float> multiBuf(12, 0.25f);
+                auto multiOriginal = multiBuf;
+                multi.process(multiBuf.data(), 2);
+                test_assert(multiBuf == multiOriginal, "StereoWidener: no-op for channel counts other than 2");
+            }
+
+            // --- SpatialDownmixer ---
+            {
+                using SL = naikav::dsp::SpatialDownmixer::SourceLayout;
+
+                naikav::dsp::SpatialDownmixer dm;
+                dm.configure(SL::FIVEPOINT1_SIDE, kSR);
+                test_assert(dm.numSourceChannels() == 6, "SpatialDownmixer: 5.1(side) reports 6 source channels");
+
+                // Front-left-only signal should land almost entirely in the
+                // left output channel (direct route: FL -> gain 1.0 L / 0.0 R).
+                {
+                    int n = 100;
+                    std::vector<float> in(static_cast<size_t>(n) * 6, 0.0f);
+                    for (int f = 0; f < n; ++f) {
+                        in[static_cast<size_t>(f) * 6 + 0] = 0.5f; // FL only
+                    }
+                    std::vector<float> out(static_cast<size_t>(n) * 2, 0.0f);
+                    dm.process(in.data(), n, out.data());
+                    float peakL = 0.0f, peakR = 0.0f;
+                    for (int f = 0; f < n; ++f) {
+                        peakL = std::max(peakL, std::fabs(out[static_cast<size_t>(f) * 2 + 0]));
+                        peakR = std::max(peakR, std::fabs(out[static_cast<size_t>(f) * 2 + 1]));
+                    }
+                    test_assert(peakL > 0.4f, "SpatialDownmixer: front-left source drives the left output channel");
+                    test_assert(peakR < 1e-5f, "SpatialDownmixer: front-left source doesn't leak into the right output channel");
+                }
+
+                // Center-only signal should split evenly between L and R.
+                {
+                    naikav::dsp::SpatialDownmixer dmCenter;
+                    dmCenter.configure(SL::FIVEPOINT1_SIDE, kSR);
+                    int n = 100;
+                    std::vector<float> in(static_cast<size_t>(n) * 6, 0.0f);
+                    for (int f = 0; f < n; ++f) {
+                        in[static_cast<size_t>(f) * 6 + 2] = 0.5f; // FC only
+                    }
+                    std::vector<float> out(static_cast<size_t>(n) * 2, 0.0f);
+                    dmCenter.process(in.data(), n, out.data());
+                    float peakL = 0.0f, peakR = 0.0f;
+                    for (int f = 0; f < n; ++f) {
+                        peakL = std::max(peakL, std::fabs(out[static_cast<size_t>(f) * 2 + 0]));
+                        peakR = std::max(peakR, std::fabs(out[static_cast<size_t>(f) * 2 + 1]));
+                    }
+                    test_assert(std::fabs(peakL - peakR) < 1e-4f,
+                                "SpatialDownmixer: center-channel source splits evenly between L and R");
+                    test_assert(peakL > 0.3f, "SpatialDownmixer: center-channel source is audible in the output");
+                }
+
+                // Side-left-only signal should be delayed (silent for the
+                // first sample) and land louder in L than in R once the
+                // delay line fills.
+                {
+                    naikav::dsp::SpatialDownmixer dmSide;
+                    dmSide.configure(SL::FIVEPOINT1_SIDE, kSR);
+                    int n = static_cast<int>(kSR * 0.02); // 20ms, enough to clear the ~8ms surround delay
+                    std::vector<float> in(static_cast<size_t>(n) * 6, 0.0f);
+                    for (int f = 0; f < n; ++f) {
+                        in[static_cast<size_t>(f) * 6 + 4] = 0.5f; // SL only
+                    }
+                    std::vector<float> out(static_cast<size_t>(n) * 2, 0.0f);
+                    dmSide.process(in.data(), n, out.data());
+
+                    test_assert(out[0] == 0.0f && out[1] == 0.0f,
+                                "SpatialDownmixer: a surround channel's contribution is delayed (silent at frame 0)");
+
+                    float tailPeakL = 0.0f, tailPeakR = 0.0f;
+                    for (int f = n - 100; f < n; ++f) {
+                        tailPeakL = std::max(tailPeakL, std::fabs(out[static_cast<size_t>(f) * 2 + 0]));
+                        tailPeakR = std::max(tailPeakR, std::fabs(out[static_cast<size_t>(f) * 2 + 1]));
+                    }
+                    test_assert(tailPeakL > tailPeakR,
+                                "SpatialDownmixer: a side-left source lands louder in the left ear than the right");
+                    test_assert(tailPeakR > 0.0f,
+                                "SpatialDownmixer: a side-left source still bleeds (quieter) into the right ear");
+                }
+
+                // LFE-only signal should split evenly (non-directional).
+                {
+                    naikav::dsp::SpatialDownmixer dmLfe;
+                    dmLfe.configure(SL::FIVEPOINT1_SIDE, kSR);
+                    int n = 10;
+                    std::vector<float> in(static_cast<size_t>(n) * 6, 0.0f);
+                    for (int f = 0; f < n; ++f) {
+                        in[static_cast<size_t>(f) * 6 + 3] = 0.8f; // LFE only
+                    }
+                    std::vector<float> out(static_cast<size_t>(n) * 2, 0.0f);
+                    dmLfe.process(in.data(), n, out.data());
+                    test_assert(std::fabs(out[0] - out[1]) < 1e-5f,
+                                "SpatialDownmixer: LFE-only source is non-directional (splits evenly)");
+                    test_assert(out[0] > 0.0f, "SpatialDownmixer: LFE-only source is audible in the output");
+                }
+
+                naikav::dsp::SpatialDownmixer dm21;
+                dm21.configure(SL::TWOPOINT1, kSR);
+                test_assert(dm21.numSourceChannels() == 3, "SpatialDownmixer: 2.1 reports 3 source channels");
+
+                naikav::dsp::SpatialDownmixer dm71;
+                dm71.configure(SL::SEVENPOINT1, kSR);
+                test_assert(dm71.numSourceChannels() == 8, "SpatialDownmixer: 7.1 reports 8 source channels");
+            }
+
+            // --- Surround3D ---
+            {
+                naikav::dsp::Surround3D s3d;
+                s3d.configure(2, kSR);
+                test_assert(!s3d.isEnabled(), "Surround3D: disabled by default");
+
+                std::vector<float> buf = {0.5f, -0.3f, 0.2f, 0.2f, -0.4f, 0.1f};
+                auto original = buf;
+                s3d.process(buf.data(), 3);
+                test_assert(buf == original, "Surround3D: process() is a no-op while disabled");
+
+                naikav::dsp::Surround3D s3dZero;
+                s3dZero.configure(2, kSR);
+                s3dZero.setEnabled(true);
+                s3dZero.setIntensity(0.0f);
+                auto zeroBuf = original;
+                s3dZero.process(zeroBuf.data(), 3);
+                test_assert(zeroBuf == original, "Surround3D: process() is a no-op at intensity 0.0 even while enabled");
+
+                naikav::dsp::Surround3D s3dOn;
+                s3dOn.configure(2, kSR);
+                s3dOn.setEnabled(true);
+                s3dOn.setIntensity(1.0f);
+                int n = static_cast<int>(kSR * 0.05); // 50ms, enough to clear both delay taps (15ms/35ms)
+                std::vector<float> in(static_cast<size_t>(n) * 2, 0.0f);
+                for (int f = 0; f < n; ++f) {
+                    // A steady, fully decorrelated (hard-left) signal so the
+                    // synthesized ambience has something nonzero to work with.
+                    in[static_cast<size_t>(f) * 2 + 0] = 0.6f;
+                    in[static_cast<size_t>(f) * 2 + 1] = -0.6f;
+                }
+                auto inOriginal = in;
+                s3dOn.process(in.data(), n);
+
+                bool everDiffered = false;
+                for (size_t i = 0; i < in.size(); ++i) {
+                    if (std::fabs(in[i] - inOriginal[i]) > 1e-6f) {
+                        everDiffered = true;
+                        break;
+                    }
+                }
+                test_assert(everDiffered, "Surround3D: enabled with nonzero intensity measurably alters a decorrelated signal");
+
+                // The injected ambience is added to one ear and subtracted
+                // from the other in exactly equal amounts, so L+R (the mono
+                // downmix) must be preserved exactly, sample-by-sample,
+                // regardless of intensity.
+                bool monoSumPreserved = true;
+                for (int f = 0; f < n; ++f) {
+                    float outSum = in[static_cast<size_t>(f) * 2 + 0] + in[static_cast<size_t>(f) * 2 + 1];
+                    float inSum = inOriginal[static_cast<size_t>(f) * 2 + 0] + inOriginal[static_cast<size_t>(f) * 2 + 1];
+                    if (std::fabs(outSum - inSum) > 1e-4f) {
+                        monoSumPreserved = false;
+                        break;
+                    }
+                }
+                test_assert(monoSumPreserved, "Surround3D: preserves the mono (L+R) sum exactly, adding only decorrelated ambience");
+
+                naikav::dsp::Surround3D s3dMulti;
+                s3dMulti.configure(6, kSR); // e.g. 5.1 -- Surround3D is only defined for 2ch
+                s3dMulti.setEnabled(true);
+                s3dMulti.setIntensity(1.0f);
+                std::vector<float> multiBuf(12, 0.25f);
+                auto multiOriginal = multiBuf;
+                s3dMulti.process(multiBuf.data(), 2);
+                test_assert(multiBuf == multiOriginal, "Surround3D: no-op for channel counts other than 2");
+            }
+
+            // --- Post-limiter overshoot / final safety backstop ---
+            //
+            // SpatialDownmixer, Surround3D, and StereoWidener all run
+            // *after* DspChain's own Limiter in AudioDecoder's real
+            // pipeline (see decodeAndResample()), so nothing upstream
+            // protects against the overshoot each can independently
+            // introduce. These tests reproduce that at the DSP-class
+            // level (no full AudioDecoder/codec setup needed) to prove:
+            // (a) the overshoot is real, and (b) chaining the same
+            // naikav::dsp::Limiter AudioDecoder now runs as a final
+            // safety backstop (m_finalSafetyLimiter) actually contains it.
+            {
+                using SL = naikav::dsp::SpatialDownmixer::SourceLayout;
+
+                // (a) SpatialDownmixer alone: three simultaneously loud
+                // source channels (FL/FC/SL) sum past +/-1.0 -- expected
+                // behavior for a plain gain-sum downmix (a real ITU-R
+                // BS.775-style downmix matrix has the same property), not
+                // a bug in SpatialDownmixer itself.
+                naikav::dsp::SpatialDownmixer dmLoud;
+                dmLoud.configure(SL::FIVEPOINT1_SIDE, kSR);
+                int n = static_cast<int>(kSR * 0.05); // 50ms, clears the ~8ms surround delay
+                std::vector<float> loudIn(static_cast<size_t>(n) * 6, 0.0f);
+                for (int f = 0; f < n; ++f) {
+                    loudIn[static_cast<size_t>(f) * 6 + 0] = 0.95f; // FL
+                    loudIn[static_cast<size_t>(f) * 6 + 2] = 0.95f; // FC
+                    loudIn[static_cast<size_t>(f) * 6 + 4] = 0.95f; // SL
+                }
+                std::vector<float> downmixed(static_cast<size_t>(n) * 2, 0.0f);
+                dmLoud.process(loudIn.data(), n, downmixed.data());
+                const float downmixedPeak = std::accumulate(
+                    downmixed.begin(), downmixed.end(), 0.0f,
+                    [](float acc, float v) { return std::max(acc, std::fabs(v)); });
+                test_assert(downmixedPeak > 1.0f,
+                            "SpatialDownmixer: three simultaneously loud source channels can sum past full scale (no headroom by design)");
+
+                // (b) Chain Surround3D + StereoWidener on top (as
+                // AudioDecoder does), using the shipped Live preset's
+                // settings, which enables both at once and pushes the
+                // overshoot even further.
+                naikav::dsp::AudioDspSettings live = naikav::dsp::makeLivePreset();
+                test_assert(live.surround3dEnabled && live.widenerEnabled,
+                            "Sanity check: the Live preset enables both Surround3D and StereoWidener");
+
+                naikav::dsp::Surround3D s3dChain;
+                s3dChain.configure(2, kSR);
+                s3dChain.setEnabled(true);
+                s3dChain.setIntensity(live.surround3dIntensity);
+                naikav::dsp::StereoWidener widenerChain;
+                widenerChain.configure(2);
+                widenerChain.setEnabled(true);
+                widenerChain.setWidth(live.widenerWidth);
+
+                auto beforeFinalLimiter = downmixed;
+                s3dChain.process(beforeFinalLimiter.data(), n);
+                widenerChain.process(beforeFinalLimiter.data(), n);
+                const float chainedPeak = std::accumulate(
+                    beforeFinalLimiter.begin(), beforeFinalLimiter.end(), 0.0f,
+                    [](float acc, float v) { return std::max(acc, std::fabs(v)); });
+                test_assert(chainedPeak > downmixedPeak,
+                            "Surround3D + StereoWidener measurably add to an already-over-full-scale signal");
+
+                // (c) Append the same final safety backstop AudioDecoder
+                // runs (naikav::dsp::Limiter at a 0dBFS ceiling, matching
+                // m_finalSafetyLimiter's fallback when the user's own
+                // Limiter isn't active): the result must never exceed that
+                // ceiling, however far upstream stages overshot it.
+                naikav::dsp::Limiter finalSafety;
+                finalSafety.configure(2, kSR);
+                finalSafety.setCeilingDb(0.0f);
+                auto afterFinalLimiter = beforeFinalLimiter;
+                finalSafety.process(afterFinalLimiter.data(), n);
+                const float finalPeak = std::accumulate(
+                    afterFinalLimiter.begin(), afterFinalLimiter.end(), 0.0f,
+                    [](float acc, float v) { return std::max(acc, std::fabs(v)); });
+                test_assert(finalPeak <= 1.0001f,
+                            "Final safety Limiter backstop contains overshoot from SpatialDownmixer+Surround3D+StereoWidener within +/-1.0");
+            }
+
+            std::cout << "Stereo widener / spatial downmixer / 3D surround unit tests passed!" << std::endl;
+        }
+
+        // -------------------------------------------------------------
+        // Phase 3: Loudness (EBU R128) Unit Tests
+        // -------------------------------------------------------------
+        {
+            std::cout << "Running loudness normalization unit tests..." << std::endl;
+            constexpr int kSR = 48000;
+            constexpr int kChunk = 1024;
+
+            auto fillSine = [&](std::vector<float>& buf, double freqHz, float amplitude, int startSample, int n) {
+                for (int i = 0; i < n; ++i) {
+                    float s = amplitude * static_cast<float>(std::sin(2.0 * M_PI * freqHz * (startSample + i) / kSR));
+                    buf[static_cast<size_t>(i) * 2] = s;
+                    buf[static_cast<size_t>(i) * 2 + 1] = s;
+                }
+            };
+            auto peakOf = [&](const std::vector<float>& buf, int n) {
+                return std::accumulate(buf.begin(), buf.begin() + n * 2, 0.0f,
+                                        [](float acc, float s) { return std::max(acc, std::fabs(s)); });
+            };
+
+            // --- LoudnessMeter: measures a known signal close to its real LUFS ---
+            {
+                naikav::dsp::LoudnessMeter meter;
+                test_assert(meter.configure(2, kSR), "LoudnessMeter: configure succeeds against the real avfilter graph");
+                test_assert(meter.getIntegratedLufs() <= -70.0, "LoudnessMeter: no reading before any audio is fed");
+
+                std::vector<float> buf(kChunk * 2);
+                int total = kSR; // 1 second of -6dBFS 1kHz sine
+                for (int start = 0; start < total; start += kChunk) {
+                    int n = std::min(kChunk, total - start);
+                    fillSine(buf, 1000.0, 0.5f, start, n);
+                    meter.feed(buf.data(), n);
+                }
+                double measured = meter.getIntegratedLufs();
+                test_assert(measured > -70.0, "LoudnessMeter: produces a real integrated reading after ~1s of audio");
+                // -6dBFS (0.5 linear) at 1kHz should read close to -6 LUFS;
+                // allow a generous tolerance since K-weighting isn't flat.
+                test_assert(std::fabs(measured - (-6.02)) < 2.0,
+                            "LoudnessMeter: -6dBFS 1kHz sine measures close to -6 LUFS");
+
+                meter.reset();
+                test_assert(meter.getIntegratedLufs() <= -70.0, "LoudnessMeter: reset() clears the measurement history");
+            }
+
+            // --- LoudnessNormalizer: inert while disabled ---
+            {
+                naikav::dsp::LoudnessNormalizer norm;
+                norm.configure(2, kSR);
+                test_assert(!norm.isEnabled(), "LoudnessNormalizer: disabled by default");
+
+                std::vector<float> buf(kChunk * 2);
+                fillSine(buf, 1000.0, 0.5f, 0, kChunk);
+                auto original = buf;
+                norm.process(buf.data(), kChunk);
+                test_assert(buf == original, "LoudnessNormalizer: process() is a true no-op while disabled");
+                test_assert(norm.getMeasuredIntegratedLufs() <= -70.0,
+                            "LoudnessNormalizer: doesn't even measure while disabled");
+            }
+
+            // --- LoudnessNormalizer: enabled, measurably corrects toward target ---
+            {
+                naikav::dsp::LoudnessNormalizer norm;
+                norm.configure(2, kSR);
+                norm.setEnabled(true);
+                norm.setTargetLufs(-23.0f); // well below the ~-6 LUFS the test signal measures at
+                test_assert(std::fabs(norm.getTargetLufs() - (-23.0f)) < 0.001f,
+                            "LoudnessNormalizer: target LUFS getter matches setter");
+
+                std::vector<float> buf(kChunk * 2);
+                const float inputAmplitude = 0.5f;
+                int total = kSR * 2; // 2 seconds
+                float lastOutputPeak = 0.0f;
+                for (int start = 0; start < total; start += kChunk) {
+                    int n = std::min(kChunk, total - start);
+                    fillSine(buf, 1000.0, inputAmplitude, start, n);
+                    norm.process(buf.data(), n);
+                    if (start + kChunk >= total) {
+                        lastOutputPeak = peakOf(buf, n);
+                    }
+                }
+                test_assert(lastOutputPeak < inputAmplitude * 0.9f,
+                            "LoudnessNormalizer: measurably attenuates a signal louder than its target");
+                test_assert(norm.getCurrentGainDb() < -1.0f,
+                            "LoudnessNormalizer: applied gain has moved negative toward the quieter target");
+                test_assert(norm.getMeasuredIntegratedLufs() > -70.0,
+                            "LoudnessNormalizer: reports a real measured integrated LUFS once enabled and fed");
+            }
+
+            // --- LoudnessNormalizer: two-pass (prescanned) mode applies
+            // the correct gain immediately, with no ramp-up period ---
+            {
+                naikav::dsp::LoudnessNormalizer norm;
+                norm.configure(2, kSR);
+                norm.setEnabled(true);
+                norm.setTargetLufs(-23.0f);
+                test_assert(!norm.hasPrescannedLoudness(), "LoudnessNormalizer: no prescan primed by default");
+
+                // Prime with a whole-file measurement, as if
+                // naikav::dsp::prescanIntegratedLufs() had already scanned
+                // a -6 LUFS file (matching the LoudnessMeter test above).
+                norm.primeWithPrescannedLufs(-6.0);
+                test_assert(norm.hasPrescannedLoudness(), "LoudnessNormalizer: primeWithPrescannedLufs() marks the instance as primed");
+                test_assert(std::fabs(norm.getMeasuredIntegratedLufs() - (-6.0)) < 0.001,
+                            "LoudnessNormalizer: getMeasuredIntegratedLufs() reports the prescanned value immediately, before any audio is fed");
+
+                float expectedGainDb = -23.0f - (-6.0f); // target - measured
+                test_assert(std::fabs(norm.getCurrentGainDb() - expectedGainDb) < 0.01f,
+                            "LoudnessNormalizer: priming jumps straight to the correct gain, with no ramp-up");
+
+                // The very first block processed should already reflect
+                // the primed gain in full -- unlike the real-time path
+                // above, which ramps in over several seconds.
+                std::vector<float> buf(kChunk * 2);
+                fillSine(buf, 1000.0, 0.5f, 0, kChunk);
+                norm.process(buf.data(), kChunk);
+                float firstBlockPeak = peakOf(buf, kChunk);
+                float expectedGainLinear = std::pow(10.0f, expectedGainDb / 20.0f);
+                float expectedPeak = 0.5f * expectedGainLinear;
+                test_assert(std::fabs(firstBlockPeak - expectedPeak) < 0.01f,
+                            "LoudnessNormalizer: the first processed block already applies the full prescanned gain, with no startup ramp");
+
+                // A seek (reset()) must not drop back to zero gain -- the
+                // prescanned value is still valid for the whole file
+                // regardless of playback position.
+                norm.reset();
+                test_assert(std::fabs(norm.getCurrentGainDb() - expectedGainDb) < 0.01f,
+                            "LoudnessNormalizer: reset() (as called on seek) keeps the primed gain instead of dropping to zero");
+                test_assert(norm.hasPrescannedLoudness(), "LoudnessNormalizer: reset() does not clear the prescanned value");
+
+                norm.clearPrescan();
+                test_assert(!norm.hasPrescannedLoudness(), "LoudnessNormalizer: clearPrescan() reverts to real-time-only measurement");
+            }
+
+            // --- LoudnessPrescan: decodes a real file's whole audio
+            // stream and reports a plausible integrated LUFS ---
+            {
+                double scanned = naikav::dsp::prescanIntegratedLufs(testFile);
+                test_assert(scanned > -70.0, "prescanIntegratedLufs: produces a real reading for the test video's audio track");
+                test_assert(scanned < 0.0, "prescanIntegratedLufs: reports a sane (sub-0dBFS) LUFS value for the test video");
+
+                double missing = naikav::dsp::prescanIntegratedLufs("this_file_does_not_exist.mp4");
+                test_assert(missing <= -70.0, "prescanIntegratedLufs: returns the failure sentinel for a nonexistent file");
+            }
+
+            std::cout << "Loudness normalization unit tests passed!" << std::endl;
+        }
+
+        // -------------------------------------------------------------
+        // AudioDecoder DSP end-to-end integration test.
+        //
+        // Every DSP test above exercises naikav::dsp::* classes directly --
+        // never a real AudioDecoder -- so none of them prove
+        // AudioDecoder::applyDspSettings() actually reaches
+        // decodeAndResample()'s real decode path. This test decodes the
+        // identical sequence of real packets from the test file through
+        // two independent AudioDecoder instances (one DSP-enabled, one
+        // not) and diffs their output float buffers -- reachable here
+        // because of the `#define private public` test-only macro near the
+        // top of this file, which also exposes decodeAndResample() and
+        // m_audioBuffer directly, letting this run deterministically
+        // without depending on real SDL audio device/callback timing.
+        // -------------------------------------------------------------
+        {
+            std::cout << "Running AudioDecoder DSP end-to-end integration test..." << std::endl;
+
+            AVFormatContext* dspFmtCtx = nullptr;
+            AVDictionary* dspOpenOpts = nullptr;
+            av_dict_set(&dspOpenOpts, "protocol_whitelist", "file,pipe", 0);
+            int dspOpenRet = avformat_open_input(&dspFmtCtx, testFile.c_str(), nullptr, &dspOpenOpts);
+            av_dict_free(&dspOpenOpts);
+            test_assert(dspOpenRet >= 0 && dspFmtCtx != nullptr, "DSP integration: raw demux opens the test file");
+
+            if (dspOpenRet >= 0 && dspFmtCtx) {
+                test_assert(avformat_find_stream_info(dspFmtCtx, nullptr) >= 0,
+                            "DSP integration: raw demux finds stream info");
+
+                const AVCodec* dspDummyCodec = nullptr;
+                int dspAudioStreamIdx = av_find_best_stream(dspFmtCtx, AVMEDIA_TYPE_AUDIO, -1, -1, &dspDummyCodec, 0);
+                test_assert(dspAudioStreamIdx >= 0, "DSP integration: test file has a decodable audio stream");
+
+                if (dspAudioStreamIdx >= 0) {
+                    AVStream* dspStream = dspFmtCtx->streams[dspAudioStreamIdx];
+
+                    ThreadSafeQueue<AVPacket*> plainQueue(64);
+                    ThreadSafeQueue<AVPacket*> dspQueue(64);
+                    AudioDecoder plainDecoder(dspStream->codecpar, dspStream->time_base, 0, plainQueue);
+                    AudioDecoder dspDecoder(dspStream->codecpar, dspStream->time_base, 0, dspQueue);
+                    test_assert(plainDecoder.init(), "DSP integration: plain decoder initializes from real codec params");
+                    test_assert(dspDecoder.init(), "DSP integration: DSP decoder initializes from real codec params");
+
+                    naikav::dsp::AudioDspSettings settings;
+                    settings.dspEnabled = true;
+                    settings.eqBandGainDb[0] = 12.0f; // large, unmissable bass boost
+                    settings.compressorEnabled = true;
+                    settings.compressorThresholdDb = -30.0f;
+                    settings.compressorRatio = 8.0f;
+                    dspDecoder.applyDspSettings(settings);
+
+                    // Feed identical real packets, read once from the file,
+                    // to both decoders' queues.
+                    AVPacket* readPkt = av_packet_alloc();
+                    int fed = 0;
+                    while (fed < 60 && av_read_frame(dspFmtCtx, readPkt) >= 0) {
+                        if (readPkt->stream_index == dspAudioStreamIdx) {
+                            plainQueue.push(av_packet_clone(readPkt));
+                            dspQueue.push(av_packet_clone(readPkt));
+                            ++fed;
+                        }
+                        av_packet_unref(readPkt);
+                    }
+                    av_packet_free(&readPkt);
+                    test_assert(fed > 0, "DSP integration: fed real audio packets from the test file to both decoders");
+
+                    // Pull several decoded frames out of each.
+                    // decodeAndResample() is normally invoked by the SDL
+                    // audio callback thread; calling it directly here
+                    // drives the exact same real decode path
+                    // deterministically.
+                    bool everProducedAudio = false;
+                    bool everDiffered = false;
+                    for (int call = 0; call < 30 && !everDiffered; ++call) {
+                        plainDecoder.decodeAndResample();
+                        dspDecoder.decodeAndResample();
+                        if (plainDecoder.m_audioBufferSize == 0 || dspDecoder.m_audioBufferSize == 0) {
+                            continue;
+                        }
+                        everProducedAudio = true;
+                        size_t commonBytes = std::min(plainDecoder.m_audioBufferSize, dspDecoder.m_audioBufferSize);
+                        // m_audioBuffer is byte-typed because it holds whatever
+                        // the device format is; on this path it carries the
+                        // DSP chain's native float samples, and the vector's
+                        // allocator satisfies float alignment. Reading it back
+                        // as float is exactly what the audio callback does.
+                        // cppcheck-suppress invalidPointerCast
+                        const float* plainSamples = reinterpret_cast<const float*>(plainDecoder.m_audioBuffer.data());
+                        // cppcheck-suppress invalidPointerCast
+                        const float* dspSamples = reinterpret_cast<const float*>(dspDecoder.m_audioBuffer.data());
+                        for (size_t i = 0; i < commonBytes / sizeof(float); ++i) {
+                            if (std::fabs(plainSamples[i] - dspSamples[i]) > 1e-4f) {
+                                everDiffered = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    test_assert(everProducedAudio, "DSP integration: real packets actually decode into non-empty audio buffers");
+                    test_assert(everDiffered,
+                                "DSP integration: applyDspSettings() measurably changes decodeAndResample()'s real decoded output -- the EQ/compressor chain actually runs on live decoded audio, not just in isolated DSP-class tests");
+
+                    // Drain and free any packets neither decoder consumed
+                    // (e.g. if fewer than 30 frames' worth were needed) --
+                    // ThreadSafeQueue's destructor aborts the queue but
+                    // doesn't free contained pointers.
+                    AVPacket* leftover = nullptr;
+                    while (plainQueue.try_pop(leftover)) av_packet_free(&leftover);
+                    while (dspQueue.try_pop(leftover)) av_packet_free(&leftover);
+                }
+
+                avformat_close_input(&dspFmtCtx);
+            }
+
+            std::cout << "AudioDecoder DSP end-to-end integration test passed!" << std::endl;
+        }
+
+        // -------------------------------------------------------------
+        // Phase 7: Audio DSP Settings Persistence (Config File) Test
+        // -------------------------------------------------------------
+        {
+            std::cout << "Testing audio DSP settings persistence..." << std::endl;
+
+            // PlayerController's constructor loads player_settings.txt from the
+            // current working directory, so a file left behind by a real app run
+            // (or by an earlier run of this very test) would make the "defaults
+            // to ..." assertions below read someone else's saved state. Start
+            // from a known-clean directory, and don't leave a file behind either.
+            struct SettingsFileGuard {
+                SettingsFileGuard()  { std::remove("player_settings.txt"); }
+                ~SettingsFileGuard() { std::remove("player_settings.txt"); }
+            } settingsFileGuard;
+
+            naikav::dsp::AudioDspSettings testSettings = naikav::dsp::makeCinemaPreset();
+            testSettings.eqBandGainDb[1] = 3.25f; // distinctive, non-preset value
+            testSettings.eqBandFreqHz[1] = 315.0f;  // distinctive, non-default band frequency
+            testSettings.eqBandQ[1] = 1.4f;         // distinctive, non-default band Q
+            testSettings.widenerEnabled = true;
+            testSettings.widenerWidth = 1.75f; // distinctive, non-default value
+            testSettings.surround3dEnabled = true;
+            testSettings.surround3dIntensity = 1.35f; // distinctive, non-default value
+            testSettings.crossoverBassRedirectEnabled = true; // distinctive, non-default value
+            testSettings.balance = -0.4f; // distinctive, non-default value
+            testSettings.noiseGateEnabled = true;
+            testSettings.noiseGateThresholdDb = -35.0f;
+            testSettings.noiseGateRatio = 6.0f;
+            testSettings.multibandEnabled = true;
+            testSettings.multibandLowMidHz = 300.0f;
+            testSettings.multibandMidHighHz = 3500.0f;
+            testSettings.multibandLowThresholdDb = -25.0f;
+            testSettings.multibandLowRatio = 2.5f;
+            testSettings.multibandMidThresholdDb = -22.0f;
+            testSettings.multibandMidRatio = 1.5f;
+            testSettings.multibandHighThresholdDb = -18.0f;
+            testSettings.multibandHighRatio = 3.5f;
+            testSettings.autoGenrePresetEnabled = true;
+            testSettings.spectrumAnalyzerEnabled = true;
+
+            {
+                PlayerController writer;
+                writer.setAudioDspSettings(testSettings);
+                writer.persistAudioDspSettings();
+                test_assert(writer.getAudioDspSettings() == testSettings,
+                            "setAudioDspSettings() applies immediately (in-memory)");
+
+                test_assert(writer.getAudioChannelOption() == AudioChannelOption::AUTO,
+                            "AudioChannelOption defaults to AUTO");
+                writer.setAudioChannelOption(AudioChannelOption::FORCE_STEREO);
+                test_assert(writer.getAudioChannelOption() == AudioChannelOption::FORCE_STEREO,
+                            "setAudioChannelOption() applies immediately (in-memory)");
+
+                test_assert(writer.getOutputBitDepth() == AudioOutputBitDepth::BIT_16,
+                            "OutputBitDepth defaults to BIT_16");
+                writer.setOutputBitDepth(AudioOutputBitDepth::BIT_32_FLOAT);
+                test_assert(writer.getOutputBitDepth() == AudioOutputBitDepth::BIT_32_FLOAT,
+                            "setOutputBitDepth() applies immediately (in-memory)");
+
+                test_assert(writer.getOutputDeviceName().empty(), "OutputDeviceName defaults to empty (system default)");
+                writer.setOutputDeviceName("Distinctive Test Device");
+                test_assert(writer.getOutputDeviceName() == "Distinctive Test Device",
+                            "setOutputDeviceName() applies immediately (in-memory)");
+
+                test_assert(writer.getResamplerQuality() == ResamplerQuality::MEDIUM,
+                            "ResamplerQuality defaults to MEDIUM");
+                writer.setResamplerQuality(ResamplerQuality::VERY_HIGH);
+                test_assert(writer.getResamplerQuality() == ResamplerQuality::VERY_HIGH,
+                            "setResamplerQuality() applies immediately (in-memory)");
+            }
+
+            {
+                PlayerController reader;
+                test_assert(reader.getAudioDspSettings() == testSettings,
+                            "AudioDspSettings round-trips through player_settings.txt across instances");
+                test_assert(reader.getAudioChannelOption() == AudioChannelOption::FORCE_STEREO,
+                            "AudioChannelOption round-trips through player_settings.txt across instances");
+                test_assert(reader.getOutputBitDepth() == AudioOutputBitDepth::BIT_32_FLOAT,
+                            "OutputBitDepth round-trips through player_settings.txt across instances");
+                test_assert(reader.getOutputDeviceName() == "Distinctive Test Device",
+                            "OutputDeviceName round-trips through player_settings.txt across instances");
+                test_assert(reader.getResamplerQuality() == ResamplerQuality::VERY_HIGH,
+                            "ResamplerQuality round-trips through player_settings.txt across instances");
+            }
+
+            // A settings file predating DSP settings (just a bare resolution
+            // integer, no '=' signs) must still load without crashing or
+            // corrupting DSP settings -- see loadSettings()'s legacy-format
+            // fallback.
+            {
+                std::ofstream legacy("player_settings.txt");
+                legacy << "3";
+                legacy.close();
+
+                PlayerController legacyReader;
+                test_assert(legacyReader.getResolutionOption() == ResolutionOption::R_720P,
+                            "Legacy (bare-integer) settings file still loads the resolution correctly");
+                test_assert(legacyReader.getAudioDspSettings() == naikav::dsp::AudioDspSettings{},
+                            "Legacy settings file leaves DSP settings at their defaults");
+                test_assert(legacyReader.getAudioChannelOption() == AudioChannelOption::AUTO,
+                            "Legacy settings file leaves AudioChannelOption at AUTO");
+                test_assert(legacyReader.getOutputBitDepth() == AudioOutputBitDepth::BIT_16,
+                            "Legacy settings file leaves OutputBitDepth at BIT_16");
+                test_assert(legacyReader.getOutputDeviceName().empty(),
+                            "Legacy settings file leaves OutputDeviceName empty");
+                test_assert(legacyReader.getResamplerQuality() == ResamplerQuality::MEDIUM,
+                            "Legacy settings file leaves ResamplerQuality at MEDIUM");
+            }
+
+            std::cout << "Audio DSP settings persistence test passed!" << std::endl;
+        }
+
+        // -------------------------------------------------------------
+        // ReplayGain/R128 tag reading, genre-based preset mapping, and
+        // output format/device/resampler-quality selector tests.
+        // -------------------------------------------------------------
+        {
+            std::cout << "Running ReplayGain tag / genre preset / output selector tests..." << std::endl;
+
+            // --- readTaggedLoudnessAsLufs ---
+            {
+                AVDictionary* dict = nullptr;
+                av_dict_set(&dict, "R128_TRACK_GAIN", "-1234", 0); // Q7.8: -1234/256 dB
+                double lufs = 0.0;
+                bool found = naikav::dsp::readTaggedLoudnessAsLufs(dict, nullptr, lufs);
+                test_assert(found, "readTaggedLoudnessAsLufs: finds R128_TRACK_GAIN");
+                double expectedGainDb = -1234.0 / 256.0;
+                test_assert(std::fabs(lufs - (-23.0 - expectedGainDb)) < 0.001,
+                            "readTaggedLoudnessAsLufs: R128_TRACK_GAIN converts to the correct equivalent LUFS (-23 LUFS reference)");
+                av_dict_free(&dict);
+            }
+            {
+                AVDictionary* dict = nullptr;
+                av_dict_set(&dict, "REPLAYGAIN_TRACK_GAIN", "-6.50 dB", 0);
+                double lufs = 0.0;
+                bool found = naikav::dsp::readTaggedLoudnessAsLufs(dict, nullptr, lufs);
+                test_assert(found, "readTaggedLoudnessAsLufs: finds REPLAYGAIN_TRACK_GAIN");
+                test_assert(std::fabs(lufs - (-18.0 - (-6.5))) < 0.001,
+                            "readTaggedLoudnessAsLufs: REPLAYGAIN_TRACK_GAIN converts to the correct equivalent LUFS (-18 LUFS reference)");
+                av_dict_free(&dict);
+            }
+            {
+                // Stream-level metadata is checked before format-level, and
+                // within a dict R128_TRACK_GAIN outranks REPLAYGAIN_TRACK_GAIN.
+                AVDictionary* streamDict = nullptr;
+                av_dict_set(&streamDict, "R128_TRACK_GAIN", "0", 0);
+                AVDictionary* formatDict = nullptr;
+                av_dict_set(&formatDict, "REPLAYGAIN_TRACK_GAIN", "-10.0 dB", 0);
+                double lufs = 0.0;
+                bool found = naikav::dsp::readTaggedLoudnessAsLufs(formatDict, streamDict, lufs);
+                test_assert(found, "readTaggedLoudnessAsLufs: finds a tag when both stream and format metadata have one");
+                test_assert(std::fabs(lufs - (-23.0)) < 0.001,
+                            "readTaggedLoudnessAsLufs: stream-level tag takes priority over format-level tag");
+                av_dict_free(&streamDict);
+                av_dict_free(&formatDict);
+            }
+            {
+                double lufs = 0.0;
+                bool found = naikav::dsp::readTaggedLoudnessAsLufs(nullptr, nullptr, lufs);
+                test_assert(!found, "readTaggedLoudnessAsLufs: returns false when neither dictionary has a usable tag");
+            }
+
+            // --- presetForGenreTag ---
+            {
+                naikav::dsp::AudioDspSettings out;
+                test_assert(naikav::dsp::presetForGenreTag("Rock", out), "presetForGenreTag: 'Rock' matches a preset");
+                test_assert(out == naikav::dsp::makeMusicPreset(), "presetForGenreTag: 'Rock' maps to the Music preset");
+
+                naikav::dsp::AudioDspSettings out2;
+                test_assert(naikav::dsp::presetForGenreTag("PODCAST", out2), "presetForGenreTag: case-insensitive match");
+                test_assert(out2 == naikav::dsp::makePodcastPreset(), "presetForGenreTag: 'PODCAST' maps to the Podcast preset");
+
+                naikav::dsp::AudioDspSettings out3;
+                test_assert(!naikav::dsp::presetForGenreTag("Xyzzy Unrecognized Genre", out3),
+                            "presetForGenreTag: unrecognized genre returns false");
+
+                naikav::dsp::AudioDspSettings out4;
+                test_assert(!naikav::dsp::presetForGenreTag("", out4), "presetForGenreTag: empty genre string returns false");
+            }
+
+            // --- Output format/device/resampler-quality helpers (anonymous-
+            // namespace internals in AudioDecoder.cpp, directly reachable
+            // from this unity-build translation unit) ---
+            {
+                test_assert(sdlFormatFor(AudioOutputBitDepth::BIT_16) == SDL_AUDIO_S16, "sdlFormatFor: BIT_16 maps to SDL_AUDIO_S16");
+                test_assert(sdlFormatFor(AudioOutputBitDepth::BIT_32_INT) == SDL_AUDIO_S32, "sdlFormatFor: BIT_32_INT maps to SDL_AUDIO_S32");
+                test_assert(sdlFormatFor(AudioOutputBitDepth::BIT_32_FLOAT) == SDL_AUDIO_F32, "sdlFormatFor: BIT_32_FLOAT maps to SDL_AUDIO_F32");
+
+                // cppcheck folds these to "always true" by inlining
+                // outputBytesPerSampleFor()'s current body. That is the point:
+                // the assertions pin the depth-to-width mapping so a future
+                // edit to that function fails the suite rather than silently
+                // resizing every audio buffer.
+                // cppcheck-suppress knownConditionTrueFalse
+                test_assert(outputBytesPerSampleFor(AudioOutputBitDepth::BIT_16) == 2, "outputBytesPerSampleFor: BIT_16 is 2 bytes/sample");
+                // cppcheck-suppress knownConditionTrueFalse
+                test_assert(outputBytesPerSampleFor(AudioOutputBitDepth::BIT_32_INT) == 4, "outputBytesPerSampleFor: BIT_32_INT is 4 bytes/sample");
+                // cppcheck-suppress knownConditionTrueFalse
+                test_assert(outputBytesPerSampleFor(AudioOutputBitDepth::BIT_32_FLOAT) == 4, "outputBytesPerSampleFor: BIT_32_FLOAT is 4 bytes/sample");
+
+                test_assert(resamplerPrecisionBitsFor(ResamplerQuality::LOW) == 16.0, "resamplerPrecisionBitsFor: LOW is 16 bits");
+                test_assert(resamplerPrecisionBitsFor(ResamplerQuality::MEDIUM) == 20.0, "resamplerPrecisionBitsFor: MEDIUM is 20 bits (original default)");
+                test_assert(resamplerPrecisionBitsFor(ResamplerQuality::HIGH) == 28.0, "resamplerPrecisionBitsFor: HIGH is 28 bits");
+                test_assert(resamplerPrecisionBitsFor(ResamplerQuality::VERY_HIGH) == 33.0, "resamplerPrecisionBitsFor: VERY_HIGH is 33 bits");
+
+                test_assert(resolveOutputDeviceId("") == SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK,
+                            "resolveOutputDeviceId: empty name resolves to the default device");
+                test_assert(resolveOutputDeviceId("a device name that will never exist 12345") == SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK,
+                            "resolveOutputDeviceId: unknown name falls back to the default device");
+
+                uint32_t ditherState = 0xABCDEF01u;
+                int32_t s32Half = floatToS32Dithered(0.5f, ditherState);
+                test_assert(s32Half > 1000000000 && s32Half < 1100000000, "floatToS32Dithered: 0.5 maps to roughly half of INT32_MAX");
+
+                // Doesn't crash; can't assert non-empty since headless/CI
+                // environments may legitimately report zero playback devices.
+                auto deviceNames = AudioDecoder::enumeratePlaybackDeviceNames();
+                (void)deviceNames;
+            }
+
+            // --- AudioDecoder setter/getter round trips + init() actually
+            // succeeding with a non-default output bit depth ---
+            {
+                AVFormatContext* fmtCtx2 = nullptr;
+                AVDictionary* openOpts2 = nullptr;
+                av_dict_set(&openOpts2, "protocol_whitelist", "file,pipe", 0);
+                int openRet2 = avformat_open_input(&fmtCtx2, testFile.c_str(), nullptr, &openOpts2);
+                av_dict_free(&openOpts2);
+                if (openRet2 >= 0 && fmtCtx2 && avformat_find_stream_info(fmtCtx2, nullptr) >= 0) {
+                    const AVCodec* dummyCodec2 = nullptr;
+                    int audioIdx2 = av_find_best_stream(fmtCtx2, AVMEDIA_TYPE_AUDIO, -1, -1, &dummyCodec2, 0);
+                    if (audioIdx2 >= 0) {
+                        AVStream* stream2 = fmtCtx2->streams[audioIdx2];
+                        ThreadSafeQueue<AVPacket*> dummyQueue(4);
+                        AudioDecoder fmtDecoder(stream2->codecpar, stream2->time_base, 0, dummyQueue);
+
+                        test_assert(fmtDecoder.getOutputBitDepth() == AudioOutputBitDepth::BIT_16,
+                                    "AudioDecoder: output bit depth defaults to BIT_16");
+                        fmtDecoder.setOutputBitDepth(AudioOutputBitDepth::BIT_32_FLOAT);
+                        test_assert(fmtDecoder.getOutputBitDepth() == AudioOutputBitDepth::BIT_32_FLOAT,
+                                    "AudioDecoder: output bit depth getter matches setter");
+
+                        test_assert(fmtDecoder.getOutputDeviceName().empty(),
+                                    "AudioDecoder: output device name empty (system default) by default");
+                        fmtDecoder.setOutputDeviceName("a nonexistent device");
+                        test_assert(fmtDecoder.getOutputDeviceName() == "a nonexistent device",
+                                    "AudioDecoder: output device name getter matches setter");
+                        fmtDecoder.setOutputDeviceName(""); // fall back to the real default device for init() below
+
+                        test_assert(fmtDecoder.getResamplerQuality() == ResamplerQuality::MEDIUM,
+                                    "AudioDecoder: resampler quality defaults to MEDIUM");
+                        fmtDecoder.setResamplerQuality(ResamplerQuality::HIGH);
+                        test_assert(fmtDecoder.getResamplerQuality() == ResamplerQuality::HIGH,
+                                    "AudioDecoder: resampler quality getter matches setter");
+
+                        bool initOk = fmtDecoder.init();
+                        test_assert(initOk, "AudioDecoder: init() succeeds with a 32-bit float output format selected");
+                        if (initOk) {
+                            test_assert(fmtDecoder.m_outputBytesPerSample == 4,
+                                        "AudioDecoder: 32-bit float selection resolves to 4 bytes/sample internally");
+                        }
+                    }
+                }
+                if (fmtCtx2) avformat_close_input(&fmtCtx2);
+            }
+
+            std::cout << "ReplayGain tag / genre preset / output selector tests passed!" << std::endl;
+        }
+
+        // -------------------------------------------------------------
+        // Background loudness prescan: openFile() must not block on the
+        // decode-based prescan. It previously ran synchronously inside
+        // openFile() -- which main.cpp calls directly from its
+        // SDL_EVENT_DROP_FILE handler on the render/event thread -- so a
+        // real (non-trivial-length) file would freeze the entire UI for
+        // however long the whole audio track took to decode, looking
+        // exactly like a crash/hang when opening a new file. Fixed by
+        // moving the decode-based scan to a background thread, applied
+        // via PlayerController::pollPendingLoudnessPrescan().
+        // -------------------------------------------------------------
+        {
+            std::cout << "Running background loudness prescan test..." << std::endl;
+
+            PlayerController prescanController;
+            naikav::dsp::AudioDspSettings loudSettings;
+            loudSettings.dspEnabled = false;
+            loudSettings.loudnessEnabled = true;
+            loudSettings.loudnessTargetLufs = -16.0f;
+            // Applied before openFile() so it's already active at open
+            // time -- matches the real "loudness enabled, then open a
+            // file" flow (e.g. a persisted setting from a previous
+            // session) that triggers the prescan from inside openFile().
+            prescanController.setAudioDspSettings(loudSettings);
+
+            auto openStart = std::chrono::steady_clock::now();
+            bool opened = prescanController.openFile(testFile);
+            auto openElapsed = std::chrono::steady_clock::now() - openStart;
+            test_assert(opened, "Background prescan: file opens successfully with loudness normalization enabled");
+            test_assert(openElapsed < std::chrono::seconds(2),
+                        "Background prescan: openFile() returns quickly, not blocked on the whole-file decode scan");
+
+            // Poll the way main.cpp's event loop does, giving the
+            // background scan a little time to finish.
+            bool primed = false;
+            for (int i = 0; i < 100 && !primed; ++i) {
+                prescanController.pollPendingLoudnessPrescan();
+                if (prescanController.getMeasuredIntegratedLufs() > -70.0) {
+                    primed = true;
+                } else {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                }
+            }
+            test_assert(primed,
+                        "Background prescan: loudness normalizer is primed with a real measurement once "
+                        "the background scan completes and pollPendingLoudnessPrescan() is called");
+
+            // stop() must join the background thread cleanly, even right
+            // after opening (the scan may still be finishing up).
+            prescanController.stop();
+            std::cout << "Background loudness prescan test passed!" << std::endl;
+        }
+
+        // -------------------------------------------------------------
+        // DEBUG REPRO: open a series of genuinely different real media
+        // files back-to-back on the same PlayerController, WITH real
+        // hardware decoding enabled (unlike the rest of this suite, which
+        // forces g_disableHardwareDecoders = true) -- reproducing the
+        // actual "open different media file multiple times" user flow as
+        // closely as possible outside of the real GUI event loop. Gated
+        // behind an env var so it only runs on demand.
+        // -------------------------------------------------------------
+        if (const char* multiDir = std::getenv("NAIKAV_MULTI_OPEN_ASSETS_DIR")) {
+            std::cout << "Running multi-file-open hardware-decode repro..." << std::endl;
+            std::vector<std::string> files = {
+                std::string(multiDir) + "/hd_test_video_with_audio.mp4",
+                std::string(multiDir) + "/Big_Buck_Bunny_1080_10s_5MB.mp4",
+                std::string(multiDir) + "/Big_Buck_Bunny_1080_10s_5MB.mkv",
+                std::string(multiDir) + "/Big_Buck_Bunny_1080_10s_5MB.webm",
+                std::string(multiDir) + "/test_mono.mp4",
+                std::string(multiDir) + "/test_5point1.mp4",
+                std::string(multiDir) + "/4K 2K 1080p 720p 480p video resolution test_2160p.mp4",
+            };
+
+            g_disableHardwareDecoders = false;
+            g_videoThreadEnabled = true;
+            PlayerController multiController;
+            for (int cycle = 0; cycle < 3; ++cycle) {
+                for (const auto& f : files) {
+                    std::cout << "[MULTI-OPEN] Opening: " << f << " (cycle " << cycle << ")" << std::endl;
+                    bool ok = multiController.openFile(f);
+                    std::cout << "[MULTI-OPEN]   openFile() -> " << (ok ? "true" : "false") << std::endl;
+                    if (ok) {
+                        multiController.play();
+                        for (int i = 0; i < 20; ++i) {
+                            multiController.getCurrentTime();
+                            multiController.pollPendingLoudnessPrescan();
+                            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+                        }
+                    }
+                }
+            }
+            multiController.stop();
+            std::cout << "[MULTI-OPEN] Completed all cycles without crashing." << std::endl;
+
+            // Rapid-fire variant: no waiting/draining between opens at all
+            // (immediate back-to-back openFile() calls, closer to a user
+            // mashing the Open button or dropping several files in a
+            // burst), alternating channel layouts every time to force the
+            // SDL audio device to be torn down and reopened with a
+            // different channel count/format on every single call.
+            std::cout << "[MULTI-OPEN] Starting rapid-fire (no-wait) variant..." << std::endl;
+            std::vector<std::string> rapidFiles = {
+                std::string(multiDir) + "/hd_test_video_with_audio.mp4",
+                std::string(multiDir) + "/test_mono.mp4",
+                std::string(multiDir) + "/test_5point1.mp4",
+            };
+            PlayerController rapidController;
+            for (int cycle = 0; cycle < 50; ++cycle) {
+                const std::string& f = rapidFiles[cycle % rapidFiles.size()];
+                bool ok = rapidController.openFile(f);
+                if (ok) {
+                    rapidController.play();
+                }
+                if (cycle % 10 == 0) {
+                    std::cout << "[MULTI-OPEN][RAPID] cycle " << cycle << " -> " << (ok ? "ok" : "FAILED") << std::endl;
+                }
+            }
+            rapidController.stop();
+            std::cout << "[MULTI-OPEN][RAPID] Completed 50 rapid-fire cycles without crashing." << std::endl;
+
+            // VIRTUAL_SURROUND variant: exercises m_spatialDownmixActive
+            // toggling on (5.1 source) and off (mono/stereo source) across
+            // repeated opens -- the one code path neither repro above
+            // touches, since AUTO never activates SpatialDownmixer.
+            std::cout << "[MULTI-OPEN][VSURROUND] Starting VIRTUAL_SURROUND rapid variant..." << std::endl;
+            PlayerController vsurroundController;
+            vsurroundController.setAudioChannelOption(AudioChannelOption::VIRTUAL_SURROUND);
+            for (int cycle = 0; cycle < 50; ++cycle) {
+                const std::string& f = rapidFiles[cycle % rapidFiles.size()];
+                bool ok = vsurroundController.openFile(f);
+                if (ok) {
+                    vsurroundController.play();
+                }
+                if (cycle % 10 == 0) {
+                    std::cout << "[MULTI-OPEN][VSURROUND] cycle " << cycle << " -> " << (ok ? "ok" : "FAILED")
+                              << ", spatialDownmixActive=" << vsurroundController.isAudioVirtualSurroundActive()
+                              << std::endl;
+                }
+            }
+            vsurroundController.stop();
+            std::cout << "[MULTI-OPEN][VSURROUND] Completed 50 cycles without crashing." << std::endl;
+
+            // -------------------------------------------------------------
+            // USER-REPORTED REPRO: open a video-only file (no audio
+            // stream), enable EVERY DSP option from the GUI (as if the
+            // user checked every box in the Audio Processing panel), then
+            // open a large real-world 4K file that does have an audio
+            // stream -- the user's exact reported crash scenario. Every
+            // repro above left DSP settings at their all-disabled
+            // defaults, so this is the first place any DSP processing code
+            // actually runs against real decoded audio during a reopen.
+            // -------------------------------------------------------------
+            {
+                g_disableHardwareDecoders = false;
+                g_videoThreadEnabled = true;
+                std::cout << "[DSP-REPRO] Opening Big_Buck_Bunny (no audio stream)..." << std::endl;
+                PlayerController dspController;
+                std::string noAudioFile = std::string(multiDir) + "/Big_Buck_Bunny_1080_10s_5MB.mp4";
+                bool ok1 = dspController.openFile(noAudioFile);
+                std::cout << "[DSP-REPRO]   openFile() -> " << (ok1 ? "true" : "false")
+                          << ", hasAudio=" << dspController.hasAudio() << std::endl;
+                if (ok1) {
+                    dspController.play();
+                    for (int i = 0; i < 20; ++i) {
+                        dspController.getCurrentTime();
+                        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+                    }
+                }
+
+                std::cout << "[DSP-REPRO] Enabling every DSP option from the GUI..." << std::endl;
+                naikav::dsp::AudioDspSettings allOn;
+                allOn.dspEnabled = true;
+                for (int i = 0; i < naikav::dsp::ParametricEQ::kNumBands; ++i) {
+                    allOn.eqBandGainDb[i] = 6.0f;
+                }
+                allOn.compressorEnabled = true;
+                allOn.limiterEnabled = true;
+                allOn.crossoverEnabled = true;
+                allOn.crossoverBassRedirectEnabled = true;
+                allOn.loudnessEnabled = true;
+                allOn.widenerEnabled = true;
+                allOn.surround3dEnabled = true;
+                allOn.balance = 0.3f;
+                allOn.noiseGateEnabled = true;
+                allOn.multibandEnabled = true;
+                allOn.autoGenrePresetEnabled = true;
+                allOn.spectrumAnalyzerEnabled = true;
+                dspController.setAudioDspSettings(allOn);
+                dspController.persistAudioDspSettings();
+
+                std::string bigFile = std::string(multiDir) +
+                    "/4K Remastered - Daddy Mummy Full Video Song _ Urvashi Rautela, Kunal Khemu _ Bhaag Johnny_2160p.mp4";
+                std::cout << "[DSP-REPRO] Opening 4K file with all DSP enabled..." << std::endl;
+                bool ok2 = dspController.openFile(bigFile);
+                std::cout << "[DSP-REPRO]   openFile() -> " << (ok2 ? "true" : "false")
+                          << ", hasAudio=" << dspController.hasAudio() << std::endl;
+                if (ok2) {
+                    dspController.play();
+                    for (int i = 0; i < 80; ++i) {
+                        dspController.getCurrentTime();
+                        dspController.pollPendingLoudnessPrescan();
+                        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+                    }
+                }
+                dspController.stop();
+                std::cout << "[DSP-REPRO] Completed without crashing." << std::endl;
+            }
+
+            g_videoThreadEnabled = false;
+            g_disableHardwareDecoders = true;
         }
 
         std::cout << "Additional code coverage tests PASSED!" << std::endl;

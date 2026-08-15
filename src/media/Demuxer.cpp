@@ -1,0 +1,321 @@
+#include "media/Demuxer.hpp"
+#include <iostream>
+#include <chrono>
+#include <cmath>
+#include <limits>
+#include <cstdint>
+
+namespace {
+// Upper bound on how long the read loop will ever wait for room in a packet
+// queue before giving up and dropping the oldest entry instead. Generous
+// enough that it never engages under normal backpressure (decode keeps up
+// with real-time content well within this window), but guarantees the
+// single demuxer thread -- which feeds both streams -- can never be stuck
+// indefinitely regardless of what stalls the consumer on the other end.
+constexpr std::chrono::milliseconds kQueuePushTimeout{500};
+} // namespace
+
+Demuxer::Demuxer(const std::string& filename, 
+                 ThreadSafeQueue<AVPacket*>& videoQueue, 
+                 ThreadSafeQueue<AVPacket*>& audioQueue,
+                 MetricRing<256>& demuxTimeRing,
+                 std::atomic<bool>& profilingEnabled)
+    : m_filename(filename),
+      m_formatCtx(nullptr),
+      m_videoStreamIdx(-1),
+      m_audioStreamIdx(-1),
+      m_videoCodecParams(nullptr),
+      m_audioCodecParams(nullptr),
+      m_videoTimeBase{0, 1},
+      m_audioTimeBase{0, 1},
+      m_videoStartTime(0),
+      m_audioStartTime(0),
+      m_duration(0.0),
+      m_videoQueue(videoQueue),
+      m_audioQueue(audioQueue),
+      m_running(false),
+      m_seekRequested(false),
+      m_seekTargetTime(0.0),
+      m_eof(false),
+      m_catchupMode(SeekCatchupMode::NONE),
+      m_catchupTarget(0.0),
+      m_demuxTimeRing(demuxTimeRing),
+      m_profilingEnabled(profilingEnabled) {
+}
+
+static MetricRing<256> g_dummyDemuxRing;
+static std::atomic<bool> g_dummyDemuxerProfilingEnabled{false};
+
+Demuxer::Demuxer(const std::string& filename, 
+                 ThreadSafeQueue<AVPacket*>& videoQueue, 
+                 ThreadSafeQueue<AVPacket*>& audioQueue)
+    : Demuxer(filename, videoQueue, audioQueue, g_dummyDemuxRing, g_dummyDemuxerProfilingEnabled) {
+}
+
+Demuxer::~Demuxer() {
+    stop();
+    if (m_formatCtx) {
+        avformat_close_input(&m_formatCtx);
+    }
+}
+
+bool Demuxer::open() {
+    // Open video file with protocol whitelist restrictions (local file and pipe only)
+    AVDictionary* options = nullptr;
+    av_dict_set(&options, "protocol_whitelist", "file,pipe", 0);
+    
+    int ret = avformat_open_input(&m_formatCtx, m_filename.c_str(), nullptr, &options);
+    av_dict_free(&options);
+
+    if (ret < 0) {
+        std::cerr << "Error: Could not open media file " << m_filename << std::endl;
+        return false;
+    }
+
+    // Enable fast seek using index tables instead of parsing frames
+    m_formatCtx->flags |= AVFMT_FLAG_FAST_SEEK;
+
+    // Retrieve stream info
+    if (avformat_find_stream_info(m_formatCtx, nullptr) < 0) {
+        std::cerr << "Error: Could not find stream information" << std::endl;
+        return false;
+    }
+
+    // Find video and audio streams
+    for (unsigned int i = 0; i < m_formatCtx->nb_streams; i++) {
+        AVCodecParameters* codecParams = m_formatCtx->streams[i]->codecpar;
+        if (codecParams->codec_type == AVMEDIA_TYPE_VIDEO && m_videoStreamIdx < 0) {
+            m_videoStreamIdx = i;
+            m_videoCodecParams = codecParams;
+            m_videoTimeBase = m_formatCtx->streams[i]->time_base;
+            m_videoStartTime = m_formatCtx->streams[i]->start_time;
+            if (m_videoStartTime == AV_NOPTS_VALUE) m_videoStartTime = 0;
+        } else if (codecParams->codec_type == AVMEDIA_TYPE_AUDIO && m_audioStreamIdx < 0) {
+            m_audioStreamIdx = i;
+            m_audioCodecParams = codecParams;
+            m_audioTimeBase = m_formatCtx->streams[i]->time_base;
+            m_audioStartTime = m_formatCtx->streams[i]->start_time;
+            if (m_audioStartTime == AV_NOPTS_VALUE) m_audioStartTime = 0;
+        }
+    }
+
+    if (m_videoStreamIdx < 0 && m_audioStreamIdx < 0) {
+        std::cerr << "Error: Could not find any video or audio streams" << std::endl;
+        return false;
+    }
+
+    // Calculate duration
+    if (m_formatCtx->duration != AV_NOPTS_VALUE) {
+        m_duration = static_cast<double>(m_formatCtx->duration) / AV_TIME_BASE;
+    } else {
+        m_duration = 0.0;
+    }
+
+    std::cout << "Opened media file: " << m_filename 
+              << ", Duration: " << m_duration << "s" 
+              << ", Video Stream: " << m_videoStreamIdx 
+              << ", Audio Stream: " << m_audioStreamIdx << std::endl;
+
+    m_eof = false;
+    return true;
+}
+
+void Demuxer::start() {
+    if (m_running) return;
+    m_running = true;
+    m_thread = std::thread(&Demuxer::threadLoop, this);
+}
+
+void Demuxer::stop() {
+    m_running = false;
+    m_videoQueue.abort();
+    m_audioQueue.abort();
+    if (m_thread.joinable()) {
+        m_thread.join();
+    }
+}
+
+void Demuxer::seek(double timeInSeconds) {
+    if (timeInSeconds < 0.0) timeInSeconds = 0.0;
+    if (timeInSeconds > m_duration) timeInSeconds = m_duration;
+    
+    m_seekTargetTime = timeInSeconds;
+    m_seekRequested = true;
+    m_eof = false;
+}
+
+void Demuxer::setCatchup(SeekCatchupMode mode, double targetSeconds) {
+    m_catchupTarget = targetSeconds;
+    m_catchupMode = mode;
+}
+
+double Demuxer::packetTimeSeconds(const AVPacket* pkt, int streamIdx) const {
+    int64_t ts = (pkt->pts != AV_NOPTS_VALUE) ? pkt->pts : pkt->dts;
+    if (ts == AV_NOPTS_VALUE) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    if (streamIdx == m_videoStreamIdx) {
+        return (ts - m_videoStartTime) * av_q2d(m_videoTimeBase);
+    }
+    return (ts - m_audioStartTime) * av_q2d(m_audioTimeBase);
+}
+
+void Demuxer::performSeek() {
+    std::lock_guard<std::mutex> lock(m_seekMutex);
+    
+    // Capture target time and reset request flag at the start
+    double targetTime = m_seekTargetTime;
+    m_seekRequested = false;
+    m_eof = false;
+    
+    // Clear both queues to drop packets from the old position
+    m_videoQueue.clear([](AVPacket*& pkt) { av_packet_free(&pkt); });
+    m_audioQueue.clear([](AVPacket*& pkt) { av_packet_free(&pkt); });
+    
+    int64_t targetTs;
+    int streamIdx = -1;
+    
+    // Convert target time to the timebase of the selected stream for seeking
+    if (m_videoStreamIdx >= 0) {
+        streamIdx = m_videoStreamIdx;
+        // In FFmpeg, stream-specific seek requires the timestamp in stream timebase units
+        targetTs = static_cast<int64_t>(targetTime / av_q2d(m_videoTimeBase));
+    } else if (m_audioStreamIdx >= 0) {
+        streamIdx = m_audioStreamIdx;
+        targetTs = static_cast<int64_t>(targetTime / av_q2d(m_audioTimeBase));
+    } else {
+        targetTs = static_cast<int64_t>(targetTime * AV_TIME_BASE);
+    }
+    
+    // Seek to nearest keyframe around target timestamp using modern fast binary-search avformat_seek_file
+    int ret = avformat_seek_file(m_formatCtx, streamIdx, INT64_MIN, targetTs, INT64_MAX, 0);
+    if (ret < 0) {
+        std::cerr << "Warning: Could not seek to " << targetTime << "s using stream " << streamIdx << std::endl;
+        // Fallback to default seek if stream-specific seek fails
+        int64_t fallbackTs = static_cast<int64_t>(targetTime * AV_TIME_BASE);
+        avformat_seek_file(m_formatCtx, -1, INT64_MIN, fallbackTs, INT64_MAX, 0);
+    } else {
+        std::cout << "Successfully seeked format context to " << targetTime << "s" << std::endl;
+    }
+
+    // Bumped last, after the format context has actually repositioned: every
+    // packet threadLoop() reads and tags from this point on genuinely comes
+    // from the new position. See the m_seekGeneration comment in Demuxer.hpp.
+    m_seekGeneration.fetch_add(1, std::memory_order_relaxed);
+}
+
+void Demuxer::threadLoop() {
+    while (m_running) {
+        if (m_seekRequested) {
+            performSeek();
+            // Give a tiny pause to let decoders process the flush signal before we push new packets
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            continue;
+        }
+
+        AVPacket* packet = av_packet_alloc();
+        if (!packet) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            continue;
+        }
+
+        int ret;
+        if (m_profilingEnabled.load(std::memory_order_relaxed)) {
+            auto startTime = std::chrono::steady_clock::now();
+            ret = av_read_frame(m_formatCtx, packet);
+            auto end = std::chrono::steady_clock::now();
+            float us = static_cast<float>(std::chrono::duration_cast<std::chrono::microseconds>(end - startTime).count());
+            m_demuxTimeRing.record(us);
+        } else {
+            ret = av_read_frame(m_formatCtx, packet);
+        }
+        if (ret >= 0) {
+            if (m_seekRequested.load()) {
+                av_packet_free(&packet);
+                continue;
+            }
+
+            // Tag with the generation this packet was actually read under,
+            // so a consumer can tell -- independent of its own thread
+            // timing -- whether this packet predates the most recent seek.
+            // See the m_seekGeneration comment in Demuxer.hpp.
+            packet->opaque = reinterpret_cast<void*>(
+                static_cast<uintptr_t>(m_seekGeneration.load(std::memory_order_relaxed)));
+
+            SeekCatchupMode cmode = m_catchupMode.load();
+
+            if (packet->stream_index == m_videoStreamIdx) {
+                // Bounded wait, not an unconditional block: this is the only
+                // thread that reads either stream, so if the video decode
+                // thread were ever wedged (a hung hardware decoder, a bug
+                // not yet found) an indefinite block here would silently
+                // stop packet delivery to BOTH queues forever, with no way
+                // to recover short of tearing down playback. Past the
+                // timeout, drop the oldest queued packet and keep reading
+                // instead, so the pipeline can never get permanently stuck.
+                // This 100-packet cap is also what naturally throttles
+                // read-ahead during a seek catch-up scan, in place of a
+                // separate pts-based throttle: it tracks actual decoder
+                // throughput (including B-frame reorder delay) instead of a
+                // fixed "1 second past target" heuristic that can't tell the
+                // difference between "nearly done" and "decoder needs many
+                // more packets before it can produce the target frame".
+                if (!m_videoQueue.push_wait_or_drop(packet, kQueuePushTimeout,
+                                                     [](AVPacket*& p) { av_packet_free(&p); })) {
+                    av_packet_free(&packet);
+                }
+            } else if (packet->stream_index == m_audioStreamIdx) {
+                // During catch-up the audio device is paused: audio from
+                // before the seek target is useless and would only clog the
+                // queue, so drop it here.
+                bool drop = false;
+                if (cmode != SeekCatchupMode::NONE) {
+                    double ptsSec = packetTimeSeconds(packet, m_audioStreamIdx);
+                    if (!std::isnan(ptsSec) &&
+                        ptsSec < m_catchupTarget.load() - 0.1) {
+                        drop = true;
+                    }
+                }
+
+                // Nothing drains the audio queue whenever the audio device
+                // itself is paused (not just during a catch-up scan - e.g.
+                // seeking, or scrubbing, while playback is paused). A
+                // blocking push in that state can stall this thread forever
+                // once the queue fills, which also starves the video queue
+                // since both streams are read by this one loop.
+                bool audioConsumerIdle = (cmode != SeekCatchupMode::NONE) ||
+                    (m_audioPausedFlag && m_audioPausedFlag->load());
+
+                bool pushed;
+                if (drop) {
+                    pushed = false;
+                } else if (audioConsumerIdle) {
+                    // Drop the oldest buffered packet instead of blocking, so
+                    // the demuxer always keeps making progress.
+                    pushed = m_audioQueue.push_drop_oldest(packet, [](AVPacket*& p) { av_packet_free(&p); });
+                } else {
+                    // Same bounded-wait backstop as the video queue above.
+                    pushed = m_audioQueue.push_wait_or_drop(packet, kQueuePushTimeout,
+                                                             [](AVPacket*& p) { av_packet_free(&p); });
+                }
+
+                if (!pushed) {
+                    av_packet_free(&packet);
+                }
+            } else {
+                av_packet_free(&packet);
+            }
+        } else {
+            // Error or EOF
+            av_packet_free(&packet);
+            
+            if (ret == AVERROR_EOF) {
+                m_eof = true;
+                // At EOF, sleep a bit so we don't hog CPU. If user seeks back, loop resumes.
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            } else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+        }
+    }
+}

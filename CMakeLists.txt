@@ -309,12 +309,14 @@ if(FFMPEG_USE_SYSTEM)
         libavformat
         libavutil
         libswscale
-        libswresample)
+        libswresample
+        libavfilter)
     message(STATUS "  libavcodec version:    ${FFMPEG_libavcodec_VERSION}")
     message(STATUS "  libavformat version:   ${FFMPEG_libavformat_VERSION}")
     message(STATUS "  libavutil version:     ${FFMPEG_libavutil_VERSION}")
     message(STATUS "  libswscale version:    ${FFMPEG_libswscale_VERSION}")
     message(STATUS "  libswresample version: ${FFMPEG_libswresample_VERSION}")
+    message(STATUS "  libavfilter version:   ${FFMPEG_libavfilter_VERSION}")
 else()
     # ---------- Bundled FFmpeg (Windows / Linux x86_64) ----------
     # Determine if we need to download FFmpeg
@@ -412,25 +414,33 @@ endif()
 # -------------------------------------------------------------
 # Main Executable
 # -------------------------------------------------------------
+# Sources are grouped by function under src/ (core, media, video, audio,
+# player, ui, app). Every target adds src/ to its include path via
+# PLAYER_INCLUDE_DIR, so headers are included by their root-anchored path
+# ("audio/dsp/DspChain.hpp") regardless of the including file's location.
+set(PLAYER_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src")
+
 # Separate logic source files from main.cpp
 set(PLAYER_LOGIC_SOURCES
-    src/PlayerController.cpp
-    src/Demuxer.cpp
-    src/VideoDecoder.cpp
-    src/AudioDecoder.cpp
+    src/player/PlayerController.cpp
+    src/media/Demuxer.cpp
+    src/video/VideoDecoder.cpp
+    src/audio/AudioDecoder.cpp
 )
 
 set(WINDOWS_RESOURCE_FILE "")
 if(TARGET_PLATFORM_WINDOWS)
-    set(WINDOWS_RESOURCE_FILE src/resource.rc)
+    set(WINDOWS_RESOURCE_FILE src/app/resource.rc)
 endif()
 
-add_executable(NaikAVPlayer 
-    src/main.cpp 
-    src/PlayerUI.cpp
+add_executable(NaikAVPlayer
+    src/app/main.cpp
+    src/ui/PlayerUI.cpp
     ${PLAYER_LOGIC_SOURCES}
     ${WINDOWS_RESOURCE_FILE}
 )
+
+target_include_directories(NaikAVPlayer PRIVATE "${PLAYER_INCLUDE_DIR}")
 
 # Link libraries to our executable
 target_link_libraries(NaikAVPlayer PRIVATE
@@ -449,6 +459,7 @@ else()
         avutil
         swscale
         swresample
+        avfilter
     )
 endif()
 
@@ -516,9 +527,11 @@ setup_target_dependencies(NaikAVPlayer)
 # -------------------------------------------------------------
 # Test Target
 # -------------------------------------------------------------
-add_executable(NaikAVPlayer_tests 
+add_executable(NaikAVPlayer_tests
     tests/tests.cpp
 )
+
+target_include_directories(NaikAVPlayer_tests PRIVATE "${PLAYER_INCLUDE_DIR}")
 
 option(ENABLE_COVERAGE "Enable code coverage instrumentation" ON)
 
@@ -552,6 +565,7 @@ else()
         avutil
         swscale
         swresample
+        avfilter
     )
 endif()
 
@@ -567,6 +581,84 @@ endif()
 target_compile_options(NaikAVPlayer_tests PRIVATE ${PROJECT_WARNING_FLAGS})
 
 setup_target_dependencies(NaikAVPlayer_tests)
+
+# -------------------------------------------------------------
+# Standalone DSP-repro diagnostic (not part of the regular test suite --
+# see tests/dsp_repro_standalone.cpp). Talks to the real SDL audio device
+# directly, unlike NaikAVPlayer_tests which mocks SDL_OpenAudioDeviceStream
+# and falls back to a disconnected (no-callback) stream whenever the real
+# device open fails in a sandboxed/headless test-runner environment.
+# -------------------------------------------------------------
+add_executable(NaikAVPlayer_dsp_repro
+    tests/dsp_repro_standalone.cpp
+    ${PLAYER_LOGIC_SOURCES}
+)
+
+target_include_directories(NaikAVPlayer_dsp_repro PRIVATE "${PLAYER_INCLUDE_DIR}")
+
+target_link_libraries(NaikAVPlayer_dsp_repro PRIVATE
+    SDL3::SDL3-shared
+)
+if(FFMPEG_USE_SYSTEM)
+    target_link_libraries(NaikAVPlayer_dsp_repro PRIVATE PkgConfig::FFMPEG)
+else()
+    target_include_directories(NaikAVPlayer_dsp_repro SYSTEM PRIVATE "${FFMPEG_DIR}/include")
+    target_link_directories(NaikAVPlayer_dsp_repro PRIVATE "${FFMPEG_DIR}/lib")
+    target_link_libraries(NaikAVPlayer_dsp_repro PRIVATE
+        avcodec
+        avformat
+        avutil
+        swscale
+        swresample
+        avfilter
+    )
+endif()
+if(TARGET_PLATFORM_LINUX)
+    target_link_libraries(NaikAVPlayer_dsp_repro PRIVATE pthread dl)
+endif()
+if(TARGET_PLATFORM_WINDOWS AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_link_options(NaikAVPlayer_dsp_repro PRIVATE -static-libgcc -static-libstdc++)
+endif()
+
+setup_target_dependencies(NaikAVPlayer_dsp_repro)
+
+# -------------------------------------------------------------
+# Standalone getColorInfo() data-race diagnostic (see
+# tests/colorinfo_race_repro.cpp) -- isolates the specific race between the
+# Diagnostics HUD's getColorInfo() and the video decode thread.
+# -------------------------------------------------------------
+add_executable(NaikAVPlayer_colorinfo_race
+    tests/colorinfo_race_repro.cpp
+    ${PLAYER_LOGIC_SOURCES}
+)
+
+target_include_directories(NaikAVPlayer_colorinfo_race PRIVATE "${PLAYER_INCLUDE_DIR}")
+
+target_link_libraries(NaikAVPlayer_colorinfo_race PRIVATE
+    SDL3::SDL3-shared
+)
+if(FFMPEG_USE_SYSTEM)
+    target_link_libraries(NaikAVPlayer_colorinfo_race PRIVATE PkgConfig::FFMPEG)
+else()
+    target_include_directories(NaikAVPlayer_colorinfo_race SYSTEM PRIVATE "${FFMPEG_DIR}/include")
+    target_link_directories(NaikAVPlayer_colorinfo_race PRIVATE "${FFMPEG_DIR}/lib")
+    target_link_libraries(NaikAVPlayer_colorinfo_race PRIVATE
+        avcodec
+        avformat
+        avutil
+        swscale
+        swresample
+        avfilter
+    )
+endif()
+if(TARGET_PLATFORM_LINUX)
+    target_link_libraries(NaikAVPlayer_colorinfo_race PRIVATE pthread dl)
+endif()
+if(TARGET_PLATFORM_WINDOWS AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_link_options(NaikAVPlayer_colorinfo_race PRIVATE -static-libgcc -static-libstdc++)
+endif()
+
+setup_target_dependencies(NaikAVPlayer_colorinfo_race)
 
 # -------------------------------------------------------------
 # Install Rules

@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install Python Dependencies
         run: |
@@ -53,7 +53,7 @@ jobs:
           echo "Repository file integrity check passed."
 
       - name: Setup Compiler Cache (ccache)
-        uses: hendrikmuhs/ccache-action@v1
+        uses: hendrikmuhs/ccache-action@5ebbd400eff9e74630f759d94ddd7b6c26299639 # v1.2.20
         with:
           key: linux-gcc-ccache
 
@@ -85,7 +85,7 @@ jobs:
           lcov --list coverage.info --ignore-errors unused
 
       - name: Upload Coverage to Codecov
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac # v5.5.5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: coverage.info
@@ -99,6 +99,7 @@ jobs:
             --error-exitcode=1 \
             --xml \
             --xml-version=2 \
+            -I src/ \
             src/ tests/ 2> cppcheck_report.xml
 
       - name: Configure CMake with Sanitizers (ASan/UBSan Debug)
@@ -182,7 +183,7 @@ jobs:
 
       - name: Upload Test Report Artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: test-execution-report
           path: test_report.xlsx
@@ -190,7 +191,7 @@ jobs:
 
       - name: Upload Cppcheck Report Artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: cppcheck-report
           path: cppcheck_report.xlsx
@@ -198,7 +199,7 @@ jobs:
 
       - name: Upload ASan Report Artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: asan-report
           path: asan_report.xlsx
@@ -206,7 +207,7 @@ jobs:
 
       - name: Upload UBSan Report Artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ubsan-report
           path: ubsan_report.xlsx
@@ -245,7 +246,7 @@ jobs:
 
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install System Dependencies (Linux)
         if: matrix.os_name == 'linux'
@@ -266,7 +267,7 @@ jobs:
 
       - name: Setup Compiler Cache (ccache, Linux)
         if: matrix.os_name == 'linux'
-        uses: hendrikmuhs/ccache-action@v1
+        uses: hendrikmuhs/ccache-action@5ebbd400eff9e74630f759d94ddd7b6c26299639 # v1.2.20
         with:
           key: ${{ matrix.target }}-ccache
 
@@ -388,7 +389,7 @@ jobs:
         # Linux users are instructed to build from source on their target system until a portable packaging
         # pipeline (e.g. AppImage or containerized build using an older GLIBC baseline) is implemented.
         if: startsWith(github.ref, 'refs/heads/release') && matrix.os_name == 'windows'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ matrix.artifact_name }}
           path: package/

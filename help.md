@@ -33,6 +33,7 @@ sudo apt-get install -y \
   libavutil-dev \
   libswscale-dev \
   libswresample-dev \
+  libavfilter-dev \
   libgtk-3-dev \
   libxss-dev \
   libasound2-dev \
@@ -173,7 +174,20 @@ To build Windows 64-bit executables from a Linux development machine:
    cmake --build build-windows -j$(nproc)
    ```
 
-> **Advanced Build Options**: Specialized build options such as `-DENABLE_SANITIZERS=ON` (ASan/UBSan), `-DENABLE_TSAN=ON` (ThreadSanitizer), `RelWithDebInfo`, and `MinSizeRel` remain supported across all configurations.
+### Advanced Build Options
+
+All are supported across configurations:
+
+| Option | Default | Purpose |
+|---|---|---|
+| `-DENABLE_SANITIZERS=ON` | `OFF` | AddressSanitizer + UndefinedBehaviorSanitizer |
+| `-DENABLE_TSAN=ON` | `OFF` | ThreadSanitizer |
+| `-DTREAT_WARNINGS_AS_ERRORS=OFF` | `ON` | Disable `-Werror` |
+| `-DENABLE_COVERAGE=OFF` | `ON` | gcov/lcov coverage instrumentation |
+| `-DNAIKAV_FORCE_BUNDLED_FFMPEG=OFF` | — | Use the system FFmpeg (via `pkg-config`) instead of the downloaded prebuilt archive; required when cross-compiling for ARM64 |
+| `-DPLATFORM=LINUX\|WINDOWS` | autodetected | Target platform selection |
+
+The `RelWithDebInfo` and `MinSizeRel` build types are also supported.
 
 ---
 
@@ -213,6 +227,25 @@ sudo cmake --build build --target uninstall
 ./build/NaikAVPlayer --metrics "/path/to/video.mp4"
 ```
 
+**Viewing console log output (Windows):**
+```bash
+./build/NaikAVPlayer.exe --console "/path/to/video.mp4"
+```
+The Windows build is a GUI-subsystem executable, so it has no console of its
+own and its log output (file open, decode, DSP, playback-state messages) is
+discarded by default. `--console` attaches the app to the terminal that
+launched it and routes that output there. It does nothing when the app is
+started by double-click (no parent console) and is ignored on Linux, where
+the same output already goes to the terminal.
+
+> [!NOTE]
+> Console attachment is opt-in rather than automatic. A GUI-subsystem process
+> that silently attaches to its parent console at startup matches a known
+> console-hiding pattern used by malware, and generic antivirus heuristics
+> score it accordingly — the same class of false positive that already moved
+> the Windows release build from MinGW to MSVC. Requiring the flag keeps the
+> diagnostics without the unprompted startup behavior.
+
 ---
 
 ## 4. UI Controls & Shortcuts
@@ -232,7 +265,31 @@ The user interface uses Dear ImGui with frosted translucency overlay.
 | **`Right Arrow`** | Seek forward 10 seconds |
 | **`L`** | Toggle Loop Mode |
 | **`D`** | Toggle Diagnostics HUD overlay |
+| **`A`** | Toggle Audio Processing panel (EQ, noise gate, compressor, multiband compressor, limiter, crossover, loudness, 3D surround, widener, balance, channel/device/format selection) |
 | **`Escape`** | Exit application |
+
+---
+
+## 4a. Source Layout
+
+Sources are grouped by subsystem under `src/`. Headers are included by that subsystem-relative path (e.g. `#include "audio/dsp/DspChain.hpp"`), which is why manual compiles and static analysis both need `-I src` / `-I src/`:
+
+```text
+src/
+├── app/       main.cpp — entry point, SDL window/event loop, render loop, CLI flags
+├── audio/     AudioDecoder.{hpp,cpp} — decode, resample, SDL callback, output selectors
+│   └── dsp/   header-only DSP module (see Section 5b)
+├── core/      ThreadSafeQueue.hpp, MetricRing.hpp, PipelineMetrics.hpp
+├── media/     Demuxer.{hpp,cpp} — packet reading and routing
+├── player/    PlayerController.{hpp,cpp} — state machine, seeking, settings persistence
+├── ui/        PlayerUI.{hpp,cpp} — ImGui controls dock, diagnostics HUD, audio panel
+└── video/     VideoDecoder.{hpp,cpp} — HW/SW decode, frame conversion
+```
+
+`src/audio/dsp/` is entirely header-only: `AudioDspSettings.hpp` (settings struct, the 9 presets, and genre mapping), `Biquad.hpp`, `ParametricEQ.hpp`, `NoiseGate.hpp`, `Compressor.hpp`, `MultibandCompressor.hpp`, `Limiter.hpp`, `Crossover.hpp`, `DspChain.hpp`, `LoudnessMeter.hpp`, `LoudnessNormalizer.hpp`, `LoudnessPrescan.hpp`, `ReplayGainTags.hpp`, `SpatialDownmixer.hpp`, `Surround3D.hpp`, `StereoWidener.hpp`, `BalanceControl.hpp`, `SpectrumAnalyzer.hpp`, `DspMath.hpp`.
+
+> [!NOTE]
+> `DspMath.hpp` exists so this module never depends on `M_PI`, which is a POSIX extension rather than standard C++. libstdc++ exposes it from `<cmath>` by default and SDL3's `SDL_stdinc.h` defines it as a fallback, but MSVC only defines it when `_USE_MATH_DEFINES` is set *before* the first `<cmath>` include — an ordering constraint these headers cannot guarantee, since `AudioDecoder.hpp` includes them ahead of any SDL header. Use `naikav::dsp::kPi` in new DSP code, not `M_PI`.
 
 ---
 
@@ -247,7 +304,7 @@ The user interface uses Dear ImGui with frosted translucency overlay.
 
 ## 5a. Pipeline Backpressure & Deadlock Prevention
 
-The single demuxer thread reads both the video and audio packet streams via `av_read_frame`, so if a push into either queue ever blocked indefinitely, packet delivery to *both* streams would silently stop — for example, nothing drains the audio packet queue while the audio device is paused (a seek catch-up, or simply the user pausing playback). `ThreadSafeQueue` (`src/ThreadSafeQueue.hpp`) provides two bounded push variants used in place of a plain blocking `push()` wherever a producer thread cannot afford to stall:
+The single demuxer thread reads both the video and audio packet streams via `av_read_frame`, so if a push into either queue ever blocked indefinitely, packet delivery to *both* streams would silently stop — for example, nothing drains the audio packet queue while the audio device is paused (a seek catch-up, or simply the user pausing playback). `ThreadSafeQueue` (`src/core/ThreadSafeQueue.hpp`) provides two bounded push variants used in place of a plain blocking `push()` wherever a producer thread cannot afford to stall:
 
 - **`push_wait_or_drop(value, timeoutMs, dropCleanup)`**: waits up to `timeoutMs` for room, then drops the oldest queued entry (invoking `dropCleanup` on it, if given) and pushes anyway. This is the structural backstop for the demuxer's video/audio packet pushes and the video decode thread's push into the decoded frame queue (all with a 500ms timeout) — no matter what stalls the consumer (a paused device, a wedged hardware decoder, a stuck render loop), the producer thread always returns and keeps making progress.
 - **`push_drop_oldest(value, dropCleanup)`**: never waits at all — drops the oldest entry immediately if full. Used for audio packets specifically while the audio consumer is known to be idle (paused, or mid seek catch-up), since waiting on a consumer that isn't running serves no purpose.
@@ -256,41 +313,157 @@ This also replaced the previous PTS-based `throttleCatchupReadahead()` mechanism
 
 ---
 
+## 5b. Audio DSP & Loudness Pipeline
+
+Every decoded audio buffer runs through a fixed, in-place signal chain inside the SDL3 audio callback (`AudioDecoder::decodeAndResample()`, `src/audio/AudioDecoder.cpp`), entirely as interleaved `AV_SAMPLE_FMT_FLT` — never the S16 device format — until the very last step:
+
+```text
+decode -> resample (swresample, libsoxr engine, selectable quality) -> DSP chain
+  (parametric EQ -> noise gate -> compressor -> multiband compressor
+   -> lookahead limiter -> bass-management crossover)
+  -> loudness normalization (EBU R128 real-time, two-pass-primed, or tag-primed)
+  -> 3D surround -> stereo widener -> balance -> spectrum analyzer (read-only tap)
+  -> final safety limiter -> TPDF dither -> device-format truncation
+  (S16 / S32 / F32) -> device output
+```
+
+- **DSP chain** (`src/audio/dsp/`): hand-rolled `Biquad`/`ParametricEQ` (RBJ cookbook, 5 bands -- frequency, Q, and gain all independently adjustable per band, not just gain), `NoiseGate` (downward expander below threshold, the mirror of `Compressor`, with its own short detector-smoothing stage so a sustained tone's own zero-crossings don't chatter the gate open/closed), `Compressor` (soft-knee, linked-multichannel detection), `MultibandCompressor` (splits into low/mid/high bands via two Linkwitz-Riley crossovers, each band compressed independently by its own `Compressor`; the bands sum back to a flat *magnitude/energy* response at the default 1:1 ratios -- an allpass identity, not sample-for-sample time-domain identity, since there's a frequency-dependent phase rotation through each crossover point), `Limiter` (a short internal lookahead delay line plus fast attack, so the gain envelope reduces *ahead of* a fast transient instead of only clamping it after the fact, with a hard-ceiling backstop for the remaining rare case), `Crossover` (Linkwitz-Riley 4th-order: always-available LFE-channel lowpass, plus an optional bass-redirect mode that highpasses every other channel and sums exactly what was removed into the LFE channel -- true bass management, not just LFE tone control). Orchestrated by `DspChain`, disabled by default -- every stage is a true no-op (0 dB / 1:1 ratio / 0 dB ceiling) until configured, so wiring it into the pipeline didn't change existing playback behavior on its own.
+- **Loudness normalization** (`src/audio/dsp/LoudnessMeter.hpp` / `LoudnessNormalizer.hpp` / `LoudnessPrescan.hpp` / `ReplayGainTags.hpp`): wraps a minimal `libavfilter` graph (`abuffer -> ebur128 -> abuffersink`) for real-time momentary/integrated LUFS, reading FFmpeg's own metadata output (`lavfi.r128.M`/`.I`) rather than a hand-rolled K-weighting/gating implementation -- loudness *measurement* needs to match the real ITU-R BS.1770 spec to mean anything, unlike the DSP effects above. By default, applies a heavily-smoothed (multi-second) real-time gain correction toward a configurable LUFS target. Two ways to prime it with a whole-file figure instead of that real-time ramp, both feeding `LoudnessNormalizer::primeWithPrescannedLufs()`, checked in this order: (1) `naikav::dsp::readTaggedLoudnessAsLufs()` reads a `R128_TRACK_GAIN`/`REPLAYGAIN_TRACK_GAIN` (or `_ALBUM_` fallback) container tag if present -- no decoding needed at all; (2) failing that, `naikav::dsp::prescanIntegratedLufs()` does a decode-only (no video, no device I/O) pass over the whole file. Either way, priming applies from the very first block instead of ramping in, and survives `reset()` (called on seek) instead of dropping back to zero gain.
+- **Automatic genre-based presets** (`AudioDspSettings.hpp`'s `presetForGenreTag()`): opt-in (`autoGenrePresetEnabled`) -- on file open, `PlayerController::applyGenrePresetIfEnabled()` reads the container's genre tag and, via simple case-insensitive keyword matching (not a real genre taxonomy), applies a matching canned preset, preserving the toggle itself so it doesn't turn itself off after one use.
+- **3D Surround, Stereo Widener & Balance** (`Surround3D.hpp` / `StereoWidener.hpp` / `BalanceControl.hpp`): run after loudness normalization, on the final output-channel-count buffer. `Surround3D` synthesizes spatial ambience on any stereo output (including plain stereo sources); `StereoWidener` does mid-side width adjustment; `BalanceControl` attenuates whichever channel the balance is pulled away from (the classic mixer "balance" behavior, not a mono-source "pan"). All three are 2-channel-only no-ops on other channel counts, all disabled/centered by default.
+- **Virtual Surround downmix** (`SpatialDownmixer.hpp`): when `AudioChannelOption::VIRTUAL_SURROUND` is selected and the source is a directly-supported discrete surround layout (2.1/5.1/5.1(back)/7.1), folds it down to stereo with positional delay/filter cues instead of a flat downmix matrix, so the device still only ever receives 2 channels but retains a spatial impression of the original layout.
+- **Spectrum analyzer** (`SpectrumAnalyzer.hpp`): opt-in (`spectrumAnalyzerEnabled`), reads the final post-DSP-chain signal (downmixed to mono), accumulating it into a ring buffer and running a hand-rolled iterative radix-2 Cooley-Tukey FFT (1024-point, Hann-windowed) every full non-overlapping block (~21ms at 48kHz). The resulting dB-scaled magnitude-per-bin spectrum is exponentially smoothed frame-to-frame and exposed via `getMagnitudesDb()`, a self-synchronized snapshot getter with its own internal mutex -- the UI thread reads it without needing `AudioDecoder`'s `m_dspMutex` at all. A pure display tap: it never modifies the signal, and (like every other stage here) is a true no-op while disabled.
+- **Not implemented (deliberately scoped out)**: real HRTF/binaural rendering (the above are hand-rolled ambience/positional-cue synthesis, not a convolution against a measured head-related impulse response dataset -- no such dataset is vendored, and fabricating one would be dishonest) and gapless playback/crossfade (both need a real playlist/track-queue engine, which this single-file player doesn't have -- a larger architectural addition than anything else in this section).
+- **Resampler**: `swr_alloc_set_opts2`'s `"resampler"` AVOption is set to `"soxr"` (SoX Resampler) instead of swresample's own default engine, for better stopband rejection. This project's vendored FFmpeg build has libsoxr compiled in (confirmed via `--enable-libsoxr` in its `ffmpeg -version` configuration string); if a build ever lacks it, `av_opt_set()` fails gracefully and swresample's own (still correct, just lower-quality) resampler is used instead. `ResamplerQuality` (Low/Medium/High/Very High, panel dropdown, applied on next file open) maps to soxr's `"precision"` AVOption (16/20/28/33 bits); Medium (20 bits) matches this project's original, pre-selector default.
+- **Resampler latency & zero-output blocks**: `swr_convert()` legally returns **0** while the resampler is still filling its internal buffer, and soxr's latency grows with the precision tier — so the higher the `ResamplerQuality`, the more often a decoded frame yields no output samples yet. This is a normal buffering state, *not* an error and *not* end of stream. `decodeAndResample()` treats it as "feed the resampler another frame" and loops. It must never fall through to setting `m_audioBufferSize = 0`, because `sdlAudioStreamCallback()` cannot distinguish that from a genuinely starved queue and would memset a full block of digital silence into an otherwise healthy stream — a hard discontinuity, audible as a click. See [Section 9](#9-troubleshooting) for the symptom this caused when it was mishandled.
+- **Output format & device** (`AudioOutputBitDepth`, `AudioDecoder::setOutputDeviceName()`/`enumeratePlaybackDeviceNames()`): the internal pipeline is always float; `AudioOutputBitDepth` (S16 default / S32 / F32, panel dropdown) only controls the final device format. F32 skips truncation/dither entirely (lossless); S32 gets the same TPDF dither technique as S16, rescaled to a true 32-bit LSB. Device selection resolves a persisted device *name* (not ID, since `SDL_AudioDeviceID` values aren't stable across sessions) back to whatever ID currently matches it at `init()` time, falling back to the OS default if that device is no longer present.
+- **Dither**: applied once, at the final float-to-device-format truncation in the SDL callback (skipped for F32 output) -- triangular (TPDF) dither, the sum of two independent uniform draws, decorrelating quantization error from the signal far better than plain rounding.
+- **Thread safety**: `AudioDecoder::applyDspSettings()` lets the UI thread change any DSP/loudness parameter while the SDL audio callback thread concurrently calls `process()` on the same objects -- both sides take a single short-held mutex (`m_dspMutex`). `AudioDecoder::primeLoudnessPrescan()` (used internally by the two-pass/tag loudness paths above) takes the same lock. The older `dsp()`/`loudness()` raw accessors remain but are **not** synchronized; they're for tests and pre-playback setup only, not live control. Output format/device/resampler-quality/channel-option selectors are UI-thread-only settings applied before `init()`, not live-mutable during playback (matching `AudioChannelOption`'s existing rule).
+- **Multichannel routing**: `AudioDecoder` preserves 2.1/5.1/5.1(back)/7.1 source layouts straight through to a matching multichannel `SDL_AudioSpec` when possible (see [Section 1](#1-linux-binary-compatibility-limitation--prerequisites) for the underlying audio backend prerequisites), with a stereo fallback if the device rejects it. A successful device open does not by itself prove real multichannel hardware is connected -- shared-mode audio APIs silently downmix -- so `AudioDecoder` also queries the device's native channel count via `SDL_GetAudioDeviceFormat` and surfaces both numbers in the Audio Processing panel. `AudioChannelOption::FORCE_STEREO`/`VIRTUAL_SURROUND` (panel dropdown, applied on next file open) let a user override automatic detection outright.
+- **Config file**: all of the above persists in `player_settings.txt` (key=value lines: `dsp_enabled`, `eq_band0`-`eq_band4` plus per-band frequency/Q, `noise_gate_*`, `compressor_*`, `multiband_*`, `limiter_*`, `crossover_*` including bass redirect, `loudness_*`, `surround3d_*`, `widener_*`, `balance`, `auto_genre_preset_enabled`, `spectrum_analyzer_enabled`, `channel_option`, `output_bit_depth`, `output_device_name`, `resampler_quality`), with a tested fallback for the pre-existing legacy format (a single bare resolution integer).
+
+---
+
 ## 6. Security, Maintenance & Dependency Management
 
-- **Upstream Dependencies**: Build dependencies are pinned in `CMakeLists.txt` (`SDL3` `release-3.4.0`, `imgui` `v1.91.9`, `nativefiledialog-extended` `v1.2.1`, FFmpeg `n8.1.2`).
-- **Updating Dependencies**: Update tag entries or archive SHA-256 hashes inside `CMakeLists.txt`.
-- **Packaging Compliance**: Release packages compiled by CI include a complete `licenses/` directory containing third-party licenses (`LICENSE.lgpl-2.1`, `LICENSE.sdl3`, `LICENSE.imgui`, `LICENSE.nfd`, `LICENSE.winpthread`, `FFMPEG_CREDITS.txt`), project `LICENSE`, `README.md`, and executable binaries.
+- **Upstream Dependencies**: Build dependencies are pinned in `CMakeLists.txt` by commit SHA, with the semantic version in a trailing comment — `SDL3` `release-3.4.0`, `imgui` `v1.91.9`, `nativefiledialog-extended` `v1.2.1` (all via `FetchContent`), and FFmpeg `n8.1.2` (prebuilt archive, verified by SHA-256).
+- **Updating Dependencies**: Update the `GIT_TAG` commit SHAs or the FFmpeg archive filename/SHA-256 hashes inside `CMakeLists.txt`, keeping the trailing version comments in sync.
+- **Packaging Compliance**: Release packages compiled by CI include a complete `licenses/` directory containing third-party licenses (`LICENSE.lgpl-3`, `LICENSE.sdl3`, `LICENSE.imgui`, `LICENSE.nfd`, `LICENSE.winpthread`, `FFMPEG_CREDITS.txt`), the project `LICENSE`, both `README.md` and `help.md`, the `assets/` directory, and the executable plus its runtime libraries. `FFMPEG_CREDITS.txt` also credits the bundled libsoxr resampler and the `avfilter`/`ebur128` component used for loudness metering (see [Section 5b](#5b-audio-dsp--loudness-pipeline)) -- this build uses FFmpeg's `--enable-version3` flag, so LGPL v3 applies to the FFmpeg binaries themselves (libsoxr keeps its own LGPL v2.1+ terms).
+- **`LICENSE.winpthread` scope**: retained in `licenses/` for locally MinGW-built binaries. It does **not** apply to the published Windows release, which is MSVC-built against the static CRT (`/MT`) and links no `libwinpthread` — see [Section 7](#7-cicd-pipeline--package-verification).
 
 ---
 
 ## 7. CI/CD Pipeline & Package Verification
 
-GitHub Actions workflows ([ci.yml](.github/workflows/ci.yml)) perform:
+GitHub Actions ([ci.yml](.github/workflows/ci.yml)) runs two jobs:
+
+**`test-and-analysis`** (Native Linux Testing & Analysis, `ubuntu-latest`):
+- **Repository Integrity**: Fails the build if `README.md`, `help.md`, `LICENSE`, or a non-empty `licenses/` directory is missing.
 - **Warning Enforcement**: Builds are compiled with `-Werror` (`-DTREAT_WARNINGS_AS_ERRORS=ON`).
-- **Sanitizers**: ASan, UBSan, and TSan automated test runs.
-- **Cross-Compilation**: MinGW cross-compilation testing.
-- **Package Verification**: Automated `Verify Package Compliance` step asserts presence of executable, dynamic libraries, `LICENSE`, `README.md`, and non-empty `licenses/` / `LICENSES/` directories.
-- **Release Artifact Publishing**: Publishes Windows release packages (`NaikAVPlayer-windows-x64`). Linux release artifact uploads are currently suspended until a portable build strategy is implemented.
+- **Tests & Coverage**: Runs the `ctest` suite in Release, captures coverage with `lcov`, and uploads it to Codecov.
+- **Static Analysis**: `cppcheck` over `src/` and `tests/` with `--error-exitcode=1` (passed `-I src/` so it resolves the subsystem-relative includes).
+- **Sanitizers**: Separate ASan/UBSan and TSan configure/build/test passes in Debug.
+- **Extra Configuration Check**: A `RelWithDebInfo` configure-and-build pass.
+- **Reports**: Test execution, cppcheck, ASan and UBSan results are converted to XLS and uploaded as workflow artifacts.
+
+**`build-packages`** (matrix):
+- **Linux x86_64** on `ubuntu-latest`, and **Windows x86_64** on `windows-latest` using the **native MSVC toolchain** — not MinGW cross-compiled from Linux, since MinGW PE binaries trip generic antivirus heuristics while MSVC output trips far fewer and supports Control Flow Guard. The MSVC build uses the static CRT (`/MT`), so no VC++ redistributable and no MinGW `libwinpthread` are shipped.
+- **Package Verification**: The `Verify Package Compliance` step asserts presence of the executable, `LICENSE`, `README.md`, `help.md`, and non-empty `licenses/` **and** `LICENSES/` directories.
+- **Release Artifact Publishing**: Uploads the Windows package (`NaikAVPlayer-windows-x64`) only for branches starting with `release`. Linux release artifact uploads are currently suspended until a portable build strategy is implemented.
+
+**Supply-chain pinning** (both jobs): every `uses:` reference is pinned to an immutable commit SHA (with the semantic version in a trailing comment), not a mutable `@v4`-style tag — a moving tag would silently pull new code into the build if that action's repository were ever compromised. This matches how `CMakeLists.txt` already pins SDL3/ImGui/NFD by commit SHA and verifies the FFmpeg archive by SHA-256. When updating an action, resolve the new tag to its commit (`gh api repos/OWNER/REPO/git/ref/tags/vN`, dereferencing to `object.sha` for annotated tags) and update the trailing version comment to match.
+
+> [!NOTE]
+> There is no MinGW cross-compilation job in CI. The MinGW cross-compile workflow in [Section 2](#2-compilation--local-cross-compilation-guide) is supported for local builds, but is not exercised by the pipeline.
 
 ---
 
 ## 8. Pipeline Instrumentation & Metrics Reference
 
-The execution pipeline tracks 9 metrics using lock-free Single Producer Single Consumer (SPSC) metric rings.
+The execution pipeline tracks 9 metrics using lock-free Single Producer Single Consumer (SPSC) metric rings, plus 3 always-on audio-underrun counters (M10-M12, below).
 
 | Metric ID | Metric Name | Hook Site (File:Function) | Producing Thread | Type | Gating |
 |---|---|---|---|---|---|
-| **M1** | `video_packet_queue_depth` | `ThreadSafeQueue.hpp:push/pop/try_pop/clear/reset` | Demuxer & Video Decoder | std::atomic<int> (Gauge) | Always-On |
-| **M2** | `audio_packet_queue_depth` | `ThreadSafeQueue.hpp:push/pop/try_pop/clear/reset` | Demuxer & Audio Decoder callback | std::atomic<int> (Gauge) | Always-On |
-| **M3** | `decoded_frame_queue_depth` | `ThreadSafeQueue.hpp:push/pop/try_pop/clear/reset` | Video Decoder & Main Render | std::atomic<int> (Gauge) | Always-On |
-| **M4** | `demux_time_per_packet_us` | `Demuxer.cpp:threadLoop()` | Demuxer thread | MetricRing<256> (SPSC) | gated |
-| **M5** | `decode_time_per_frame_us` | `VideoDecoder.cpp:decodeNextFrame()` | Video Decoder thread | MetricRing<256> (SPSC) | gated |
-| **M6-A** | `convert_time_us` | `VideoDecoder.cpp:convertFrame()` | Video Decoder thread | MetricRing<256> (SPSC) | gated |
-| **M6-B** | `upload_time_us` | `main.cpp:main()` | Main / Render thread | MetricRing<256> (SPSC) | gated |
-| **M7** | `av_clock_offset_ms` | `main.cpp:main()` | Main / Render thread | MetricRing<256> (SPSC) | gated |
-| **M8** | `frames_dropped_count` | `main.cpp:main()` | Main / Render thread | std::atomic<uint64_t> (Counter) | Always-On |
-| **M9** | `seek_latency_ms` | `PlayerController.cpp:seek()` & `finishCatchup()` | Video Decoder & Main thread | MetricRing<256> (SPSC) | gated |
+| **M1** | `video_packet_queue_depth` | `core/ThreadSafeQueue.hpp:push/pop/try_pop/clear/reset` | Demuxer & Video Decoder | std::atomic<int> (Gauge) | Always-On |
+| **M2** | `audio_packet_queue_depth` | `core/ThreadSafeQueue.hpp:push/pop/try_pop/clear/reset` | Demuxer & Audio Decoder callback | std::atomic<int> (Gauge) | Always-On |
+| **M3** | `decoded_frame_queue_depth` | `core/ThreadSafeQueue.hpp:push/pop/try_pop/clear/reset` | Video Decoder & Main Render | std::atomic<int> (Gauge) | Always-On |
+| **M4** | `demux_time_per_packet_us` | `media/Demuxer.cpp:threadLoop()` | Demuxer thread | MetricRing<256> (SPSC) | gated |
+| **M5** | `decode_time_per_frame_us` | `video/VideoDecoder.cpp:decodeNextFrame()` | Video Decoder thread | MetricRing<256> (SPSC) | gated |
+| **M6-A** | `convert_time_us` | `video/VideoDecoder.cpp:convertFrame()` | Video Decoder thread | MetricRing<256> (SPSC) | gated |
+| **M6-B** | `upload_time_us` | `app/main.cpp:main()` | Main / Render thread | MetricRing<256> (SPSC) | gated |
+| **M7** | `av_clock_offset_ms` | `app/main.cpp:main()` | Main / Render thread | MetricRing<256> (SPSC) | gated |
+| **M8** | `frames_dropped_count` | `app/main.cpp:main()` | Main / Render thread | std::atomic<uint64_t> (Counter) | Always-On |
+| **M9** | `seek_latency_ms` | `player/PlayerController.cpp:seek()` & `finishCatchup()` | Video Decoder & Main thread | MetricRing<256> (SPSC) | gated |
+| **M10** | `audio_callback_count` | `audio/AudioDecoder.cpp:sdlAudioStreamCallback()` | SDL audio callback thread | std::atomic<uint64_t> (Counter) | Always-On |
+| **M11** | `audio_silence_injections` | `audio/AudioDecoder.cpp:sdlAudioStreamCallback()` | SDL audio callback thread | std::atomic<uint64_t> (Counter) | Always-On |
+| **M12** | `audio_silence_bytes` | `audio/AudioDecoder.cpp:sdlAudioStreamCallback()` | SDL audio callback thread | std::atomic<uint64_t> (Counter) | Always-On |
+
+### Audio Underrun Counters (M10-M12)
+
+`sdlAudioStreamCallback()` fills the remainder of its output block with digital silence whenever `decodeAndResample()` cannot produce samples. Every such event is a hard discontinuity in the output — an audible click — so **M11 / M10** (silence injections as a fraction of callbacks) is the direct, quantitative measure of playback glitching. In a healthy stream it is `0.00%`.
+
+> [!IMPORTANT]
+> `SDL_GetAudioStreamQueued()` is **not** usable as an audio-health signal in this architecture, and will mislead you. The callback puts exactly the number of bytes SDL asked for and SDL consumes them immediately, so that query reads ~0 at all times whether playback is perfect or glitching badly. Use M10-M12 instead.
+
+Accessors: `AudioDecoder::getCallbackCount()` / `getSilenceInjectionCount()` / `getSilenceBytes()`, surfaced through `PlayerController::getAudioCallbackCount()` / `getAudioSilenceInjectionCount()` / `getAudioSilenceBytes()`. Relaxed-ordering atomics — monotonic counters read for reporting, never used to make playback decisions, so they cost nothing on the realtime path and are always on.
+
+### Standalone Diagnostic Harnesses
+
+Five self-contained programs under `tests/`, none of which are part of the `ctest` suite (only `NaikAVPlayer_tests` is registered via `add_test`). Two are CMake targets built alongside the app; three are built manually.
+
+**Built by CMake** (produced by a normal `cmake --build`, but never run by `ctest`):
+
+| Target | Source | Purpose |
+|---|---|---|
+| `NaikAVPlayer_dsp_repro` | `tests/dsp_repro_standalone.cpp` | Exercises the DSP chain through the **real** SDL audio device path, with none of the `SDL_OpenAudioDeviceStream` mocking `tests.cpp` uses. That mock falls back to a disconnected `SDL_CreateAudioStream()` with no callback bound whenever the real device open fails in a sandboxed runner, meaning `decodeAndResample()` — and therefore the whole DSP chain — never actually executes under a real audio callback thread in the normal suite. This program makes it run, matching what the GUI app does. |
+| `NaikAVPlayer_colorinfo_race` | `tests/colorinfo_race_repro.cpp` | Stress-tests the `getColorInfo()` data race between the UI thread (which calls it every frame for the Diagnostics HUD) and the video decode thread, which concurrently mutates and frees the same `AVFrame`. A real render loop only calls it once per frame, so the race was hard to hit organically. |
+
+**Built manually** (not wired into CMake; the smoke test needs a real audio device):
+
+| Source | Purpose |
+|---|---|
+| `tests/audio_underrun_smoke.cpp` | Drives the real `PlayerController` → `AudioDecoder` → SDL device path against a real media file, samples every queue depth over time, and reports M10-M12 with per-exit-path attribution. This is the tool that isolates a crackling report to a specific cause. |
+| `tests/audio_callback_bench.cpp` | Per-stage cost of the post-resample DSP path with every effect disabled, as a percentage of the realtime budget — i.e. what the callback still pays for unconditionally. |
+| `tests/resampler_bench.cpp` | `swr_convert` cost per `ResamplerQuality` tier at both matched (48k→48k) and converting (44.1k→48k) rates. |
+
+The manually-built ones compile with the compiler directly, since the DSP headers are header-only. Note the `-I src` — headers are included by subsystem-relative path:
+
+```bash
+g++ -O2 -std=gnu++17 -I src tests/audio_callback_bench.cpp -o build/bench
+./build/bench
+```
+
+The smoke test additionally links the player sources and FFmpeg/SDL3 — see the comment block at the top of each file for its exact command line.
+
+---
+
+## 9. Troubleshooting
+
+### `Could not initialize SDL3: No available audio device` (Linux)
+
+SDL3 was compiled with only its `dummy`/`disk` audio drivers because none of `libasound2-dev` / `libpipewire-0.3-dev` / `libpulse-dev` were present at configure time — see [Section 1](#1-linux-binary-compatibility-limitation--prerequisites). CMake now fails configuration outright with instructions rather than producing a build that only breaks at runtime. Install the missing package(s) and **reconfigure** (`cmake -B build ...`); a plain `cmake --build` will not re-run `pkg-config` detection.
+
+### `h264_v4l2m2m unavailable` / software decode fallback on Raspberry Pi 5
+
+Expected, not a bug. The Pi 5's BCM2712 exposes only a hardware **HEVC/H.265** decode block (`rpi-hevc-dec`); unlike the Pi 4's BCM2711 it has **no hardware H.264 M2M decoder**, so `h264_v4l2m2m` cannot open and the pipeline correctly falls back to software `h264` (see [Section 5](#5-hardware-acceleration--dynamic-fallback)). The Cortex-A76 cores handle 1080p H.264 in software comfortably.
+
+### Crackling / clicking audio during otherwise normal playback
+
+Fixed. `swr_convert()` returning **0** — the normal "resampler is still filling its internal buffer" state — was handled only for the `< 0` (genuine error) case. A zero-sample result therefore fell through to `m_audioBufferSize = 0`, which `sdlAudioStreamCallback()` cannot distinguish from a starved queue, so it wrote a full block of digital silence into a perfectly healthy stream. Each block is a hard discontinuity: an audible click.
+
+Because soxr's internal latency grows with its precision setting, the defect scaled directly with `ResamplerQuality` — worst at **Very High**, and only present at all when the source rate differs from the 48 kHz output (so 44.1 kHz content, i.e. most music, was hit hardest). Measured on a 44.1 kHz stereo source at Very High: **17.25% of all audio callbacks** emitted silence, with the audio packet queue sitting at 149/150 the entire time. After the fix: **0.00%**, verified across mono, stereo and 5.1 sources. See the resampler-latency bullet in [Section 5b](#5b-audio-dsp--loudness-pipeline).
+
+If you hear crackling on a current build, run `tests/audio_underrun_smoke.cpp` (see [Section 8](#8-pipeline-instrumentation--metrics-reference)) against the offending file. A non-zero silence-injection percentage with per-path attribution tells you exactly which `decodeAndResample()` exit is responsible; a **0.00%** result means the callback never starved and the artifact is coming from somewhere other than underruns — most commonly gain staging (see below).
+
+### Distorted, harsh, or pumping audio (not clicks)
+
+Almost always gain staging rather than a pipeline defect. Overlapping parametric EQ bands stack: five bands at +6 dB each is roughly **+10 to +15 dB broadband** in the overlap regions, not +6 dB, which drives normal program material far past full scale and leaves both limiters in continuous heavy gain reduction. Loudness normalization can add up to a further +24 dB on top.
+
+Press **Flat** in the Audio Processing panel, or delete `player_settings.txt` and relaunch. Note that the master **Enable Audio Processing** toggle alone is not sufficient: loudness normalization, 3D surround, stereo widener, balance and the spectrum analyzer are all deliberately *outside* that switch (it gates only EQ / noise gate / compressor / multiband / limiter / crossover), so each must be turned off on its own.
+
+### Playback freezes / system appears to hang after rapid seeking or seeking while paused
+
+Fixed — see [Section 5a](#5a-pipeline-backpressure--deadlock-prevention). The demuxer thread, which reads both streams, used to block indefinitely on a plain `push()` into the audio packet queue whenever nothing was draining it (audio is muted during a seek catch-up and stays paused while playback is paused). Once blocked it stopped calling `av_read_frame` entirely, starving the video queues too. All queue pushes are now bounded-wait with a drop fallback, so the pipeline self-recovers.
 
 ---
 

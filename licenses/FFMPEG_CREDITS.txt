@@ -1,27 +1,54 @@
 FFmpeg Attribution and Source Code Notice
 =========================================
 
-This package distributes precompiled shared library (.dll) files for FFmpeg:
-- avcodec-61.dll
-- avformat-61.dll
-- avutil-58.dll
-- swscale-7.dll
-- swresample-4.dll
+This package distributes precompiled shared library (.dll) files for FFmpeg
+(version n8.1.2):
+- avcodec-62.dll
+- avformat-62.dll
+- avutil-60.dll
+- avfilter-11.dll
+- avdevice-62.dll
+- swscale-9.dll
+- swresample-6.dll
+
+avfilter is used directly by NaikAVPlayer for real-time EBU R128 loudness
+metering (the `ebur128` filter, via a minimal abuffer -> ebur128 -> abuffersink
+graph -- see src/audio/dsp/LoudnessMeter.hpp). avdevice is bundled as part of
+the standard FFmpeg shared-library set but is not directly linked/called by
+NaikAVPlayer's own code.
 
 These libraries are licensed under the GNU Lesser General Public License (LGPL)
-version 2.1 or later. The LGPL license text is included in this package as
-`licenses/LICENSE.lgpl-2.1`.
+version 3. (This specific build was compiled with FFmpeg's `--enable-version3`
+configure flag, which upgrades the effective license from the LGPL's default
+"v2.1 or later" to v3 -- see the `configuration:` line printed by
+`ffmpeg -version` for this exact build to confirm.) The matching LGPL v3
+license text is included in this package as `licenses/LICENSE.lgpl-3`.
 
-The original, unmodified source code for FFmpeg used to build these binaries is
+Bundled optional component -- libsoxr (The SoX Resampler library):
+NaikAVPlayer explicitly selects libsoxr as swresample's resampling engine
+(`av_opt_set(swrCtx, "resampler", "soxr", 0)` in src/audio/AudioDecoder.cpp) for
+better stopband rejection than swresample's own default resampler. libsoxr is
+statically compiled into this build's swresample-6.dll (confirmed via
+`--enable-libsoxr` in the same `ffmpeg -version` configuration string) rather
+than shipped as a separate DLL. libsoxr is a distinct upstream project
+(https://sourceforge.net/projects/soxr/, also mirrored on GitHub), licensed
+under the LGPL version 2.1 or later -- a different license version than the
+FFmpeg wrapper binaries it's compiled into (see above), since libsoxr itself
+was not built with any GPLv3-requiring option. No modifications were made to
+libsoxr's source.
+
+The original, unmodified source code for FFmpeg (and the optional components
+compiled into it, including libsoxr) used to build these binaries is
 available from:
 - FFmpeg Official Website: https://ffmpeg.org
 - Source Downloads: https://ffmpeg.org/download.html
 - Git Repository: https://github.com/FFmpeg/FFmpeg
+- This project's specific prebuilt package source: https://github.com/BtbN/FFmpeg-Builds
 
 No modifications were made to the FFmpeg source code. The binaries were built
-using standard configure flags for LGPL distribution (such as disabling non-free/GPL
-components).
+using standard configure flags for LGPL distribution (such as disabling
+non-free/GPL-only components, e.g. libx264/libx265).
 
-Under Section 6 of the LGPL v2.1, you are permitted to replace these FFmpeg
-dynamic libraries with your own builds of the libraries, provided they maintain
-interface compatibility.
+Under the LGPL v3 (see `licenses/LICENSE.lgpl-3`), you are permitted to
+replace these FFmpeg dynamic libraries with your own builds of the libraries,
+provided they maintain interface compatibility.
