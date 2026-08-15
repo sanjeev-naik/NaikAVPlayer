@@ -130,7 +130,10 @@ int main() {
                         [&](float* b, int n) { balance.process(b, n); }, scratch, source)});
     rows.push_back({"SpectrumAnalyzer (disabled)",
                     measurePercentOfRealtime(
-                        [&](float* b, int n) { spectrum.process(b, n); }, scratch, source)});
+                        // const: SpectrumAnalyzer is the one read-only stage
+                        // here (a display tap), so its process() takes a
+                        // const float* unlike every other stage above.
+                        [&](const float* b, int n) { spectrum.process(b, n); }, scratch, source)});
     rows.push_back({"Limiter (ALWAYS ON, 0dB)",
                     measurePercentOfRealtime(
                         [&](float* b, int n) { safety.process(b, n); }, scratch, source)});
