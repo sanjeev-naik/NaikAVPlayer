@@ -99,6 +99,23 @@ void PlayerUI::init() {
   applyTheme();
 }
 
+void PlayerUI::openMediaFileDialog() {
+  if (m_controller.getState() == PlayerState::PLAYING) {
+    m_controller.pause();
+  }
+
+  if (m_fileDialogCallback) {
+    std::string path = m_fileDialogCallback();
+    if (!path.empty()) {
+      if (m_controller.openFile(path)) {
+        m_controller.play();
+      }
+    }
+  } else {
+    m_showLoadFileDialog = true;
+  }
+}
+
 std::string PlayerUI::formatTime(double seconds) {
   int s = static_cast<int>(seconds);
   int h = s / 3600;
@@ -483,16 +500,7 @@ void PlayerUI::drawWelcomeHUD(int windowWidth, int windowHeight) {
   float btnHeight = 40.0f;
   ImGui::SetCursorPosX((cardWidth - btnWidth) * 0.5f);
   if (ImGui::Button("Open Media File", ImVec2(btnWidth, btnHeight))) {
-    if (m_fileDialogCallback) {
-      std::string path = m_fileDialogCallback();
-      if (!path.empty()) {
-        if (m_controller.openFile(path)) {
-          m_controller.play();
-        }
-      }
-    } else {
-      m_showLoadFileDialog = true;
-    }
+    openMediaFileDialog();
   }
 
   ImGui::Spacing();
@@ -1091,16 +1099,7 @@ void PlayerUI::drawControlsBar(int windowWidth, int windowHeight) {
 
   // Left Group: Open File Button
   if (drawIconButton("##browse", IconType::Folder, ImVec2(36, 28))) {
-    if (m_fileDialogCallback) {
-      std::string path = m_fileDialogCallback();
-      if (!path.empty()) {
-        if (m_controller.openFile(path)) {
-          m_controller.play();
-        }
-      }
-    } else {
-      m_showLoadFileDialog = true;
-    }
+    openMediaFileDialog();
   }
   if (ImGui::IsItemHovered()) {
     ImGui::SetTooltip("Browse Media File");
@@ -1137,7 +1136,7 @@ void PlayerUI::drawControlsBar(int windowWidth, int windowHeight) {
       if (state != PlayerState::UNINITIALIZED) {
         m_controller.play();
       } else {
-        m_showLoadFileDialog = true;
+        openMediaFileDialog();
       }
     }
     if (ImGui::IsItemHovered()) {

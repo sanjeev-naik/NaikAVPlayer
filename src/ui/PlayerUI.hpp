@@ -93,6 +93,7 @@ private:
     static void applyTheme();
 
     // Modular drawing helpers
+    void openMediaFileDialog();
     void drawWelcomeHUD(int windowWidth, int windowHeight);
     void drawAudioVisualizer(int windowWidth, int windowHeight, double currentSystemTime);
     void drawTitleBar(int windowWidth, int windowHeight);
