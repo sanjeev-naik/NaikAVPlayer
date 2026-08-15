@@ -89,6 +89,14 @@ private:
     std::vector<float> m_visualizerPeakVelocities;
     double m_visualizerLastTime = 0.0;
 
+    struct ToastNotification {
+        std::string message;
+        double expiryTime = 0.0;
+        double totalDuration = 3.5;
+        bool isError = false;
+    };
+    ToastNotification m_toast;
+
     static std::string formatTime(double seconds);
     static void applyTheme();
 
@@ -100,6 +108,7 @@ private:
     void drawControlsBar(int windowWidth, int windowHeight);
     void drawDiagnosticsHUD(int windowWidth, int windowHeight);
     void drawAudioSettingsPanel(int windowWidth, int windowHeight);
+    void drawToastNotification(int windowWidth, int windowHeight, double currentSystemTime);
 
     static bool drawIconButton(const char* str_id, IconType icon, ImVec2 size);
 
@@ -122,6 +131,15 @@ public:
     void toggleAudioSettings() { m_showAudioSettings = !m_showAudioSettings; }
     bool isAudioSettingsVisible() const { return m_showAudioSettings; }
 
+    // Volume and Mute helpers
+    void toggleMute();
+    void adjustVolume(float deltaPercent);
+    void setVolumePercent(float percent);
+    float getVolumePercent() const { return m_uiVolume; }
+    bool isMuted() const { return m_isMuted; }
+
+    // Toast notifications
+    void showToast(const std::string& message, bool isError = false, double durationSeconds = 3.5);
 
     void registerVideoFrameRendered(double currentSystemTime);
     
@@ -136,4 +154,6 @@ public:
     void notifyMouseActivity(double currentSystemTime);
 
     // Get visibility state
+    bool isControlsVisible() const { return m_controlsVisible; }
 };
+
