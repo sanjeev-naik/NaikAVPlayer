@@ -476,7 +476,7 @@ bool AudioDecoder::init() {
     m_spectrum.setEnabled(true);
     m_finalSafetyLimiter.configure(m_outChannels, m_outSampleRate);
 
-    if (m_audioStream && m_playbackSpeed.load() != 1.0f) {
+    if (m_playbackSpeed.load() != 1.0f) {
         SDL_SetAudioStreamFrequencyRatio(m_audioStream, m_playbackSpeed.load());
     }
 
