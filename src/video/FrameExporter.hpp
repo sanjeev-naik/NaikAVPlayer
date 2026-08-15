@@ -53,11 +53,11 @@ public:
             size_t dot = raw.find_last_of('.');
             baseName = (dot == std::string::npos) ? raw : raw.substr(0, dot);
         }
-        for (char& c : baseName) {
-            if (c == ' ' || c == ':' || c == '*' || c == '?' || c == '"' || c == '<' || c == '>' || c == '|' || c == '/' || c == '\\') {
-                c = '_';
-            }
-        }
+        std::replace_if(baseName.begin(), baseName.end(), [](char c) {
+            return c == ' ' || c == ':' || c == '*' || c == '?' || c == '"' ||
+                   c == '<' || c == '>' || c == '|' || c == '/' || c == '\\';
+        }, '_');
+
 
         // Current system date-time string (YYYYMMDD_HHMMSS)
         auto now = std::chrono::system_clock::now();

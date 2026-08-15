@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <numeric>
 #include <imgui.h>
 #include <iostream>
 
@@ -615,11 +616,11 @@ void PlayerUI::drawAudioVisualizer(int windowWidth, int windowHeight, double cur
   }
 
   // Calculate aggregate energy for bass and brightness
-  float bassEnergy = 0.0f;
-  for (int i = 0; i < std::min(8, kNumVisualizerBands); ++i) {
-    bassEnergy += m_visualizerSmoothBands[i];
-  }
-  bassEnergy /= 8.0f;
+  const int bassBandsCount = std::min(8, kNumVisualizerBands);
+  float bassEnergy = std::accumulate(m_visualizerSmoothBands.begin(),
+                                     m_visualizerSmoothBands.begin() + bassBandsCount,
+                                     0.0f) / static_cast<float>(bassBandsCount);
+
 
   // Palette color interpolator
   auto getThemeColor = [this](float t, float alpha = 1.0f) -> ImVec4 {
