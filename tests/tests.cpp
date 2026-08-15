@@ -1577,8 +1577,8 @@ int real_main(int argc, char* argv[]) {
         {
             std::string coverAudioFile = testFile.substr(0, testFile.find_last_of("/\\") + 1) + "test_audio_with_cover.mp3";
             std::cout << "Testing Audio with Attached Picture: " << coverAudioFile << std::endl;
-            bool openSuccess = controller.openFile(coverAudioFile);
-            test_assert(openSuccess, "Audio file with album art opens successfully");
+            bool coverOpenSuccess = controller.openFile(coverAudioFile);
+            test_assert(coverOpenSuccess, "Audio file with album art opens successfully");
             test_assert(controller.hasAudio(), "Audio with album art hasAudio() is true");
             test_assert(!controller.hasVideo(), "Audio with album art hasVideo() is false (attached picture excluded from video pipeline)");
 
