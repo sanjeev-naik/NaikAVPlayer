@@ -415,6 +415,19 @@ int main(int argc, char *argv[]) {
         case SDLK_L:
           controller.setLoopEnabled(!controller.isLoopEnabled());
           break;
+        case SDLK_LEFTBRACKET: {
+          float current = controller.getPlaybackSpeed();
+          controller.setPlaybackSpeed(std::round((current - 0.25f) * 100.0f) / 100.0f);
+          break;
+        }
+        case SDLK_RIGHTBRACKET: {
+          float current = controller.getPlaybackSpeed();
+          controller.setPlaybackSpeed(std::round((current + 0.25f) * 100.0f) / 100.0f);
+          break;
+        }
+        case SDLK_BACKSPACE:
+          controller.setPlaybackSpeed(1.0f);
+          break;
         case SDLK_D:
           playerUI.toggleDiagnostics();
           break;

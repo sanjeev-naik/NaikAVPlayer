@@ -3698,6 +3698,30 @@ int main(int argc, char* argv[]) {
                 if (fmtCtx2) avformat_close_input(&fmtCtx2);
             }
 
+            // --- Playback Speed Control Tests ---
+            {
+                std::cout << "Running playback speed control tests..." << std::endl;
+                PlayerController speedController;
+                test_assert(std::fabs(speedController.getPlaybackSpeed() - 1.0f) < 0.001f,
+                            "PlayerController: default playback speed is 1.0x");
+
+                speedController.setPlaybackSpeed(1.5f);
+                test_assert(std::fabs(speedController.getPlaybackSpeed() - 1.5f) < 0.001f,
+                            "PlayerController: playback speed set to 1.5x");
+
+                speedController.setPlaybackSpeed(0.1f); // below min 0.25f
+                test_assert(std::fabs(speedController.getPlaybackSpeed() - 0.25f) < 0.001f,
+                            "PlayerController: playback speed clamped to minimum 0.25x");
+
+                speedController.setPlaybackSpeed(3.0f); // above max 2.0f
+                test_assert(std::fabs(speedController.getPlaybackSpeed() - 2.0f) < 0.001f,
+                            "PlayerController: playback speed clamped to maximum 2.0x");
+
+                speedController.setPlaybackSpeed(1.0f);
+                test_assert(std::fabs(speedController.getPlaybackSpeed() - 1.0f) < 0.001f,
+                            "PlayerController: playback speed reset to 1.0x");
+            }
+
             std::cout << "ReplayGain tag / genre preset / output selector tests passed!" << std::endl;
         }
 

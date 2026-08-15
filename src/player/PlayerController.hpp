@@ -60,6 +60,7 @@ private:
     std::atomic<double> m_lastSystemTime;
     
     float m_volume;
+    std::atomic<float> m_playbackSpeed{1.0f};
 
     // UI-thread-only copy, mirroring m_volume's pattern: written/read only
     // from the UI thread (single-writer/single-reader), applied to the
@@ -226,8 +227,13 @@ public:
     VideoDecoder* getVideoDecoder() const { return m_videoDecoder.get(); }
     ThreadSafeQueue<DecodedFrame>& getDecodedFrameQueue() { return m_decodedFrameQueue; }
     
+    static constexpr float kMinPlaybackSpeed = 0.25f;
+    static constexpr float kMaxPlaybackSpeed = 2.0f;
+
     // Setters
     void setVolume(float volume);
+    void setPlaybackSpeed(float speed);
+    float getPlaybackSpeed() const { return m_playbackSpeed.load(); }
     void setLoopEnabled(bool enabled) { m_loopEnabled = enabled; }
     bool isLoopEnabled() const { return m_loopEnabled; }
     bool hasSeeked() const { return m_seeked.load(); }
