@@ -373,6 +373,10 @@ void drive_playback(PlayerController& controller, double seconds) {
                 }
             }
         }
+        if (controller.hasAudio() && controller.m_audioDecoder && controller.getState() == PlayerState::PLAYING) {
+            // Pump audio decoder callback for headless CI environments without active hardware audio driver
+            AudioDecoder::sdlAudioStreamCallback(controller.m_audioDecoder.get(), nullptr, 4096, 4096);
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 }

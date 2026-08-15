@@ -344,6 +344,23 @@ decode -> resample (swresample, libsoxr engine, selectable quality) -> DSP chain
 
 ---
 
+## 5c. Audio-Only Playback Pipeline & Real-Time Visualizer
+
+NaikAVPlayer provides a dedicated audio-only playback mode that activates automatically whenever a media file contains audio streams without a motion video stream (including MP3, AAC, FLAC, OGG, WAV):
+
+- **Embedded Album Cover Art Handling (`AV_DISPOSITION_ATTACHED_PIC`)**: ID3 APIC / attached pictures are exposed by FFmpeg as video streams with the `AV_DISPOSITION_ATTACHED_PIC` or `AV_DISPOSITION_TIMED_THUMBNAILS` disposition. `Demuxer::open()` explicitly filters out attached picture streams when selecting `m_videoStreamIdx`, ensuring tracks with embedded artwork are accurately classified as audio-only media (`hasAudio() == true`, `hasVideo() == false`) without stalling the video decoder pipeline.
+- **Timebase-Accurate Audio Clock**: `AudioDecoder::decodeAndResample()` converts decoded frame presentation timestamps directly from the stream timebase (`m_timeBase`, e.g., `1/14112000` for MP3) into seconds via `static_cast<double>(pts - startTime) * av_q2d(m_timeBase)`. This guarantees sample-accurate master clock progression at true 1.0x playback speed across all audio formats and sample rates.
+- **Demuxer Backpressure for Audio Streams**: For audio-only media (`m_videoStreamIdx < 0`), the demuxer uses blocking queue push `m_audioQueue.push(packet)` during paused or initial open states rather than dropping packets, preserving the full track buffer.
+- **Hardware-Accelerated Real-Time Visualizer**: When an audio-only file is loaded, `PlayerUI::drawAudioVisualizer()` automatically renders an interactive audio visualizer across the viewport using Dear ImGui `ImDrawList` primitives (<0.1% CPU overhead):
+  - **Neon Equalizer Bars (Default)**: 64 logarithmic frequency bands covering ~20 Hz to 20 kHz, smoothed with fast attack and exponential decay, gravity-falling peak cap indicators, floor reflections, and bass-reactive central ambient glow.
+  - **Smooth Waveform**: Continuous oscillating audio oscilloscope ribbon with multi-layer glow and gradient fill.
+  - **Radial Audio Disc**: 360-degree circular visualizer with rotating vinyl disc aesthetics, pulsating center bass ring, and radiating frequency spikes.
+  - **Mirrored Stereo Spectrum**: Symmetrical top-and-bottom frequency equalizer bars meeting at a glowing horizon line.
+  - **Vibrant Color Palettes**: `CYBER` (Cyan/Magenta), `SUNSET` (Amber/Hot Pink), `MINT` (Mint/Emerald), and `VIOLET` (Aqua/Purple).
+  - **Telemetry Snapshots**: Self-synchronized thread-safe getters `getSpectrumMagnitudesDb()` (512 FFT bins) and `getWaveformSamples()` (1024 time-domain samples) feed the visualizer without requiring audio callback locks.
+
+---
+
 ## 6. Security, Maintenance & Dependency Management
 
 - **Upstream Dependencies**: Build dependencies are pinned in `CMakeLists.txt` by commit SHA, with the semantic version in a trailing comment — `SDL3` `release-3.4.0`, `imgui` `v1.91.9`, `nativefiledialog-extended` `v1.2.1` (all via `FetchContent`), and FFmpeg `n8.1.2` (prebuilt archive, verified by SHA-256).
@@ -464,6 +481,14 @@ Press **Flat** in the Audio Processing panel, or delete `player_settings.txt` an
 ### Playback freezes / system appears to hang after rapid seeking or seeking while paused
 
 Fixed — see [Section 5a](#5a-pipeline-backpressure--deadlock-prevention). The demuxer thread, which reads both streams, used to block indefinitely on a plain `push()` into the audio packet queue whenever nothing was draining it (audio is muted during a seek catch-up and stays paused while playback is paused). Once blocked it stopped calling `av_read_frame` entirely, starving the video queues too. All queue pushes are now bounded-wait with a drop fallback, so the pipeline self-recovers.
+
+### Audio-only / MP3 files skip rapidly or finish playback in ~4 seconds
+
+Fixed — see [Section 5c](#5c-audio-only-playback-pipeline--real-time-visualizer). `AudioDecoder` previously computed decoded audio frame PTS by dividing `pts` by `sample_rate` instead of converting from stream `m_timeBase`. On MP3 files (where `time_base` is typically `1/14112000`), timestamps scaled ~320x too fast, advancing the master clock past the track duration within milliseconds. In addition, the demuxer's initial paused-state push was dropping packets. Both issues are resolved and verified by automated test suites.
+
+### MP3 files with album artwork showing a blank screen instead of the visualizer
+
+Fixed — see [Section 5c](#5c-audio-only-playback-pipeline--real-time-visualizer). Embedded cover art (ID3 APIC / attached pictures) is demuxed by FFmpeg as a video stream with `AV_DISPOSITION_ATTACHED_PIC`. `Demuxer::open()` now filters out attached picture streams from `m_videoStreamIdx`, ensuring tracks with cover art correctly identify as audio-only files (`hasAudio() == true`, `hasVideo() == false`) and automatically activate the real-time visualizer.
 
 ---
 
