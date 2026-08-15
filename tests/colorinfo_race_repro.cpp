@@ -19,12 +19,14 @@
 #include <iostream>
 #include <thread>
 
+// argv is never modified, but the suggested 'char* const argv[]' decays to
+// char* const* -- not one of the signatures the standard defines for main.
+// cppcheck-suppress constParameter
 int main(int argc, char* argv[]) {
     if (argc < 2) {
         std::cerr << "Usage: " << argv[0] << " <video_file> [seconds]" << std::endl;
         return 1;
     }
-    std::string file = argv[1];
     double seconds = argc > 2 ? std::stod(argv[2]) : 15.0;
 
     SDL_SetMainReady();
@@ -34,6 +36,7 @@ int main(int argc, char* argv[]) {
     }
 
     {
+        const std::string file = argv[1];
         PlayerController controller;
         std::cout << "Opening: " << file << std::endl;
         if (!controller.openFile(file)) {

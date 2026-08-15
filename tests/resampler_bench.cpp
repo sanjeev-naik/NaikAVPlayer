@@ -21,6 +21,7 @@ extern "C" {
 
 #include <chrono>
 #include <cstdio>
+#include <algorithm>
 #include <random>
 #include <vector>
 
@@ -68,7 +69,7 @@ double benchTier(double precisionBits, int inRate, bool useSoxr) {
     std::vector<float> in(static_cast<size_t>(inFrames) * kChannels);
     std::mt19937 rng(999);
     std::uniform_real_distribution<float> dist(-0.5f, 0.5f);
-    for (auto& s : in) s = dist(rng);
+    std::generate(in.begin(), in.end(), [&] { return dist(rng); });
 
     std::vector<float> out(static_cast<size_t>(kBlockFrames + 64) * kChannels);
     const uint8_t* inPtr[1] = { reinterpret_cast<const uint8_t*>(in.data()) };

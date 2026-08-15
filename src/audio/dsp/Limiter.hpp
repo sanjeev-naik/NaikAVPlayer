@@ -88,7 +88,13 @@ public:
             const int64_t n = m_frameCounter++;
             m_windowMaxima.emplace_back(n, incomingPeak);
             const int64_t windowStart = n - m_lookaheadFrames;
-            while (!m_windowMaxima.empty() && m_windowMaxima.front().first < windowStart) {
+            // Retain at least one entry: the element just emplaced above has
+            // key n, and m_lookaheadFrames is never negative (see
+            // updateLookaheadBuffer()), so n < windowStart is never true and
+            // that entry is never the one being expired. Bounding on
+            // size() > 1 rather than !empty() makes that invariant
+            // structural, so front() below is unconditionally safe.
+            while (m_windowMaxima.size() > 1 && m_windowMaxima.front().first < windowStart) {
                 m_windowMaxima.pop_front();
             }
             const float windowPeak = m_windowMaxima.front().second;

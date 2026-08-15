@@ -3052,8 +3052,9 @@ int main(int argc, char* argv[]) {
                 }
                 std::vector<float> downmixed(static_cast<size_t>(n) * 2, 0.0f);
                 dmLoud.process(loudIn.data(), n, downmixed.data());
-                float downmixedPeak = 0.0f;
-                for (float v : downmixed) downmixedPeak = std::max(downmixedPeak, std::fabs(v));
+                const float downmixedPeak = std::accumulate(
+                    downmixed.begin(), downmixed.end(), 0.0f,
+                    [](float acc, float v) { return std::max(acc, std::fabs(v)); });
                 test_assert(downmixedPeak > 1.0f,
                             "SpatialDownmixer: three simultaneously loud source channels can sum past full scale (no headroom by design)");
 
@@ -3077,8 +3078,9 @@ int main(int argc, char* argv[]) {
                 auto beforeFinalLimiter = downmixed;
                 s3dChain.process(beforeFinalLimiter.data(), n);
                 widenerChain.process(beforeFinalLimiter.data(), n);
-                float chainedPeak = 0.0f;
-                for (float v : beforeFinalLimiter) chainedPeak = std::max(chainedPeak, std::fabs(v));
+                const float chainedPeak = std::accumulate(
+                    beforeFinalLimiter.begin(), beforeFinalLimiter.end(), 0.0f,
+                    [](float acc, float v) { return std::max(acc, std::fabs(v)); });
                 test_assert(chainedPeak > downmixedPeak,
                             "Surround3D + StereoWidener measurably add to an already-over-full-scale signal");
 
@@ -3092,8 +3094,9 @@ int main(int argc, char* argv[]) {
                 finalSafety.setCeilingDb(0.0f);
                 auto afterFinalLimiter = beforeFinalLimiter;
                 finalSafety.process(afterFinalLimiter.data(), n);
-                float finalPeak = 0.0f;
-                for (float v : afterFinalLimiter) finalPeak = std::max(finalPeak, std::fabs(v));
+                const float finalPeak = std::accumulate(
+                    afterFinalLimiter.begin(), afterFinalLimiter.end(), 0.0f,
+                    [](float acc, float v) { return std::max(acc, std::fabs(v)); });
                 test_assert(finalPeak <= 1.0001f,
                             "Final safety Limiter backstop contains overshoot from SpatialDownmixer+Surround3D+StereoWidener within +/-1.0");
             }
@@ -3329,7 +3332,14 @@ int main(int argc, char* argv[]) {
                         }
                         everProducedAudio = true;
                         size_t commonBytes = std::min(plainDecoder.m_audioBufferSize, dspDecoder.m_audioBufferSize);
+                        // m_audioBuffer is byte-typed because it holds whatever
+                        // the device format is; on this path it carries the
+                        // DSP chain's native float samples, and the vector's
+                        // allocator satisfies float alignment. Reading it back
+                        // as float is exactly what the audio callback does.
+                        // cppcheck-suppress invalidPointerCast
                         const float* plainSamples = reinterpret_cast<const float*>(plainDecoder.m_audioBuffer.data());
+                        // cppcheck-suppress invalidPointerCast
                         const float* dspSamples = reinterpret_cast<const float*>(dspDecoder.m_audioBuffer.data());
                         for (size_t i = 0; i < commonBytes / sizeof(float); ++i) {
                             if (std::fabs(plainSamples[i] - dspSamples[i]) > 1e-4f) {
@@ -3547,8 +3557,16 @@ int main(int argc, char* argv[]) {
                 test_assert(sdlFormatFor(AudioOutputBitDepth::BIT_32_INT) == SDL_AUDIO_S32, "sdlFormatFor: BIT_32_INT maps to SDL_AUDIO_S32");
                 test_assert(sdlFormatFor(AudioOutputBitDepth::BIT_32_FLOAT) == SDL_AUDIO_F32, "sdlFormatFor: BIT_32_FLOAT maps to SDL_AUDIO_F32");
 
+                // cppcheck folds these to "always true" by inlining
+                // outputBytesPerSampleFor()'s current body. That is the point:
+                // the assertions pin the depth-to-width mapping so a future
+                // edit to that function fails the suite rather than silently
+                // resizing every audio buffer.
+                // cppcheck-suppress knownConditionTrueFalse
                 test_assert(outputBytesPerSampleFor(AudioOutputBitDepth::BIT_16) == 2, "outputBytesPerSampleFor: BIT_16 is 2 bytes/sample");
+                // cppcheck-suppress knownConditionTrueFalse
                 test_assert(outputBytesPerSampleFor(AudioOutputBitDepth::BIT_32_INT) == 4, "outputBytesPerSampleFor: BIT_32_INT is 4 bytes/sample");
+                // cppcheck-suppress knownConditionTrueFalse
                 test_assert(outputBytesPerSampleFor(AudioOutputBitDepth::BIT_32_FLOAT) == 4, "outputBytesPerSampleFor: BIT_32_FLOAT is 4 bytes/sample");
 
                 test_assert(resamplerPrecisionBitsFor(ResamplerQuality::LOW) == 16.0, "resamplerPrecisionBitsFor: LOW is 16 bits");

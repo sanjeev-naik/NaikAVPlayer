@@ -32,6 +32,11 @@ public:
     void setWidth(float width) { m_width = std::max(0.0f, width); }
     float getWidth() const { return m_width; }
 
+    // Intentionally empty: this stage is stateless (mid-side width is a
+    // per-sample computation with no history to clear). Kept as a non-static
+    // member so every DSP stage exposes the same reset() interface for
+    // callers that reset the chain uniformly.
+    // cppcheck-suppress functionStatic
     void reset() {}
 
     // In-place processing of an interleaved float buffer. No-op unless

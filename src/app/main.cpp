@@ -51,10 +51,16 @@ static bool isSignalQuitRequested() {
 static void attachParentConsole() {
   if (AttachConsole(ATTACH_PARENT_PROCESS)) {
     FILE *dummy;
-    freopen_s(&dummy, "CONOUT$", "w", stdout);
-    freopen_s(&dummy, "CONOUT$", "w", stderr);
-    std::cout.clear();
-    std::cerr.clear();
+    // Only clear the iostream error state for streams actually redirected
+    // onto the console -- if freopen_s() failed, the underlying FILE* is
+    // still detached and clearing the state would just advertise an output
+    // path that does not work.
+    if (freopen_s(&dummy, "CONOUT$", "w", stdout) == 0) {
+      std::cout.clear();
+    }
+    if (freopen_s(&dummy, "CONOUT$", "w", stderr) == 0) {
+      std::cerr.clear();
+    }
   }
 }
 #endif

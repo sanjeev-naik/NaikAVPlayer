@@ -717,12 +717,13 @@ void AudioDecoder::decodeAndResample() {
                 // floats, m_dspChannels >= 3 whenever this is active), so
                 // this can't clobber data still needed elsewhere.
                 if (m_spatialDownmixActive) {
-                    size_t downmixBytes = static_cast<size_t>(outSamples) * 2 * sizeof(float);
-                    if (m_downmixBuffer.size() < downmixBytes) {
-                        m_downmixBuffer.resize(downmixBytes);
+                    const size_t downmixSamples = static_cast<size_t>(outSamples) * 2;
+                    if (m_downmixBuffer.size() < downmixSamples) {
+                        m_downmixBuffer.resize(downmixSamples);
                     }
-                    m_spatialDownmixer.process(dspBuffer, outSamples, reinterpret_cast<float*>(m_downmixBuffer.data()));
-                    std::memcpy(m_audioBuffer.data(), m_downmixBuffer.data(), downmixBytes);
+                    m_spatialDownmixer.process(dspBuffer, outSamples, m_downmixBuffer.data());
+                    std::memcpy(m_audioBuffer.data(), m_downmixBuffer.data(),
+                                downmixSamples * sizeof(float));
                 }
 
                 // "3D Surround" ambience synthesis, then mid-side stereo
@@ -876,6 +877,13 @@ void AudioDecoder::sdlAudioStreamCallback(void* userdata, SDL_AudioStream* strea
             case AudioOutputBitDepth::BIT_32_FLOAT: {
                 // Float in, float out -- no truncation, so no dither needed
                 // either; this is the only lossless path in the callback.
+                //
+                // destPtr is SDL's own output block (Uint8*), which the
+                // device was opened as SDL_AUDIO_F32 in this branch, so it
+                // is float data by construction and SDL guarantees its
+                // alignment. The byte-typed pointer is the shape of SDL's
+                // callback API, not a representation mismatch.
+                // cppcheck-suppress invalidPointerCast
                 float* dest = reinterpret_cast<float*>(destPtr);
                 if (volume <= 0.01f) {
                     std::memset(dest, 0, samplesToCopy * sizeof(float));

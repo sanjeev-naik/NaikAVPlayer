@@ -208,8 +208,10 @@ private:
     // Scratch buffer for m_spatialDownmixer's 2-channel output, copied
     // into the front of m_audioBuffer afterward. Reused across calls to
     // decodeAndResample() (like m_audioBuffer itself) to avoid a
-    // per-frame allocation.
-    std::vector<uint8_t> m_downmixBuffer;
+    // per-frame allocation. Typed as float (unlike m_audioBuffer, which
+    // holds whatever the device format is) because it only ever carries
+    // the DSP path's native float samples.
+    std::vector<float> m_downmixBuffer;
 
     // Parametric EQ -> compressor -> limiter -> LFE crossover, applied to
     // the freshly-decoded float buffer in decodeAndResample(), before the

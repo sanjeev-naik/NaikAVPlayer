@@ -286,7 +286,10 @@ src/
 └── video/     VideoDecoder.{hpp,cpp} — HW/SW decode, frame conversion
 ```
 
-`src/audio/dsp/` is entirely header-only: `AudioDspSettings.hpp` (settings struct, the 9 presets, and genre mapping), `Biquad.hpp`, `ParametricEQ.hpp`, `NoiseGate.hpp`, `Compressor.hpp`, `MultibandCompressor.hpp`, `Limiter.hpp`, `Crossover.hpp`, `DspChain.hpp`, `LoudnessMeter.hpp`, `LoudnessNormalizer.hpp`, `LoudnessPrescan.hpp`, `ReplayGainTags.hpp`, `SpatialDownmixer.hpp`, `Surround3D.hpp`, `StereoWidener.hpp`, `BalanceControl.hpp`, `SpectrumAnalyzer.hpp`.
+`src/audio/dsp/` is entirely header-only: `AudioDspSettings.hpp` (settings struct, the 9 presets, and genre mapping), `Biquad.hpp`, `ParametricEQ.hpp`, `NoiseGate.hpp`, `Compressor.hpp`, `MultibandCompressor.hpp`, `Limiter.hpp`, `Crossover.hpp`, `DspChain.hpp`, `LoudnessMeter.hpp`, `LoudnessNormalizer.hpp`, `LoudnessPrescan.hpp`, `ReplayGainTags.hpp`, `SpatialDownmixer.hpp`, `Surround3D.hpp`, `StereoWidener.hpp`, `BalanceControl.hpp`, `SpectrumAnalyzer.hpp`, `DspMath.hpp`.
+
+> [!NOTE]
+> `DspMath.hpp` exists so this module never depends on `M_PI`, which is a POSIX extension rather than standard C++. libstdc++ exposes it from `<cmath>` by default and SDL3's `SDL_stdinc.h` defines it as a fallback, but MSVC only defines it when `_USE_MATH_DEFINES` is set *before* the first `<cmath>` include — an ordering constraint these headers cannot guarantee, since `AudioDecoder.hpp` includes them ahead of any SDL header. Use `naikav::dsp::kPi` in new DSP code, not `M_PI`.
 
 ---
 

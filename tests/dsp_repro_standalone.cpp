@@ -57,8 +57,6 @@ int main(int argc, char* argv[]) {
                   << " <no_audio_file> <big_file_with_audio> [seconds_to_play] [live|preset]" << std::endl;
         return 1;
     }
-    std::string noAudioFile = argv[1];
-    std::string bigFile = argv[2];
     double playSeconds = argc > 3 ? std::stod(argv[3]) : 8.0;
     std::string mode = argc > 4 ? argv[4] : "preset";
     bool liveMode = (mode == "live");
@@ -70,6 +68,8 @@ int main(int argc, char* argv[]) {
     }
 
     {
+        const std::string noAudioFile = argv[1];
+        const std::string bigFile = argv[2];
         PlayerController controller;
 
         std::cout << "[1] Opening no-audio file: " << noAudioFile << std::endl;

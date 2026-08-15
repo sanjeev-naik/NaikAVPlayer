@@ -17,6 +17,7 @@
 #include <SDL3/SDL_main.h>
 
 #include <algorithm>
+#include <numeric>
 #include <chrono>
 #include <cstdio>
 #include <string>
@@ -123,8 +124,8 @@ int main(int argc, char** argv) {
 
     auto avg = [](const std::vector<size_t>& v) {
         if (v.empty()) return 0.0;
-        double t = 0.0;
-        for (size_t x : v) t += static_cast<double>(x);
+        const double t = std::accumulate(v.begin(), v.end(), 0.0,
+                                         [](double acc, size_t x) { return acc + static_cast<double>(x); });
         return t / v.size();
     };
     auto minOf = [](const std::vector<size_t>& v) {
@@ -162,7 +163,7 @@ int main(int argc, char** argv) {
     std::printf("  total silence emitted      : %llu bytes\n",
                 static_cast<unsigned long long>(silBytes));
 
-    if (AudioDecoder* ad = controller.audioDecoderForDiagnostics()) {
+    if (const AudioDecoder* ad = controller.audioDecoderForDiagnostics()) {
         char errbuf[128] = {0};
         const int reason = ad->getLastFailReason();
         av_strerror(reason, errbuf, sizeof(errbuf));

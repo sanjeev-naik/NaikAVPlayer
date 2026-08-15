@@ -2,6 +2,8 @@
 
 #include <cmath>
 
+#include "audio/dsp/DspMath.hpp"
+
 namespace naikav::dsp {
 
 // Direct Form I biquad IIR filter using the Robert Bristow-Johnson "Audio
@@ -19,7 +21,7 @@ public:
     // with bandwidth controlled by q (higher q = narrower band).
     void setPeaking(double freqHz, double q, double gainDb, double sampleRate) {
         const double A = std::pow(10.0, gainDb / 40.0);
-        const double w0 = 2.0 * M_PI * freqHz / sampleRate;
+        const double w0 = 2.0 * kPi * freqHz / sampleRate;
         const double cosW0 = std::cos(w0);
         const double sinW0 = std::sin(w0);
         const double alpha = sinW0 / (2.0 * q);
@@ -38,7 +40,7 @@ public:
     // gives a Butterworth (maximally flat) response, used by Crossover to
     // build Linkwitz-Riley slopes via cascaded stages.
     void setLowpass(double freqHz, double q, double sampleRate) {
-        const double w0 = 2.0 * M_PI * freqHz / sampleRate;
+        const double w0 = 2.0 * kPi * freqHz / sampleRate;
         const double cosW0 = std::cos(w0);
         const double sinW0 = std::sin(w0);
         const double alpha = sinW0 / (2.0 * q);
@@ -54,7 +56,7 @@ public:
     }
 
     void setHighpass(double freqHz, double q, double sampleRate) {
-        const double w0 = 2.0 * M_PI * freqHz / sampleRate;
+        const double w0 = 2.0 * kPi * freqHz / sampleRate;
         const double cosW0 = std::cos(w0);
         const double sinW0 = std::sin(w0);
         const double alpha = sinW0 / (2.0 * q);

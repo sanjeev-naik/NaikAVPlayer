@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <mutex>
 
+#include "audio/dsp/DspMath.hpp"
+
 namespace naikav::dsp {
 
 // Real-time magnitude spectrum analyzer for the Audio Processing panel's
@@ -96,7 +98,7 @@ private:
         m_window.resize(kFftSize);
         for (int i = 0; i < kFftSize; ++i) {
             m_window[static_cast<size_t>(i)] =
-                0.5f * (1.0f - std::cos(2.0f * static_cast<float>(M_PI) * static_cast<float>(i) / (kFftSize - 1)));
+                0.5f * (1.0f - std::cos(2.0f * static_cast<float>(kPi) * static_cast<float>(i) / (kFftSize - 1)));
         }
     }
 
@@ -150,7 +152,7 @@ private:
         }
 
         for (size_t len = 2; len <= n; len <<= 1) {
-            const float ang = -2.0f * static_cast<float>(M_PI) / static_cast<float>(len);
+            const float ang = -2.0f * static_cast<float>(kPi) / static_cast<float>(len);
             const std::complex<float> wlen(std::cos(ang), std::sin(ang));
             for (size_t i = 0; i < n; i += len) {
                 std::complex<float> w(1.0f, 0.0f);

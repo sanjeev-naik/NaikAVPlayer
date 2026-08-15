@@ -23,6 +23,7 @@
 #include <chrono>
 #include <cstdio>
 #include <functional>
+#include <algorithm>
 #include <random>
 #include <vector>
 
@@ -76,9 +77,7 @@ int main() {
     std::vector<float> source(static_cast<size_t>(kBlockFrames) * kChannels);
     std::mt19937 rng(12345);
     std::uniform_real_distribution<float> dist(-0.5f, 0.5f);
-    for (auto& s : source) {
-        s = dist(rng);
-    }
+    std::generate(source.begin(), source.end(), [&] { return dist(rng); });
     std::vector<float> scratch(source.size());
 
     // Every stage configured exactly as AudioDecoder::init() +
