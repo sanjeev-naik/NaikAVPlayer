@@ -21,12 +21,14 @@ public:
         SeekForward,
         VolumeMute,
         VolumeHigh,
-        Loop
+        Loop,
+        Subtitles
     };
 
 private:
     PlayerController& m_controller;
     std::function<std::string()> m_fileDialogCallback;
+    std::function<std::string()> m_subtitleDialogCallback;
     
     // UI state variables
     float m_uiVolume;
@@ -57,9 +59,10 @@ private:
     char m_filePathBuffer[512];
 
     // Loaded fonts
-    ImFont* m_mainFont;
-    ImFont* m_titleFont;
-    ImFont* m_hudFont;
+    ImFont* m_mainFont = nullptr;
+    ImFont* m_titleFont = nullptr;
+    ImFont* m_hudFont = nullptr;
+    ImFont* m_subtitleFont = nullptr;
 
     // FPS tracking
     std::deque<double> m_videoFrameTimes;
@@ -102,8 +105,10 @@ private:
 
     // Modular drawing helpers
     void openMediaFileDialog();
+    void openSubtitleFileDialog();
     void drawWelcomeHUD(int windowWidth, int windowHeight);
     void drawAudioVisualizer(int windowWidth, int windowHeight, double currentSystemTime);
+    void drawSubtitleOverlay(int windowWidth, int windowHeight, double currentPts);
     void drawTitleBar(int windowWidth, int windowHeight);
     void drawControlsBar(int windowWidth, int windowHeight);
     void drawDiagnosticsHUD(int windowWidth, int windowHeight);
@@ -131,6 +136,10 @@ public:
     void toggleAudioSettings() { m_showAudioSettings = !m_showAudioSettings; }
     bool isAudioSettingsVisible() const { return m_showAudioSettings; }
 
+    // Subtitle track cycling & delay adjustments
+    void cycleSubtitleTrack();
+    void adjustSubtitleDelay(double deltaSeconds);
+
     // Volume and Mute helpers
     void toggleMute();
     void adjustVolume(float deltaPercent);
@@ -146,6 +155,9 @@ public:
     void setFileDialogCallback(std::function<std::string()> callback) {
         m_fileDialogCallback = callback;
     }
+    void setSubtitleDialogCallback(std::function<std::string()> callback) {
+        m_subtitleDialogCallback = callback;
+    }
     
     // Draw the UI overlays. Called once per frame in the render loop.
     void draw(int windowWidth, int windowHeight, double currentSystemTime);
@@ -156,4 +168,5 @@ public:
     // Get visibility state
     bool isControlsVisible() const { return m_controlsVisible; }
 };
+
 

@@ -18,6 +18,7 @@ NaikAVPlayer is a native, multi-threaded C++17 media engine and video player bui
 - **Stall-Proof Pipeline Backpressure:** Producer threads never block indefinitely on a full queue — bounded-wait pushes fall back to dropping the oldest queued item once a timeout elapses, so a paused audio device, a stalled render loop, or a wedged decoder can never freeze the single demuxer thread that feeds both the video and audio queues.
 - **Dynamic Hardware Decoder Fallback:** Tries platform-specific hardware decoders (D3D11VA, DXVA2, QSV, CUVID on Windows; V4L2M2M, VAAPI, QSV, CUVID on Linux), falling back dynamically to software H.264 decoding if hardware context allocation fails or encounters runtime surface mapping errors.
 - **Sub-10ms Audio-Video Synchronization:** Reconstructs the audio clock sample-accurately from PCM sample offsets to maintain A/V drift under 10ms.
+- **Complete Subtitle Support (Internal & External):** Detects, decodes, and renders both embedded container subtitles (SRT, ASS, SSA, WebVTT, MOV Text) and external subtitle files (`.srt`, `.vtt`, `.ass`, `.ssa`, `.sub`). Features auto-detection of matching subtitle files adjacent to media, interactive track selection menu (`[CC]` button in controls dock), on-the-fly subtitle cycling (`V`), millisecond-accurate sync timing delay offset adjustments (`G` / `H`), and clean on-screen rendering with dark backdrop contrast overlays.
 - **Multichannel Audio Preservation:** Reads the source stream's real channel layout and drives 2.1/5.1/5.1(back)/7.1 straight through to a matching SDL3 multichannel device instead of always downmixing to stereo, with a device-native-channel check that flags when the OS is silently downmixing anyway, and a manual Auto / Force Stereo / Virtual Surround override.
 - **Virtual Surround & 3D Spatial Audio:** `VIRTUAL_SURROUND` folds a discrete 2.1/5.1/5.1(back)/7.1 source down to stereo with positional delay/filter cues (`SpatialDownmixer`) instead of a flat downmix, so surround content stays spatial on headphones/stereo speakers; a separate "3D Surround" ambience synthesizer (`Surround3D`) adds a similar spatial feel to any plain stereo source, and a mid-side Stereo Widener adjusts the perceived image width independently of either.
 - **Studio DSP Chain:** Live-adjustable true parametric 5-band EQ (frequency, Q, and gain all independently adjustable per band), a noise gate/expander, a soft-knee full-band compressor plus an independent 3-band multiband compressor (two crossover-split bands, each with its own threshold/ratio), a lookahead peak limiter (delay-line based, so the gain envelope reduces *ahead of* fast transients instead of only clamping after the fact), and a Linkwitz-Riley bass-management crossover — LFE tone control by default, with an optional true bass-redirect mode that highpasses every other channel and sums exactly what was removed into the LFE channel. A left/right balance control and 9 presets (see below) round out the chain. Runs on a float-internal signal path — every stage is a true no-op until explicitly configured.
@@ -57,7 +58,8 @@ src/
 ├── core/      ThreadSafeQueue.hpp, MetricRing.hpp, PipelineMetrics.hpp
 ├── media/     Demuxer.{hpp,cpp} — packet reading and routing
 ├── player/    PlayerController.{hpp,cpp} — state machine, seeking, settings persistence
-├── ui/        PlayerUI.{hpp,cpp} — ImGui controls dock, diagnostics HUD, audio panel
+├── subtitle/  SubtitleDecoder.{hpp,cpp}, SubtitleTrack.hpp — decoding, parsing, sync, sanitization
+├── ui/        PlayerUI.{hpp,cpp} — ImGui controls dock, diagnostics HUD, audio panel, subtitle overlay
 └── video/     VideoDecoder.{hpp,cpp} — HW/SW decode, frame conversion
 ```
 
@@ -71,31 +73,29 @@ src/
            ▼
   ┌──────────────────────────────────────────────────────────┐
   │                      Demuxer Thread                      │
-  └─────────────┬──────────────────────────────┬─────────────┘
-                │ packets                      │ packets
-                ▼                              ▼
-  ┌───────────────────────────┐  ┌───────────────────────────┐
-  │   Video Packet Queue      │  │   Audio Packet Queue      │
-  │     (100 packets)         │  │     (150 packets)         │
-  └─────────────┬─────────────┘  └─────────────┬─────────────┘
-                │                              │
-                ▼                              ▼
-  ┌───────────────────────────┐  ┌───────────────────────────┐
-  │   Video Decoder Thread    │  │   Audio Decoder Callback  │
-  │    (HW / SW Fallback)     │  │   (SDL3 Audio Thread)     │
-  │Decode -> Convert -> Queue │  │ Resample(soxr)->DSP Chain │
-  │  (GPU-Mapped YUV Planes)  │  │  ->Loudness->Dither->S16  │
-  └─────────────┬─────────────┘  └─────────────┬─────────────┘
-                │ decoded frames               │ PCM Audio & PTS
-                ▼                              ▼
-  ┌───────────────────────────┐  ┌───────────────────────────┐
-  │   Decoded Frame Queue     │  │     Audio Master Clock    │
-  │        (8 frames)         │  │  (Sub-10ms A/V Sync Ref)  │
-  └─────────────┬─────────────┘  └─────────────┬─────────────┘
-                │                              │
-                └──────────────┬───────────────┘
-                               │
-                               ▼
+  └───────┬─────────────────────┬────────────────────┬───────┘
+          │ video packets       │ audio packets      │ subtitle packets
+          ▼                     ▼                    ▼
+  ┌──────────────┐      ┌──────────────┐     ┌──────────────┐
+  │ Video Packet │      │ Audio Packet │     │Subtitle Queue│
+  │ Queue (100)  │      │ Queue (150)  │     │  (50 pkts)   │
+  └───────┬──────┘      └───────┬──────┘     └───────┬──────┘
+          │                     │                    │
+          ▼                     ▼                    ▼
+  ┌──────────────┐      ┌──────────────┐     ┌──────────────┐
+  │Video Decoder │      │Audio Decoder │     │  Subtitle    │
+  │Thread (HW/SW)│      │  (SDL3 Audio)│     │Decoder/Parser│
+  └───────┬──────┘      └───────┬──────┘     └───────┬──────┘
+          │ decoded frames      │ PCM Audio & PTS    │ events
+          ▼                     ▼                    │
+  ┌──────────────┐      ┌──────────────┐             │
+  │Decoded Frame │      │ Audio Master │             │
+  │  Queue (8)   │      │    Clock     │             │
+  └───────┬──────┘      └───────┬──────┘             │
+          │                     │                    │
+          └──────────────┬──────┴────────────────────┘
+                         │
+                         ▼
   ┌──────────────────────────────────────────────────────────┐
   │                   Main / Render Loop                     │
   │  ┌────────────────────────────────────────────────────┐  │
@@ -103,14 +103,18 @@ src/
   │  │                            │                       │  │
   │  │                            ▼                       │  │
   │  │ Drop Late Frames ──► GPU YUV Texture Upload & UI   │  │
+  │  │                            │                       │  │
+  │  │                            ▼                       │  │
+  │  │ Subtitle Overlay Match ──► Render Contrast Backdrop│  │
   │  └────────────────────────────────────────────────────┘  │
   └──────────────────────────────────────────────────────────┘
 ```
 
-- **Demuxer Thread**: Reads raw packets via `av_read_frame` and routes them into bounded `ThreadSafeQueue<AVPacket*>` instances (video capacity: 100 packets, audio capacity: 150 packets). Pushes never block indefinitely — see [Stall-Proof Queue Backpressure](#stall-proof-queue-backpressure-deadlock-prevention) below.
+- **Demuxer Thread**: Reads raw packets via `av_read_frame` and routes them into bounded `ThreadSafeQueue<AVPacket*>` instances (video capacity: 100 packets, audio capacity: 150 packets, subtitle capacity: 50 packets). Pushes never block indefinitely — see [Stall-Proof Queue Backpressure](#stall-proof-queue-backpressure-deadlock-prevention) below.
 - **Video Decoder Thread**: Background worker thread that pops packets from the video queue, decodes them (via hardware or software fallback), converts frames, and pushes them into the bounded `m_decodedFrameQueue` (capacity: 8 frames), using the same bounded-wait backpressure.
 - **Audio Decoding**: Executed sample-accurately inside the SDL3 Audio Stream callback thread. It pulls packets from the audio queue, decodes them, resamples to the output layout/rate as interleaved float (`swr_convert`, libsoxr engine), runs the DSP chain and loudness normalization in place, then dithers and truncates to the device's 16-bit format — see [Audio DSP & Loudness Pipeline](#audio-dsp--loudness-pipeline) below.
-- **Main / Render Thread**: Dequeues decoded frames from `m_decodedFrameQueue` whose PTS matches the master clock time, updates the SDL YUV texture on the GPU, and renders the Dear ImGui interface overlay.
+- **Subtitle Decoder & Parser**: Handles container-embedded subtitle streams via FFmpeg decoders and standalone external files (`.srt`, `.vtt`, `.ass`, `.ssa`, `.sub`) parsed directly into in-memory timed events.
+- **Main / Render Thread**: Dequeues decoded frames from `m_decodedFrameQueue` whose PTS matches the master clock time, matches active subtitle events against playback PTS + delay offset, updates the SDL YUV texture on the GPU, and renders the Dear ImGui interface overlay.
 
 #### GPU-Mapped Planar YUV Uploads
 Instead of performing CPU-side YUV-to-RGB color space conversion, the video decoder pipeline extracts raw YUV 4:2:0 planar frame data directly. The main thread maps this data onto a hardware-accelerated SDL3 streaming texture (`SDL_PIXELFORMAT_IYUV`) using `SDL_UpdateYUVTexture`. This uploads plane segments directly to GPU texture memory, allowing graphics hardware to handle color space conversion and scaling efficiently.
@@ -448,6 +452,8 @@ effect when launched by double-click, and ignored on Linux.
 | **`Up Arrow`** / **`Down Arrow`** | Increase / Decrease Volume (±5%) |
 | **`Mouse Wheel`** (over video) | Adjust Volume Up / Down |
 | **`S`** | Capture Screenshot / Export Video Frame as PNG |
+| **`V`** | Cycle Subtitle Tracks (Off -> Embedded -> External -> Off) |
+| **`G`** / **`H`** | Adjust Subtitle Synchronization Delay (-50ms / +50ms) |
 | **`Left Arrow`** / **`Right Arrow`** | Seek backward / forward by 10 seconds |
 | **`[`** / **`]`** | Decrease / Increase playback speed by 0.25x (0.25x – 2.0x) |
 | **`Backspace`** | Reset playback speed to normal (1.0x) |

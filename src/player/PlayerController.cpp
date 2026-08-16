@@ -18,6 +18,7 @@ PlayerController::PlayerController()
     : m_state(PlayerState::UNINITIALIZED),
       m_videoQueue(100), // Max capacity of 100 packets
       m_audioQueue(150), // Max capacity of 150 packets (audio packets are smaller)
+      m_subtitleQueue(100), // Max capacity of 100 subtitle packets
       m_hasAudio(false),
       m_hasVideo(false),
       m_videoClock(0.0),
@@ -39,6 +40,7 @@ PlayerController::PlayerController()
       m_resolutionOption(ResolutionOption::ORIGINAL) {
     m_videoQueue.attachDepthMirror(&m_metrics->m_videoPacketQueueDepth);
     m_audioQueue.attachDepthMirror(&m_metrics->m_audioPacketQueueDepth);
+    m_subtitleQueue.attachDepthMirror(&m_metrics->m_subtitlePacketQueueDepth);
     m_decodedFrameQueue.attachDepthMirror(&m_metrics->m_decodedFrameQueueDepth);
     loadSettings();
 }
@@ -57,34 +59,32 @@ bool PlayerController::openFile(const std::string& filename) {
     // If a file is already loaded, close it first
     stop();
 
-    // Everything below can throw: std::thread's constructor (m_demuxer's
-    // read thread, m_videoThread) throws std::system_error if the OS is
-    // temporarily out of thread/handle capacity, and any of the several
-    // std::vector/std::string allocations along this path (decode buffers,
-    // the audio device name, etc.) can throw std::bad_alloc under memory
-    // pressure -- both realistic failure modes precisely when a user has
-    // already opened/closed several files in a row, not on a fresh launch.
-    // openFile() is called directly from main.cpp's SDL_EVENT_DROP_FILE
-    // handler and from PlayerUI's file-dialog callbacks, neither of which
-    // wrap it in a try/catch, so an uncaught exception here means
-    // std::terminate() -- the whole app crashing -- instead of "this file
-    // didn't load." Catch here and fail gracefully instead: stop() tears
-    // down whatever partial state was constructed before the throw, same
-    // as any other openFile() failure path.
     try {
         m_filename = filename;
         m_videoQueue.reset();
         m_audioQueue.reset();
+        m_subtitleQueue.reset();
         m_decodedFrameQueue.reset(); // Clear aborted state set by stop()
 
         // Create and open the demuxer
         m_demuxer = std::make_unique<Demuxer>(
             filename, m_videoQueue, m_audioQueue,
             m_metrics->m_demuxTimePerPacketUs, m_metrics->m_profilingEnabled);
+        m_demuxer->attachSubtitleQueue(&m_subtitleQueue);
+
         if (!m_demuxer->open()) {
             m_state = PlayerState::ERROR_STATE;
             return false;
         }
+
+        {
+            std::lock_guard<std::mutex> lock(m_subtitleMutex);
+            m_cachedSubtitleTracks = m_demuxer->getSubtitleTracks();
+            m_hasExternalSubtitle = false;
+        }
+
+        // Auto-probe matching external subtitle files in directory
+        autoProbeExternalSubtitles(filename);
 
         // Initialize Video Decoder if video stream is available
         if (m_demuxer->getVideoStreamIndex() >= 0) {
@@ -297,6 +297,13 @@ void PlayerController::seek(double seconds) {
     m_videoQueue.clear([](AVPacket*& pkt) { av_packet_free(&pkt); });
     m_audioQueue.clear([](AVPacket*& pkt) { av_packet_free(&pkt); });
     {
+        std::lock_guard<std::mutex> subLock(m_subtitleMutex);
+        m_subtitleQueue.clear([](AVPacket*& pkt) { av_packet_free(&pkt); });
+        if (m_subtitleDecoder) {
+            m_subtitleDecoder->flush();
+        }
+    }
+    {
         std::lock_guard<std::mutex> decoderLock(m_videoDecoderMutex);
         m_decodedFrameQueue.clear([](DecodedFrame& df) {
             if (df.frame) {
@@ -337,6 +344,13 @@ void PlayerController::instantSeek(double seconds) {
     // Force clear our queues immediately from this thread to speed up seek response
     m_videoQueue.clear([](AVPacket*& pkt) { av_packet_free(&pkt); });
     m_audioQueue.clear([](AVPacket*& pkt) { av_packet_free(&pkt); });
+    {
+        std::lock_guard<std::mutex> subLock(m_subtitleMutex);
+        m_subtitleQueue.clear([](AVPacket*& pkt) { av_packet_free(&pkt); });
+        if (m_subtitleDecoder) {
+            m_subtitleDecoder->flush();
+        }
+    }
 
     // Flush decoders and clear decoded frame queue under lock
     {
@@ -394,6 +408,7 @@ void PlayerController::stop() {
     m_decodedFrameQueue.abort();
     m_videoQueue.abort();
     m_audioQueue.abort();
+    m_subtitleQueue.abort();
 
     m_videoThreadRunning = false;
     if (m_videoThread.joinable()) {
@@ -422,6 +437,18 @@ void PlayerController::stop() {
     m_demuxer.reset();
     m_audioDecoder.reset();
     m_videoDecoder.reset();
+
+    {
+        std::lock_guard<std::mutex> lock(m_subtitleMutex);
+        m_subtitleQueue.clear([](AVPacket*& pkt) { av_packet_free(&pkt); });
+        if (m_subtitleDecoder) {
+            m_subtitleDecoder->reset();
+            m_subtitleDecoder.reset();
+        }
+        m_cachedSubtitleTracks.clear();
+        m_hasExternalSubtitle = false;
+        m_selectedSubtitleTrack.store(-1);
+    }
 
     m_hasAudio = false;
     m_hasVideo = false;
@@ -1145,3 +1172,160 @@ ColorPipelineInfo PlayerController::getColorInfo() const {
     }
     return ColorPipelineInfo{};
 }
+
+std::vector<naikav::subtitle::SubtitleTrackInfo> PlayerController::getSubtitleTracks() const {
+    std::lock_guard<std::mutex> lock(m_subtitleMutex);
+    std::vector<naikav::subtitle::SubtitleTrackInfo> result = m_cachedSubtitleTracks;
+    if (m_hasExternalSubtitle) {
+        result.push_back(m_externalSubtitleTrack);
+    }
+    return result;
+}
+
+void PlayerController::selectSubtitleTrack(int trackId) {
+    std::lock_guard<std::mutex> lock(m_subtitleMutex);
+    m_selectedSubtitleTrack.store(trackId);
+
+    if (trackId == -1) {
+        // Disabled / Off
+        if (m_demuxer) {
+            m_demuxer->setSubtitleStreamIndex(-1);
+        }
+        m_subtitleQueue.clear([](AVPacket*& pkt) { av_packet_free(&pkt); });
+        if (m_subtitleDecoder && !m_subtitleDecoder->isExternal()) {
+            m_subtitleDecoder->reset();
+        }
+        std::cout << "Subtitle track disabled (Off)" << std::endl;
+    } else if (trackId == -2) {
+        // External subtitle selected
+        if (m_demuxer) {
+            m_demuxer->setSubtitleStreamIndex(-1);
+        }
+        m_subtitleQueue.clear([](AVPacket*& pkt) { av_packet_free(&pkt); });
+        if (!m_subtitleDecoder || !m_subtitleDecoder->isExternal()) {
+            if (m_hasExternalSubtitle) {
+                m_subtitleDecoder = std::make_unique<naikav::subtitle::SubtitleDecoder>();
+                m_subtitleDecoder->loadExternalFile(m_externalSubtitleTrack.sourcePath);
+            }
+        }
+        std::cout << "Selected external subtitle track: " << m_externalSubtitleTrack.sourcePath << std::endl;
+    } else if (trackId >= 0) {
+        // Embedded subtitle stream
+        if (m_demuxer) {
+            m_demuxer->setSubtitleStreamIndex(trackId);
+            m_subtitleQueue.clear([](AVPacket*& pkt) { av_packet_free(&pkt); });
+            m_subtitleDecoder = std::make_unique<naikav::subtitle::SubtitleDecoder>();
+            AVCodecParameters* params = m_demuxer->getSubtitleCodecParams(trackId);
+            AVRational tb = m_demuxer->getSubtitleTimeBase(trackId);
+            int64_t st = m_demuxer->getSubtitleStartTime(trackId);
+            m_subtitleDecoder->init(params, tb, st);
+            m_subtitleDecoder->attachSeekGeneration(m_demuxer->seekGenerationPtr());
+            std::cout << "Selected embedded subtitle track index: " << trackId << std::endl;
+        }
+    }
+}
+
+bool PlayerController::loadExternalSubtitle(const std::string& filepath) {
+    if (filepath.empty()) return false;
+
+    auto decoder = std::make_unique<naikav::subtitle::SubtitleDecoder>();
+    if (!decoder->loadExternalFile(filepath)) {
+        std::cerr << "Failed to parse external subtitle file: " << filepath << std::endl;
+        return false;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(m_subtitleMutex);
+        m_subtitleDecoder = std::move(decoder);
+        m_externalSubtitleTrack.id = -2;
+        m_externalSubtitleTrack.isExternal = true;
+        m_externalSubtitleTrack.sourcePath = filepath;
+
+        size_t lastSlash = filepath.find_last_of("/\\");
+        std::string filename = (lastSlash != std::string::npos) ? filepath.substr(lastSlash + 1) : filepath;
+        m_externalSubtitleTrack.title = filename;
+        m_externalSubtitleTrack.language = "ext";
+        m_externalSubtitleTrack.codecName = "external";
+        m_hasExternalSubtitle = true;
+    }
+
+    selectSubtitleTrack(-2);
+    return true;
+}
+
+void PlayerController::pollSubtitlePackets() {
+    if (!m_subtitleDecoder || m_selectedSubtitleTrack.load() < 0) {
+        return;
+    }
+
+    AVPacket* pkt = nullptr;
+    while (m_subtitleQueue.try_pop(pkt)) {
+        if (pkt) {
+            m_subtitleDecoder->processPacket(pkt);
+            av_packet_free(&pkt);
+        }
+    }
+}
+
+std::string PlayerController::getCurrentSubtitleText() {
+    double pts = getCurrentTime();
+
+    std::lock_guard<std::mutex> lock(m_subtitleMutex);
+    pollSubtitlePackets();
+
+    if (m_selectedSubtitleTrack.load() == -1 || !m_subtitleDecoder) {
+        return "";
+    }
+
+    return m_subtitleDecoder->getActiveSubtitleText(pts, m_subtitleDelay.load());
+}
+
+void PlayerController::autoProbeExternalSubtitles(const std::string& mediaFilename) {
+    if (mediaFilename.empty()) return;
+
+    size_t lastDot = mediaFilename.find_last_of('.');
+    if (lastDot == std::string::npos) return;
+
+    std::string base = mediaFilename.substr(0, lastDot);
+    std::vector<std::string> candidates = {
+        base + ".srt", base + ".SRT",
+        base + ".vtt", base + ".VTT",
+        base + ".ass", base + ".ASS",
+        base + ".ssa", base + ".SSA",
+        base + ".en.srt", base + ".eng.srt",
+        base + ".en.vtt", base + ".eng.vtt"
+    };
+
+    for (const auto& path : candidates) {
+        std::ifstream f(path);
+        if (f.good()) {
+            f.close();
+            if (loadExternalSubtitle(path)) {
+                std::cout << "Auto-detected external subtitle file: " << path << std::endl;
+                break;
+            }
+        }
+    }
+}
+
+std::string PlayerController::getActiveSubtitleTrackName() const {
+    int track = m_selectedSubtitleTrack.load();
+    if (track == -1) {
+        return "Off";
+    }
+    if (track == -2) {
+        std::lock_guard<std::mutex> lock(m_subtitleMutex);
+        return m_externalSubtitleTrack.title.empty() ? "External" : m_externalSubtitleTrack.title;
+    }
+
+    std::lock_guard<std::mutex> lock(m_subtitleMutex);
+    auto it = std::find_if(m_cachedSubtitleTracks.begin(), m_cachedSubtitleTracks.end(),
+        [track](const naikav::subtitle::SubtitleTrackInfo& t) {
+            return t.id == track;
+        });
+    if (it != m_cachedSubtitleTracks.end()) {
+        return it->title + " (" + it->language + ")";
+    }
+    return "Track " + std::to_string(track);
+}
+

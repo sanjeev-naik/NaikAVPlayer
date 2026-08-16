@@ -4,6 +4,7 @@
 #include <cmath>
 #include <limits>
 #include <cstdint>
+#include <cstring>
 
 namespace {
 // Upper bound on how long the read loop will ever wait for room in a packet
@@ -81,7 +82,10 @@ bool Demuxer::open() {
         return false;
     }
 
-    // Find video and audio streams
+    // Find video, audio and subtitle streams
+    m_subtitleTracks.clear();
+    m_subtitleStreamIdx = -1;
+
     for (unsigned int i = 0; i < m_formatCtx->nb_streams; i++) {
         AVCodecParameters* codecParams = m_formatCtx->streams[i]->codecpar;
         if (codecParams->codec_type == AVMEDIA_TYPE_VIDEO &&
@@ -98,6 +102,38 @@ bool Demuxer::open() {
             m_audioTimeBase = m_formatCtx->streams[i]->time_base;
             m_audioStartTime = m_formatCtx->streams[i]->start_time;
             if (m_audioStartTime == AV_NOPTS_VALUE) m_audioStartTime = 0;
+        } else if (codecParams->codec_type == AVMEDIA_TYPE_SUBTITLE) {
+            naikav::subtitle::SubtitleTrackInfo info;
+            info.id = static_cast<int>(i);
+
+            // Extract title / handler name
+            const char* titleTag = nullptr;
+            if (const AVDictionaryEntry* e = av_dict_get(m_formatCtx->streams[i]->metadata, "title", nullptr, 0)) {
+                titleTag = e->value;
+            } else if (const AVDictionaryEntry* e2 = av_dict_get(m_formatCtx->streams[i]->metadata, "handler_name", nullptr, 0)) {
+                titleTag = e2->value;
+            }
+            if (titleTag && std::strlen(titleTag) > 0) {
+                info.title = titleTag;
+            } else {
+                info.title = "Subtitle Track " + std::to_string(m_subtitleTracks.size() + 1);
+            }
+
+            // Extract language
+            const char* langTag = nullptr;
+            if (const AVDictionaryEntry* e = av_dict_get(m_formatCtx->streams[i]->metadata, "language", nullptr, 0)) {
+                langTag = e->value;
+            } else if (const AVDictionaryEntry* e2 = av_dict_get(m_formatCtx->streams[i]->metadata, "lang", nullptr, 0)) {
+                langTag = e2->value;
+            }
+            info.language = (langTag && std::strlen(langTag) > 0) ? langTag : "und";
+
+            // Codec name
+            const char* cname = avcodec_get_name(codecParams->codec_id);
+            info.codecName = (cname && std::strlen(cname) > 0) ? cname : "unknown";
+            info.isExternal = false;
+
+            m_subtitleTracks.push_back(info);
         }
     }
 
@@ -116,7 +152,8 @@ bool Demuxer::open() {
     std::cout << "Opened media file: " << m_filename 
               << ", Duration: " << m_duration << "s" 
               << ", Video Stream: " << m_videoStreamIdx 
-              << ", Audio Stream: " << m_audioStreamIdx << std::endl;
+              << ", Audio Stream: " << m_audioStreamIdx 
+              << ", Subtitle Tracks: " << m_subtitleTracks.size() << std::endl;
 
     m_eof = false;
     return true;
@@ -132,6 +169,9 @@ void Demuxer::stop() {
     m_running = false;
     m_videoQueue.abort();
     m_audioQueue.abort();
+    if (m_subtitleQueue) {
+        m_subtitleQueue->abort();
+    }
     if (m_thread.joinable()) {
         m_thread.join();
     }
@@ -162,6 +202,28 @@ double Demuxer::packetTimeSeconds(const AVPacket* pkt, int streamIdx) const {
     return (ts - m_audioStartTime) * av_q2d(m_audioTimeBase);
 }
 
+AVCodecParameters* Demuxer::getSubtitleCodecParams(int streamIdx) const {
+    if (!m_formatCtx || streamIdx < 0 || streamIdx >= static_cast<int>(m_formatCtx->nb_streams)) {
+        return nullptr;
+    }
+    return m_formatCtx->streams[streamIdx]->codecpar;
+}
+
+AVRational Demuxer::getSubtitleTimeBase(int streamIdx) const {
+    if (!m_formatCtx || streamIdx < 0 || streamIdx >= static_cast<int>(m_formatCtx->nb_streams)) {
+        return AVRational{0, 1};
+    }
+    return m_formatCtx->streams[streamIdx]->time_base;
+}
+
+int64_t Demuxer::getSubtitleStartTime(int streamIdx) const {
+    if (!m_formatCtx || streamIdx < 0 || streamIdx >= static_cast<int>(m_formatCtx->nb_streams)) {
+        return 0;
+    }
+    int64_t st = m_formatCtx->streams[streamIdx]->start_time;
+    return (st != AV_NOPTS_VALUE) ? st : 0;
+}
+
 void Demuxer::performSeek() {
     std::lock_guard<std::mutex> lock(m_seekMutex);
     
@@ -170,9 +232,12 @@ void Demuxer::performSeek() {
     m_seekRequested = false;
     m_eof = false;
     
-    // Clear both queues to drop packets from the old position
+    // Clear queues to drop packets from the old position
     m_videoQueue.clear([](AVPacket*& pkt) { av_packet_free(&pkt); });
     m_audioQueue.clear([](AVPacket*& pkt) { av_packet_free(&pkt); });
+    if (m_subtitleQueue) {
+        m_subtitleQueue->clear([](AVPacket*& pkt) { av_packet_free(&pkt); });
+    }
     
     int64_t targetTs;
     int streamIdx = -1;
@@ -299,6 +364,11 @@ void Demuxer::threadLoop() {
                 if (!pushed) {
                     av_packet_free(&packet);
                 }
+            } else if (m_subtitleQueue && packet->stream_index == m_subtitleStreamIdx.load()) {
+                if (!m_subtitleQueue->push_wait_or_drop(packet, kQueuePushTimeout,
+                                                        [](AVPacket*& p) { av_packet_free(&p); })) {
+                    av_packet_free(&packet);
+                }
             } else {
                 av_packet_free(&packet);
             }
@@ -316,3 +386,4 @@ void Demuxer::threadLoop() {
         }
     }
 }
+

@@ -426,6 +426,7 @@ set(PLAYER_LOGIC_SOURCES
     src/media/Demuxer.cpp
     src/video/VideoDecoder.cpp
     src/audio/AudioDecoder.cpp
+    src/subtitle/SubtitleDecoder.cpp
 )
 
 set(WINDOWS_RESOURCE_FILE "")

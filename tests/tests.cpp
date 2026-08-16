@@ -333,6 +333,7 @@ inline bool mock_SDL_Init(SDL_InitFlags flags) {
 #include "media/Demuxer.cpp"
 #include "video/VideoDecoder.cpp"
 #include "audio/AudioDecoder.cpp"
+#include "subtitle/SubtitleDecoder.cpp"
 #include "video/FrameExporter.hpp"
 #undef private
 
@@ -3773,6 +3774,164 @@ int main(int argc, char* argv[]) {
                 std::filesystem::remove(exportRes.filepath, ec);
                 std::filesystem::remove("test_screenshots", ec);
                 av_frame_free(&synthFrame);
+            }
+
+            // --- Subtitle Comprehensive Unit Tests ---
+            {
+                std::cout << "Running comprehensive Subtitle unit tests..." << std::endl;
+
+                // 1. Text sanitization
+                {
+                    std::string rawAss = "{\\pos(192,200)\\an8\\c&H00FFFF&}Hello World!\\NThis is line 2.\\hExtra space.";
+                    std::string cleaned = naikav::subtitle::sanitizeSubtitleText(rawAss);
+                    test_assert(cleaned == "Hello World!\nThis is line 2. Extra space.", "ASS tags stripped and newlines normalized");
+
+                    std::string htmlText = "<i>Italic</i> and <b>Bold</b> with <font color=\"#ff0000\">Color</font>";
+                    std::string cleanHtml = naikav::subtitle::sanitizeSubtitleText(htmlText);
+                    test_assert(cleanHtml == "Italic and Bold with Color", "HTML tags stripped");
+
+                    std::string emptyStr = naikav::subtitle::sanitizeSubtitleText("   \n\t  ");
+                    test_assert(emptyStr.empty(), "Whitespace trimmed properly");
+                }
+
+                // 2. SubtitleEvent timing
+                {
+                    naikav::subtitle::SubtitleEvent ev;
+                    ev.startPts = 10.0;
+                    ev.endPts = 15.0;
+                    ev.text = "Sample subtitle";
+
+                    test_assert(!ev.isActive(9.9), "Not active before start");
+                    test_assert(ev.isActive(10.0), "Active at exact start");
+                    test_assert(ev.isActive(12.5), "Active in middle");
+                    test_assert(ev.isActive(15.0), "Active at exact end");
+                    test_assert(!ev.isActive(15.1), "Not active after end");
+                }
+
+                // 3. SubtitleDecoder with SRT / VTT fallback parser
+                {
+                    std::string srtPath = "temp_test_sub.srt";
+                    {
+                        std::ofstream f(srtPath);
+                        f << "1\n"
+                          << "00:00:01,000 --> 00:00:03,500\n"
+                          << "First subtitle line\n\n"
+                          << "2\n"
+                          << "00:00:04,000 --> 00:00:07,000\n"
+                          << "Second subtitle line <i>with formatting</i>\n\n";
+                    }
+
+                    naikav::subtitle::SubtitleDecoder decoder;
+                    bool loaded = decoder.loadExternalFile(srtPath);
+                    test_assert(loaded, "External SRT loaded successfully");
+                    test_assert(decoder.isExternal(), "Decoder marked as external");
+                    test_assert(decoder.getEventCount() == 2, "2 subtitle events parsed");
+
+                    test_assert(decoder.getActiveSubtitleText(0.5).empty(), "No subtitle at 0.5s");
+                    test_assert(decoder.getActiveSubtitleText(2.0) == "First subtitle line", "Subtitle match at 2.0s");
+                    test_assert(decoder.getActiveSubtitleText(3.8).empty(), "No subtitle between events (3.8s)");
+                    test_assert(decoder.getActiveSubtitleText(5.0) == "Second subtitle line with formatting", "Subtitle match at 5.0s");
+
+                    // Subtitle delay offset test
+                    // Positive delay (+1.0s) delays display: querying at 3.0s evaluates at 2.0s
+                    test_assert(decoder.getActiveSubtitleText(3.0, 1.0) == "First subtitle line", "Subtitle delay +1.0s matches at 3.0s");
+                    // Negative delay (-1.0s) advances display: querying at 1.0s evaluates at 2.0s
+                    test_assert(decoder.getActiveSubtitleText(1.0, -1.0) == "First subtitle line", "Subtitle delay -1.0s matches at 1.0s");
+
+                    decoder.flush();
+                    test_assert(decoder.getEventCount() == 2, "Events preserved across flush for external track");
+
+                    decoder.reset();
+                    test_assert(decoder.getEventCount() == 0, "Events cleared on reset");
+
+                    std::remove(srtPath.c_str());
+                }
+
+                // 4. SubtitleDecoder with WebVTT file
+                {
+                    std::string vttPath = "temp_test_sub.vtt";
+                    {
+                        std::ofstream f(vttPath);
+                        f << "WEBVTT\n\n"
+                          << "00:01.500 --> 00:03.000 position:10%\n"
+                          << "WebVTT subtitle line\n\n";
+                    }
+
+                    naikav::subtitle::SubtitleDecoder decoder;
+                    bool loaded = decoder.loadExternalFile(vttPath);
+                    test_assert(loaded, "External WebVTT loaded successfully");
+                    test_assert(decoder.getActiveSubtitleText(2.0) == "WebVTT subtitle line", "VTT text match at 2.0s");
+
+                    std::remove(vttPath.c_str());
+                }
+
+                // 4b. SubtitleDecoder with ASS file
+                {
+                    std::string assPath = "temp_test_sub.ass";
+                    {
+                        std::ofstream f(assPath);
+                        f << "[Script Info]\n"
+                          << "Title: Test ASS\n"
+                          << "[Events]\n"
+                          << "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+                          << "Dialogue: 0,0:00:01.50,0:00:04.20,Default,,0,0,0,,{\\pos(100,200)}ASS Subtitle Line\\NSecond row\n";
+                    }
+
+                    naikav::subtitle::SubtitleDecoder decoder;
+                    bool loaded = decoder.loadExternalFile(assPath);
+                    test_assert(loaded, "External ASS loaded successfully");
+                    test_assert(decoder.getActiveSubtitleText(2.0) == "ASS Subtitle Line\nSecond row", "ASS text match at 2.0s");
+
+                    std::remove(assPath.c_str());
+                }
+
+                // 5. PlayerController Subtitle APIs
+                {
+                    PlayerController ctrl;
+                    test_assert(ctrl.getSelectedSubtitleTrack() == -1, "Initial subtitle track is Off (-1)");
+                    test_assert(ctrl.getSubtitleTracks().empty(), "Initial subtitle tracks list is empty");
+                    test_assert(!ctrl.hasExternalSubtitle(), "No external subtitle initially");
+                    test_assert(ctrl.getActiveSubtitleTrackName() == "Off", "Active track name is Off");
+
+                    // Set delay
+                    ctrl.setSubtitleDelay(0.15);
+                    test_assert(std::abs(ctrl.getSubtitleDelay() - 0.15) < 1e-5, "Subtitle delay setter/getter works");
+                    ctrl.setSubtitleDelay(0.0);
+
+                    // Load external subtitle into player controller
+                    std::string srtPath = "temp_player_sub.srt";
+                    {
+                        std::ofstream f(srtPath);
+                        f << "1\n"
+                          << "00:00:00,000 --> 00:00:10,000\n"
+                          << "PlayerController Subtitle Test\n\n";
+                    }
+
+                    bool extOk = ctrl.loadExternalSubtitle(srtPath);
+                    test_assert(extOk, "PlayerController loads external subtitle");
+                    test_assert(ctrl.hasExternalSubtitle(), "hasExternalSubtitle() is true");
+                    test_assert(ctrl.getSelectedSubtitleTrack() == -2, "Selected track is -2 (external)");
+                    test_assert(ctrl.getActiveSubtitleTrackName() == "temp_player_sub.srt", "Active track name matches external filename");
+                    test_assert(ctrl.getSubtitleTracks().size() == 1, "Subtitle tracks list includes external track");
+
+                    // Toggle Off and back to External
+                    ctrl.selectSubtitleTrack(-1);
+                    test_assert(ctrl.getSelectedSubtitleTrack() == -1, "Track selected Off");
+                    test_assert(ctrl.getCurrentSubtitleText().empty(), "Empty subtitle text when Off");
+
+                    ctrl.selectSubtitleTrack(-2);
+                    test_assert(ctrl.getSelectedSubtitleTrack() == -2, "Track selected back to External");
+
+                    ctrl.stop();
+                    test_assert(ctrl.getSelectedSubtitleTrack() == -1, "Stop resets subtitle track to -1");
+                    test_assert(!ctrl.hasExternalSubtitle(), "Stop clears external subtitle");
+
+                    std::remove(srtPath.c_str());
+                }
+
+
+
+                std::cout << "Comprehensive Subtitle unit tests passed!" << std::endl;
             }
 
             std::cout << "ReplayGain tag / genre preset / output selector tests passed!" << std::endl;

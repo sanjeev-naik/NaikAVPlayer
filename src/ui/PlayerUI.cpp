@@ -92,9 +92,13 @@ void PlayerUI::init() {
   if (!foundBoldPath.empty()) {
     m_titleFont =
         io.Fonts->AddFontFromFileTTF(foundBoldPath.c_str(), 28.0f, &fontConfig);
+    m_subtitleFont =
+        io.Fonts->AddFontFromFileTTF(foundBoldPath.c_str(), 36.0f, &fontConfig);
   } else if (!foundRegularPath.empty()) {
     m_titleFont = io.Fonts->AddFontFromFileTTF(foundRegularPath.c_str(), 28.0f,
                                                &fontConfig);
+    m_subtitleFont = io.Fonts->AddFontFromFileTTF(foundRegularPath.c_str(), 36.0f,
+                                                  &fontConfig);
   }
 
   applyTheme();
@@ -209,6 +213,11 @@ void PlayerUI::draw(int windowWidth, int windowHeight,
   // 1b. Real-time Audio Visualizer (automatically shown for audio-only media)
   if (state != PlayerState::UNINITIALIZED && m_controller.hasAudio() && !m_controller.hasVideo()) {
     drawAudioVisualizer(windowWidth, windowHeight, currentSystemTime);
+  }
+
+  // 1c. On-screen Subtitle Overlay (rendered directly above video frame)
+  if (state != PlayerState::UNINITIALIZED && m_controller.hasVideo()) {
+    drawSubtitleOverlay(windowWidth, windowHeight, currentSystemTime);
   }
 
   // 2. Top Title Bar HUD
@@ -435,6 +444,20 @@ bool PlayerUI::drawIconButton(const char *str_id, IconType icon, ImVec2 size) {
     drawList->AddTriangleFilled(tip, base1, base2, color);
     break;
   }
+  case IconType::Subtitles: {
+    float r = sz * 0.5f;
+    float boxW = r * 1.4f;
+    float boxH = r * 1.0f;
+    ImVec2 p_min(center.x - boxW * 0.5f, center.y - boxH * 0.5f);
+    ImVec2 p_max(center.x + boxW * 0.5f, center.y + boxH * 0.5f);
+    drawList->AddRect(p_min, p_max, color, 2.0f, 0, 1.5f);
+    // Draw two horizontal subtitle lines inside the box
+    float lineL = center.x - boxW * 0.35f;
+    float lineR = center.x + boxW * 0.35f;
+    drawList->AddLine(ImVec2(lineL, center.y - boxH * 0.15f), ImVec2(lineR, center.y - boxH * 0.15f), color, 1.5f);
+    drawList->AddLine(ImVec2(lineL + boxW * 0.1f, center.y + boxH * 0.15f), ImVec2(lineR - boxW * 0.1f, center.y + boxH * 0.15f), color, 1.5f);
+    break;
+  }
   }
 
   ImGui::PopID();
@@ -529,13 +552,15 @@ void PlayerUI::drawWelcomeHUD(int windowWidth, int windowHeight) {
   // Centering the shortcut display
   float rowWidth =
       ImGui::CalcTextSize(
-          " [Space] Play/Pause    [<- / ->] Seek 10s    [ [ / ] ] Speed    [F11] Fullscreen    [M] Mute    [Up/Down] Vol    [S] Screenshot    [L] Loop    [Esc] Exit")
+          " [Space] Play/Pause    [<- / ->] Seek 10s    [ [ / ] ] Speed    [V] Subtitles    [G/H] Sub Delay    [F11] Fullscreen    [M] Mute    [Up/Down] Vol    [S] Screenshot    [L] Loop    [Esc] Exit")
           .x;
   ImGui::SetCursorPosX((cardWidth - rowWidth) * 0.5f);
 
   renderKey("Space", "Play/Pause");
   renderKey("<- / ->", "Seek 10s");
   renderKey("[ / ]", "Speed -/+");
+  renderKey("V", "Subtitles");
+  renderKey("G/H", "Sub Delay");
   renderKey("F11", "Fullscreen");
   renderKey("M", "Mute");
   renderKey("Up/Down", "Vol");
@@ -1025,13 +1050,7 @@ void PlayerUI::drawTitleBar(int windowWidth, int windowHeight) {
 
 void PlayerUI::drawControlsBar(int windowWidth, int windowHeight) {
   // Floating centered dock design.
-  //
-  // 940 rather than 880: the right-hand group (resolution / EQ / mute /
-  // volume) is right-anchored and the playback buttons are centered, so at
-  // 880 the two collide once the right group reserves its true width. The
-  // extra 60px restores a clear gap between them and keeps the volume
-  // slider fully inside the dock.
-  float barWidth = std::min(940.0f, windowWidth * 0.95f);
+  float barWidth = std::min(980.0f, windowWidth * 0.95f);
   float barHeight = 85.0f;
   float posX = (windowWidth - barWidth) * 0.5f;
   float posY = windowHeight - barHeight - 20.0f;
@@ -1054,10 +1073,6 @@ void PlayerUI::drawControlsBar(int windowWidth, int windowHeight) {
   // Row 1: Timeline Seeker Bar
   ImGui::SetCursorPosY(12.0f);
 
-  // Left current time. While actively dragging the seek bar, show the drag
-  // target instead of the live playback clock - otherwise the numeric label
-  // keeps counting up with real playback while the slider handle sits
-  // wherever the user dragged it, which looks broken/inconsistent.
   double displayTime =
       m_seekDragActive ? static_cast<double>(m_seekDragValue) : currentTime;
   std::string timeCurrentStr = formatTime(displayTime);
@@ -1071,9 +1086,6 @@ void PlayerUI::drawControlsBar(int windowWidth, int windowHeight) {
 
   ImGui::PushItemWidth(sliderWidth);
 
-  // While the user is actively dragging, keep showing/using the value
-  // they're dragging to - do NOT resync from currentTime, which keeps
-  // advancing during playback and will otherwise fight the drag.
   float seekTarget =
       m_seekDragActive ? m_seekDragValue : static_cast<float>(currentTime);
 
@@ -1088,10 +1100,6 @@ void PlayerUI::drawControlsBar(int windowWidth, int windowHeight) {
     m_seekDragValue = seekTarget;
   }
   if (ImGui::IsItemDeactivated()) {
-    // Commit the seek once the drag/click ends, whether or not ImGui's
-    // own value-changed bookkeeping flagged an edit (that check can miss
-    // cases here since the backing value is a live, ticking clock rather
-    // than a static settings value).
     m_controller.seek(seekTarget);
     m_seekDragActive = false;
   }
@@ -1119,8 +1127,6 @@ void PlayerUI::drawControlsBar(int windowWidth, int windowHeight) {
   ImGui::SameLine((barWidth - centerButtonsGroupWidth) * 0.5f);
 
   // Seek back button (<<)
-  // Relative seeks are based on the seek reference time so that repeated
-  // presses stack onto a catch-up that is still in flight.
   if (drawIconButton("##seek_back", IconType::SeekBackward, ImVec2(36, 28))) {
     m_controller.seek(m_controller.getSeekReferenceTime() - 10.0);
   }
@@ -1229,24 +1235,18 @@ void PlayerUI::drawControlsBar(int windowWidth, int windowHeight) {
     ImGui::EndPopup();
   }
 
-  // Right Group: Resolution, Volume and Mute
-  //
-  // This group is right-anchored, so the offset below must reserve room for
-  // EVERY item in it: the resolution combo, the EQ and mute buttons, the
-  // volume slider, the 8px gaps between them, and the window's right padding.
-  // Deriving the reserve from the actual item widths (rather than a hand-
-  // totalled constant) keeps the trailing volume slider inside the window --
-  // under-counting here pushes it past the content edge, where it is clipped.
+  // Right Group: Resolution, Subtitles, EQ, Mute and Volume
   const float groupItemSpacing = 8.0f;
-  const float resolutionGroupWidth = 120.0f;
+  const float resolutionGroupWidth = 100.0f;
+  const float subButtonWidth = 36.0f;
   const float eqButtonWidth = 36.0f;
   const float muteButtonWidth = 36.0f;
-  const float volumeSliderWidth = 100.0f;
-  const float barRightPadding = 20.0f; // matches the WindowPadding.x pushed above
+  const float volumeSliderWidth = 90.0f;
+  const float barRightPadding = 20.0f;
 
-  float rightGroupWidth = resolutionGroupWidth + eqButtonWidth +
+  float rightGroupWidth = resolutionGroupWidth + subButtonWidth + eqButtonWidth +
                           muteButtonWidth + volumeSliderWidth +
-                          groupItemSpacing * 3.0f;
+                          groupItemSpacing * 4.0f;
   ImGui::SameLine(barWidth - rightGroupWidth - barRightPadding);
 
   // Resolution Dropdown
@@ -1281,10 +1281,93 @@ void PlayerUI::drawControlsBar(int windowWidth, int windowHeight) {
   }
 
   ImGui::SameLine(0.0f, groupItemSpacing);
-  // Capture before the button, not re-checked after: toggleAudioSettings()
-  // mutates m_showAudioSettings on click, so re-reading it to decide
-  // whether to Pop would mismatch the earlier Push whenever the button is
-  // actually clicked (push decided by the old value, pop by the new one).
+
+  // Subtitle selector button (CC)
+  int selSubTrack = m_controller.getSelectedSubtitleTrack();
+  bool subActive = (selSubTrack != -1);
+  if (subActive) {
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.53f, 0.90f, 0.80f));
+  }
+  if (drawIconButton("##subtitles_btn", IconType::Subtitles, ImVec2(subButtonWidth, 28))) {
+    ImGui::OpenPopup("##subtitles_popup");
+  }
+  if (subActive) {
+    ImGui::PopStyleColor();
+  }
+  if (ImGui::IsItemHovered()) {
+    std::string subTip = "Subtitles: " + m_controller.getActiveSubtitleTrackName() + " - [V]";
+    ImGui::SetTooltip("%s", subTip.c_str());
+  }
+
+  if (ImGui::BeginPopup("##subtitles_popup")) {
+    ImGui::TextColored(ImVec4(0.00f, 0.83f, 0.88f, 1.00f), "Subtitles");
+    ImGui::Separator();
+
+    bool isOff = (selSubTrack == -1);
+    if (ImGui::MenuItem("Off", nullptr, isOff)) {
+      m_controller.selectSubtitleTrack(-1);
+    }
+
+    auto tracks = m_controller.getSubtitleTracks();
+    bool hasEmbedded = std::any_of(tracks.begin(), tracks.end(), [](const naikav::subtitle::SubtitleTrackInfo& t) {
+      return !t.isExternal;
+    });
+
+    if (hasEmbedded) {
+      ImGui::Spacing();
+      ImGui::TextDisabled("Embedded Tracks:");
+      for (const auto& t : tracks) {
+        if (!t.isExternal) {
+          bool isSelected = (selSubTrack == t.id);
+          std::string label = "[" + t.language + "] " + t.title + " (" + t.codecName + ")";
+          if (ImGui::MenuItem(label.c_str(), nullptr, isSelected)) {
+            m_controller.selectSubtitleTrack(t.id);
+          }
+        }
+      }
+    }
+
+    ImGui::Spacing();
+    ImGui::TextDisabled("External Subtitles:");
+    for (const auto& t : tracks) {
+      if (t.isExternal) {
+        bool isSelected = (selSubTrack == -2);
+        std::string label = "[ext] " + t.title;
+        if (ImGui::MenuItem(label.c_str(), nullptr, isSelected)) {
+          m_controller.selectSubtitleTrack(-2);
+        }
+      }
+    }
+
+    if (ImGui::MenuItem("Load Subtitle File (.srt, .vtt, .ass)...")) {
+      openSubtitleFileDialog();
+    }
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::TextDisabled("Subtitle Timing Delay:");
+
+    if (ImGui::SmallButton("-50ms")) {
+      adjustSubtitleDelay(-0.05);
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Reset")) {
+      m_controller.setSubtitleDelay(0.0);
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("+50ms")) {
+      adjustSubtitleDelay(0.05);
+    }
+    ImGui::SameLine();
+    char delayBuf[32];
+    std::snprintf(delayBuf, sizeof(delayBuf), "%+.0f ms", m_controller.getSubtitleDelay() * 1000.0);
+    ImGui::TextColored(ImVec4(0.00f, 0.83f, 0.88f, 1.00f), "%s", delayBuf);
+
+    ImGui::EndPopup();
+  }
+
+  ImGui::SameLine(0.0f, groupItemSpacing);
+
   bool eqButtonHighlighted = m_showAudioSettings;
   if (eqButtonHighlighted) {
     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.53f, 0.90f, 0.80f));
@@ -1554,13 +1637,11 @@ void PlayerUI::drawDiagnosticsHUD(int windowWidth, int windowHeight) {
     drawQueueDepth("Audio Frame Q", audioFrmSize, m_controller.getAudioFrameQueueCapacity(), audioInfo); */
   }
 
-  // Subtitle Queue: hardcoded to disabled since it's not supported by core
-  /* ImGui::Text("Subtitle Q: N/A");
-  ImGui::SameLine();
-  ImGui::TextDisabled(" (Disabled)");
-  ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(0.3f, 0.3f, 0.3f, 1.0f));
-  ImGui::ProgressBar(0.0f, ImVec2(-1, 14), "0.0%");
-  ImGui::PopStyleColor(); */
+  // Subtitle Queue
+  std::string activeSub = m_controller.getActiveSubtitleTrackName();
+  char subInfo[64];
+  std::snprintf(subInfo, sizeof(subInfo), "%s", activeSub.c_str());
+  drawQueueDepth("Subtitle Packet Q", m_controller.getSubtitlePacketQueueSize(), m_controller.getSubtitlePacketQueueCapacity(), subInfo);
 
   ImGui::Spacing();
   ImGui::Separator();
@@ -2366,4 +2447,224 @@ void PlayerUI::drawToastNotification(int windowWidth, int windowHeight, double c
   ImGui::PopStyleColor(2);
   ImGui::PopStyleVar(2);
 }
+
+void PlayerUI::drawSubtitleOverlay(int windowWidth, int windowHeight, double currentPts) {
+  (void)currentPts;
+  std::string subText = m_controller.getCurrentSubtitleText();
+  if (subText.empty()) return;
+
+  // Choose the font to use
+  ImFont* font = m_subtitleFont ? m_subtitleFont : (m_titleFont ? m_titleFont : (m_mainFont ? m_mainFont : ImGui::GetFont()));
+  float baseFontSize = font ? font->FontSize : 20.0f;
+
+  // 1. Calculate the exact rendered video viewport bounds (letterbox & pillarbox aware)
+  float videoW = static_cast<float>(windowWidth);
+  float videoH = static_cast<float>(windowHeight);
+  float videoX = 0.0f;
+  float videoY = 0.0f;
+
+  int vidW = m_controller.getVideoWidth();
+  int vidH = m_controller.getVideoHeight();
+  if (vidW > 0 && vidH > 0) {
+    float videoAspect = static_cast<float>(vidW) / vidH;
+    float windowAspect = static_cast<float>(windowWidth) / windowHeight;
+
+    if (windowAspect > videoAspect) {
+      // Pillarbox: video touches top & bottom, side black bars
+      videoH = static_cast<float>(windowHeight);
+      videoW = windowHeight * videoAspect;
+      videoX = (windowWidth - videoW) * 0.5f;
+      videoY = 0.0f;
+    } else {
+      // Letterbox: video touches left & right, top/bottom black bars
+      videoW = static_cast<float>(windowWidth);
+      videoH = windowWidth / videoAspect;
+      videoX = 0.0f;
+      videoY = (windowHeight - videoH) * 0.5f;
+    }
+  }
+
+  // 2. Dynamic font scaling: ~4.6% of rendered video height (clamped between 22px and 72px)
+  float targetFontSize = std::clamp(videoH * 0.046f, 22.0f, 72.0f);
+  float fontScale = targetFontSize / baseFontSize;
+
+  // 3. Maximum allowed width for subtitles (92% of active video width)
+  float maxWrapWidth = std::max(100.0f, videoW * 0.92f);
+
+  // 4. Split and wrap subtitle text into individual lines
+  std::vector<std::string> lines;
+  std::istringstream stream(subText);
+  std::string rawLine;
+  while (std::getline(stream, rawLine)) {
+    if (!rawLine.empty() && rawLine.back() == '\r') {
+      rawLine.pop_back();
+    }
+    if (rawLine.empty()) continue;
+
+    // Word wrap long lines to fit within maxWrapWidth
+    float unscaledMaxWrap = maxWrapWidth / fontScale;
+    size_t start = 0;
+    while (start < rawLine.size()) {
+      size_t len = rawLine.size() - start;
+      ImVec2 sz = font->CalcTextSizeA(baseFontSize, unscaledMaxWrap, 0.0f, rawLine.c_str() + start, rawLine.c_str() + start + len);
+      if (sz.x <= unscaledMaxWrap) {
+        lines.push_back(rawLine.substr(start));
+        break;
+      }
+
+      // Find last space before limit
+      size_t lastSpace = std::string::npos;
+      for (size_t i = start; i < rawLine.size(); ++i) {
+        if (rawLine[i] == ' ') {
+          ImVec2 curSz = font->CalcTextSizeA(baseFontSize, FLT_MAX, 0.0f, rawLine.c_str() + start, rawLine.c_str() + i);
+          if (curSz.x <= unscaledMaxWrap) {
+            lastSpace = i;
+          } else {
+            break;
+          }
+        }
+      }
+
+      if (lastSpace != std::string::npos && lastSpace > start) {
+        lines.push_back(rawLine.substr(start, lastSpace - start));
+        start = lastSpace + 1;
+      } else {
+        lines.push_back(rawLine.substr(start));
+        break;
+      }
+    }
+  }
+
+  if (lines.empty()) return;
+
+  // 5. Measure dimensions across all lines
+  float maxLineWidth = 0.0f;
+  std::vector<float> lineWidths;
+  lineWidths.reserve(lines.size());
+
+  for (const auto& line : lines) {
+    ImVec2 sz = font->CalcTextSizeA(baseFontSize, FLT_MAX, 0.0f, line.c_str(), line.c_str() + line.size());
+    float w = sz.x * fontScale;
+    lineWidths.push_back(w);
+    if (w > maxLineWidth) {
+      maxLineWidth = w;
+    }
+  }
+
+  float lineSpacing = 4.0f * fontScale;
+  float singleLineH = targetFontSize;
+  float totalTextHeight = lines.size() * singleLineH + (lines.size() > 1 ? (lines.size() - 1) * lineSpacing : 0.0f);
+
+  float padX = std::clamp(18.0f * fontScale, 14.0f, 32.0f);
+  float padY = std::clamp(10.0f * fontScale, 8.0f, 20.0f);
+  float boxW = maxLineWidth + padX * 2.0f;
+  float boxH = totalTextHeight + padY * 2.0f;
+
+  // 6. Horizontal and vertical positioning relative to video bounds
+  float posX = videoX + (videoW - boxW) * 0.5f;
+
+  // Bottom margin: 4% of video height
+  float bottomMargin = std::max(14.0f, videoH * 0.040f);
+  float dockTop = static_cast<float>(windowHeight) - 86.0f;
+
+  float posY = (videoY + videoH) - boxH - bottomMargin;
+  // If controls dock is visible and overlaps with subtitle, lift subtitle slightly above dock
+  if (m_controlsVisible && (posY + boxH > dockTop)) {
+    posY = dockTop - boxH - 8.0f;
+  }
+  // Clamp within video top bound
+  if (posY < videoY + 8.0f) {
+    posY = videoY + 8.0f;
+  }
+
+  // 7. Render Subtitle Window with translucent backdrop and centered lines
+  ImGui::SetNextWindowPos(ImVec2(posX, posY));
+  ImGui::SetNextWindowSize(ImVec2(boxW, boxH));
+
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, std::clamp(10.0f * fontScale, 8.0f, 16.0f));
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(padX, padY));
+  ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.0f, lineSpacing));
+  ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.02f, 0.02f, 0.04f, 0.82f));
+  ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.25f, 0.28f, 0.35f, 0.50f));
+
+  ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+                           ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings |
+                           ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
+                           ImGuiWindowFlags_NoBringToFrontOnFocus;
+
+  if (ImGui::Begin("##SubtitleOverlay", nullptr, flags)) {
+    ImGui::PushFont(font);
+    ImGui::SetWindowFontScale(fontScale);
+
+    float contentWidth = boxW - padX * 2.0f;
+    for (size_t i = 0; i < lines.size(); ++i) {
+      float lineW = lineWidths[i];
+      float lineOffset = (contentWidth - lineW) * 0.5f;
+      if (lineOffset > 0.0f) {
+        ImGui::SetCursorPosX(padX + lineOffset);
+      } else {
+        ImGui::SetCursorPosX(padX);
+      }
+      ImGui::TextColored(ImVec4(0.98f, 0.98f, 0.98f, 1.0f), "%s", lines[i].c_str());
+    }
+
+    ImGui::SetWindowFontScale(1.0f);
+    ImGui::PopFont();
+  }
+  ImGui::End();
+
+  ImGui::PopStyleColor(2);
+  ImGui::PopStyleVar(3);
+}
+
+void PlayerUI::openSubtitleFileDialog() {
+  if (m_subtitleDialogCallback) {
+    std::string path = m_subtitleDialogCallback();
+    if (!path.empty()) {
+      if (m_controller.loadExternalSubtitle(path)) {
+        showToast("Loaded subtitle: " + m_controller.getActiveSubtitleTrackName(), false, 3.5);
+      } else {
+        showToast("Failed to parse subtitle file", true, 3.5);
+      }
+    }
+  }
+}
+
+void PlayerUI::cycleSubtitleTrack() {
+  auto tracks = m_controller.getSubtitleTracks();
+  if (tracks.empty()) {
+    showToast("No subtitle tracks available", false, 2.5);
+    return;
+  }
+
+  int current = m_controller.getSelectedSubtitleTrack();
+  int nextTrack = -1;
+
+  if (current == -1) {
+    nextTrack = tracks[0].isExternal ? -2 : tracks[0].id;
+  } else {
+    auto it = std::find_if(tracks.begin(), tracks.end(), [current](const naikav::subtitle::SubtitleTrackInfo& t) {
+      return (current == -2 && t.isExternal) || t.id == current;
+    });
+
+    if (it != tracks.end() && (it + 1) != tracks.end()) {
+      nextTrack = (it + 1)->isExternal ? -2 : (it + 1)->id;
+    } else {
+      nextTrack = -1; // Cycle to Off
+    }
+  }
+
+  m_controller.selectSubtitleTrack(nextTrack);
+  showToast("Subtitles: " + m_controller.getActiveSubtitleTrackName(), false, 2.5);
+}
+
+void PlayerUI::adjustSubtitleDelay(double deltaSeconds) {
+  double current = m_controller.getSubtitleDelay();
+  double updated = std::round((current + deltaSeconds) * 1000.0) / 1000.0;
+  m_controller.setSubtitleDelay(updated);
+  char buf[64];
+  std::snprintf(buf, sizeof(buf), "Subtitle Delay: %+.0f ms", updated * 1000.0);
+  showToast(buf, false, 2.0);
+}
+
 

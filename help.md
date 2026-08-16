@@ -271,6 +271,8 @@ The user interface uses Dear ImGui with frosted translucency overlay.
 | **`Up Arrow`** / **`Down Arrow`** | Increase / Decrease Volume (±5%) |
 | **`Mouse Wheel`** (over video) | Adjust Volume Up / Down |
 | **`S`** | Capture Screenshot / Export Video Frame as PNG |
+| **`V`** | Cycle Subtitle Tracks (Off -> Embedded -> External -> Off) |
+| **`G`** / **`H`** | Adjust Subtitle Synchronization Delay (-50ms / +50ms) |
 | **`Left Arrow`** / **`Right Arrow`** | Seek backward / forward by 10 seconds |
 | **`[`** / **`]`** | Decrease / Increase playback speed by 0.25x (0.25x – 2.0x) |
 | **`Backspace`** | Reset playback speed to normal (1.0x) |
@@ -294,7 +296,8 @@ src/
 ├── core/      ThreadSafeQueue.hpp, MetricRing.hpp, PipelineMetrics.hpp
 ├── media/     Demuxer.{hpp,cpp} — packet reading and routing
 ├── player/    PlayerController.{hpp,cpp} — state machine, seeking, settings persistence
-├── ui/        PlayerUI.{hpp,cpp} — ImGui controls dock, diagnostics HUD, audio panel
+├── subtitle/  SubtitleDecoder.{hpp,cpp}, SubtitleTrack.hpp — decoding, parsing, sync, sanitization
+├── ui/        PlayerUI.{hpp,cpp} — ImGui controls dock, diagnostics HUD, audio panel, subtitle overlay
 └── video/     VideoDecoder.{hpp,cpp} — HW/SW decode, frame conversion
 ```
 
@@ -373,6 +376,22 @@ NaikAVPlayer provides a dedicated audio-only playback mode that activates automa
 
 ---
 
+## 5d. Subtitle Pipeline (Internal & External)
+
+NaikAVPlayer provides end-to-end subtitle handling supporting both embedded container streams and external sidecar files:
+
+- **Embedded Subtitle Stream Detection & Routing**: `Demuxer::open()` enumerates all `AVMEDIA_TYPE_SUBTITLE` streams in the media file (e.g. SubRip/SRT, ASS/SSA, WebVTT, MOV Text). When a track is selected, the demuxer routes packets to `m_subtitleQueue` (bounded 50-packet queue). During seek operations, `m_subtitleQueue` is cleared and packet timestamps from stale seek epochs are rejected using `m_seekGeneration`.
+- **External Subtitle File Support**: Users can load external subtitle files (`.srt`, `.vtt`, `.ass`, `.ssa`, `.sub`) through the native file dialog or hotkeys. External subtitle files adjacent to media files with matching names are automatically probed and loaded on file open. External subtitles are parsed upfront into memory (`<2ms`), enabling instant random seeks without disk I/O.
+- **ASS Tag Stripping & Text Sanitization**: `sanitizeSubtitleText()` filters ASS override tags (e.g., `{\pos(x,y)}`, `{\an8}`, `{\b1}`, `{\c&H00FFFF&}`), normalizes ASS dialogue field headers and hard/soft breaks (`\N`, `\n`, `\h`), and strips standard HTML formatting tags (`<i>`, `<b>`, `<font>`).
+- **Timing Synchronization & Delay Offset**: `SubtitleDecoder` matches active subtitle events against the video playback presentation timestamp (`currentPts`). Users can fine-tune subtitle synchronization in real-time in 50ms increments via the Subtitle menu or keyboard hotkeys (`G` / `H`), with delay offsets displayed in the UI.
+- **Overlay Presentation & Video Contrast**: Subtitles are rendered directly over the video canvas in `PlayerUI::drawSubtitleOverlay()`. The overlay dynamically accounts for letterboxing/pillarboxing bounding boxes, centers multi-line text near the bottom edge above the controls dock, and renders text against a translucent dark rounded backdrop box (`rgba(5, 5, 8, 0.78)`) with high-contrast white text for legibility on both bright and dark scenes.
+- **UI & Control Options**:
+  - **Controls Dock**: `[CC]` icon button with popup menu for selecting `Off`, embedded tracks by language/title/codec, external tracks, loading new external files, and adjusting timing delay.
+  - **Diagnostics HUD (`D`)**: Displays active subtitle track name and live `Subtitle Packet Q` depth.
+  - **Hotkeys**: `V` cycles through available subtitle tracks; `G` / `H` adjusts delay offset (-/+50ms).
+
+---
+
 ## 6. Security, Maintenance & Dependency Management
 
 - **Upstream Dependencies**: Build dependencies are pinned in `CMakeLists.txt` by commit SHA, with the semantic version in a trailing comment — `SDL3` `release-3.4.0`, `imgui` `v1.91.9`, `nativefiledialog-extended` `v1.2.1` (all via `FetchContent`), and FFmpeg `n8.1.2` (prebuilt archive, verified by SHA-256).
@@ -416,6 +435,7 @@ The execution pipeline tracks 9 metrics using lock-free Single Producer Single C
 | **M1** | `video_packet_queue_depth` | `core/ThreadSafeQueue.hpp:push/pop/try_pop/clear/reset` | Demuxer & Video Decoder | std::atomic<int> (Gauge) | Always-On |
 | **M2** | `audio_packet_queue_depth` | `core/ThreadSafeQueue.hpp:push/pop/try_pop/clear/reset` | Demuxer & Audio Decoder callback | std::atomic<int> (Gauge) | Always-On |
 | **M3** | `decoded_frame_queue_depth` | `core/ThreadSafeQueue.hpp:push/pop/try_pop/clear/reset` | Video Decoder & Main Render | std::atomic<int> (Gauge) | Always-On |
+| **M3b** | `subtitle_packet_queue_depth` | `core/ThreadSafeQueue.hpp:push/pop/try_pop/clear/reset` | Demuxer & Subtitle Decoder | std::atomic<int> (Gauge) | Always-On |
 | **M4** | `demux_time_per_packet_us` | `media/Demuxer.cpp:threadLoop()` | Demuxer thread | MetricRing<256> (SPSC) | gated |
 | **M5** | `decode_time_per_frame_us` | `video/VideoDecoder.cpp:decodeNextFrame()` | Video Decoder thread | MetricRing<256> (SPSC) | gated |
 | **M6-A** | `convert_time_us` | `video/VideoDecoder.cpp:convertFrame()` | Video Decoder thread | MetricRing<256> (SPSC) | gated |
