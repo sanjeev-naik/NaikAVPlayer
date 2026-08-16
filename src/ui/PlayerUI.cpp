@@ -1309,13 +1309,9 @@ void PlayerUI::drawControlsBar(int windowWidth, int windowHeight) {
     }
 
     auto tracks = m_controller.getSubtitleTracks();
-    bool hasEmbedded = false;
-    for (const auto& t : tracks) {
-      if (!t.isExternal) {
-        hasEmbedded = true;
-        break;
-      }
-    }
+    bool hasEmbedded = std::any_of(tracks.begin(), tracks.end(), [](const naikav::subtitle::SubtitleTrackInfo& t) {
+      return !t.isExternal;
+    });
 
     if (hasEmbedded) {
       ImGui::Spacing();
@@ -2647,16 +2643,12 @@ void PlayerUI::cycleSubtitleTrack() {
   if (current == -1) {
     nextTrack = tracks[0].isExternal ? -2 : tracks[0].id;
   } else {
-    int currentIdx = -1;
-    for (size_t i = 0; i < tracks.size(); ++i) {
-      if ((current == -2 && tracks[i].isExternal) || tracks[i].id == current) {
-        currentIdx = static_cast<int>(i);
-        break;
-      }
-    }
+    auto it = std::find_if(tracks.begin(), tracks.end(), [current](const naikav::subtitle::SubtitleTrackInfo& t) {
+      return (current == -2 && t.isExternal) || t.id == current;
+    });
 
-    if (currentIdx >= 0 && static_cast<size_t>(currentIdx + 1) < tracks.size()) {
-      nextTrack = tracks[currentIdx + 1].isExternal ? -2 : tracks[currentIdx + 1].id;
+    if (it != tracks.end() && (it + 1) != tracks.end()) {
+      nextTrack = (it + 1)->isExternal ? -2 : (it + 1)->id;
     } else {
       nextTrack = -1; // Cycle to Off
     }

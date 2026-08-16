@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstring>
 #include <cstdio>
+#include <iterator>
 
 namespace naikav {
 namespace subtitle {
@@ -189,7 +190,7 @@ void SubtitleDecoder::processPacket(AVPacket* pkt) {
 
     std::string combinedText;
     for (unsigned int i = 0; i < sub.num_rects; ++i) {
-        AVSubtitleRect* rect = sub.rects[i];
+        const AVSubtitleRect* rect = sub.rects[i];
         if (!rect) continue;
 
         std::string piece;
@@ -240,13 +241,9 @@ void SubtitleDecoder::processPacket(AVPacket* pkt) {
 
         std::lock_guard<std::mutex> lock(m_mutex);
         // Avoid duplicate events at same start time
-        bool duplicate = false;
-        for (auto& existing : m_events) {
-            if (std::abs(existing.startPts - ev.startPts) < 0.05 && existing.text == ev.text) {
-                duplicate = true;
-                break;
-            }
-        }
+        bool duplicate = std::any_of(m_events.begin(), m_events.end(), [&ev](const SubtitleEvent& existing) {
+            return std::abs(existing.startPts - ev.startPts) < 0.05 && existing.text == ev.text;
+        });
         if (!duplicate) {
             m_events.push_back(ev);
             // Keep events sorted by startPts
@@ -265,7 +262,9 @@ bool SubtitleDecoder::loadExternalFile(const std::string& filepath) {
     size_t dotPos = filepath.find_last_of('.');
     if (dotPos != std::string::npos) {
         ext = filepath.substr(dotPos);
-        for (char& c : ext) c = static_cast<char>(std::tolower(c));
+        std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
     }
 
     if (ext == ".srt" || ext == ".vtt") {
@@ -334,18 +333,9 @@ bool SubtitleDecoder::loadExternalFile(const std::string& filepath) {
                                     basePts = (pkt->dts - st) * av_q2d(tb);
                                 }
 
-                                double startPts = basePts + (sub.start_display_time / 1000.0);
-                                double dur = 3.5;
-                                if (sub.end_display_time > 0 && sub.end_display_time != UINT32_MAX) {
-                                    dur = sub.end_display_time / 1000.0;
-                                } else if (pkt->duration > 0) {
-                                    dur = pkt->duration * av_q2d(tb);
-                                }
-                                double endPts = startPts + dur;
-
                                 std::string combinedText;
                                 for (unsigned int j = 0; j < sub.num_rects; ++j) {
-                                    AVSubtitleRect* rect = sub.rects[j];
+                                    const AVSubtitleRect* rect = sub.rects[j];
                                     if (!rect) continue;
 
                                     std::string piece;
@@ -363,6 +353,14 @@ bool SubtitleDecoder::loadExternalFile(const std::string& filepath) {
                                 avsubtitle_free(&sub);
 
                                 if (!combinedText.empty()) {
+                                    double startPts = basePts + (sub.start_display_time / 1000.0);
+                                    double dur = 3.5;
+                                    if (sub.end_display_time > 0 && sub.end_display_time != UINT32_MAX) {
+                                        dur = sub.end_display_time / 1000.0;
+                                    } else if (pkt->duration > 0) {
+                                        dur = pkt->duration * av_q2d(tb);
+                                    }
+                                    double endPts = startPts + dur;
                                     SubtitleEvent ev;
                                     ev.startPts = startPts;
                                     ev.endPts = endPts;
@@ -437,7 +435,7 @@ void SubtitleDecoder::parseSrtVttFallback(const std::string& filepath) {
 
             size_t spacePos = endStr.find(' ');
             if (spacePos != std::string::npos) {
-                endStr = endStr.substr(0, spacePos);
+                endStr.resize(spacePos);
             }
 
             double startSec = 0.0, endSec = 0.0;
@@ -548,11 +546,10 @@ std::vector<SubtitleEvent> SubtitleDecoder::getActiveEvents(double currentPts, d
     double targetPts = currentPts - delaySeconds;
     std::vector<SubtitleEvent> result;
 
-    for (const auto& ev : m_events) {
-        if (ev.isActive(targetPts)) {
-            result.push_back(ev);
-        }
-    }
+    std::copy_if(m_events.begin(), m_events.end(), std::back_inserter(result),
+        [targetPts](const SubtitleEvent& ev) {
+            return ev.isActive(targetPts);
+        });
     return result;
 }
 

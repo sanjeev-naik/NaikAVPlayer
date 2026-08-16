@@ -1261,9 +1261,7 @@ void PlayerController::pollSubtitlePackets() {
     AVPacket* pkt = nullptr;
     while (m_subtitleQueue.try_pop(pkt)) {
         if (pkt) {
-            if (m_subtitleDecoder) {
-                m_subtitleDecoder->processPacket(pkt);
-            }
+            m_subtitleDecoder->processPacket(pkt);
             av_packet_free(&pkt);
         }
     }
@@ -1321,10 +1319,12 @@ std::string PlayerController::getActiveSubtitleTrackName() const {
     }
 
     std::lock_guard<std::mutex> lock(m_subtitleMutex);
-    for (const auto& t : m_cachedSubtitleTracks) {
-        if (t.id == track) {
-            return t.title + " (" + t.language + ")";
-        }
+    auto it = std::find_if(m_cachedSubtitleTracks.begin(), m_cachedSubtitleTracks.end(),
+        [track](const naikav::subtitle::SubtitleTrackInfo& t) {
+            return t.id == track;
+        });
+    if (it != m_cachedSubtitleTracks.end()) {
+        return it->title + " (" + it->language + ")";
     }
     return "Track " + std::to_string(track);
 }
