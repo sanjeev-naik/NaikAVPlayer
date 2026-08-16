@@ -4,6 +4,7 @@
 #include <cmath>
 #include <limits>
 #include <cstdint>
+#include <cstring>
 
 namespace {
 // Upper bound on how long the read loop will ever wait for room in a packet

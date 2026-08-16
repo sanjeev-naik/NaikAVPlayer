@@ -296,7 +296,8 @@ src/
 ├── core/      ThreadSafeQueue.hpp, MetricRing.hpp, PipelineMetrics.hpp
 ├── media/     Demuxer.{hpp,cpp} — packet reading and routing
 ├── player/    PlayerController.{hpp,cpp} — state machine, seeking, settings persistence
-├── ui/        PlayerUI.{hpp,cpp} — ImGui controls dock, diagnostics HUD, audio panel
+├── subtitle/  SubtitleDecoder.{hpp,cpp}, SubtitleTrack.hpp — decoding, parsing, sync, sanitization
+├── ui/        PlayerUI.{hpp,cpp} — ImGui controls dock, diagnostics HUD, audio panel, subtitle overlay
 └── video/     VideoDecoder.{hpp,cpp} — HW/SW decode, frame conversion
 ```
 
@@ -434,6 +435,7 @@ The execution pipeline tracks 9 metrics using lock-free Single Producer Single C
 | **M1** | `video_packet_queue_depth` | `core/ThreadSafeQueue.hpp:push/pop/try_pop/clear/reset` | Demuxer & Video Decoder | std::atomic<int> (Gauge) | Always-On |
 | **M2** | `audio_packet_queue_depth` | `core/ThreadSafeQueue.hpp:push/pop/try_pop/clear/reset` | Demuxer & Audio Decoder callback | std::atomic<int> (Gauge) | Always-On |
 | **M3** | `decoded_frame_queue_depth` | `core/ThreadSafeQueue.hpp:push/pop/try_pop/clear/reset` | Video Decoder & Main Render | std::atomic<int> (Gauge) | Always-On |
+| **M3b** | `subtitle_packet_queue_depth` | `core/ThreadSafeQueue.hpp:push/pop/try_pop/clear/reset` | Demuxer & Subtitle Decoder | std::atomic<int> (Gauge) | Always-On |
 | **M4** | `demux_time_per_packet_us` | `media/Demuxer.cpp:threadLoop()` | Demuxer thread | MetricRing<256> (SPSC) | gated |
 | **M5** | `decode_time_per_frame_us` | `video/VideoDecoder.cpp:decodeNextFrame()` | Video Decoder thread | MetricRing<256> (SPSC) | gated |
 | **M6-A** | `convert_time_us` | `video/VideoDecoder.cpp:convertFrame()` | Video Decoder thread | MetricRing<256> (SPSC) | gated |

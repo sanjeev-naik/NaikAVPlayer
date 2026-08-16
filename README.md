@@ -58,7 +58,8 @@ src/
 ├── core/      ThreadSafeQueue.hpp, MetricRing.hpp, PipelineMetrics.hpp
 ├── media/     Demuxer.{hpp,cpp} — packet reading and routing
 ├── player/    PlayerController.{hpp,cpp} — state machine, seeking, settings persistence
-├── ui/        PlayerUI.{hpp,cpp} — ImGui controls dock, diagnostics HUD, audio panel
+├── subtitle/  SubtitleDecoder.{hpp,cpp}, SubtitleTrack.hpp — decoding, parsing, sync, sanitization
+├── ui/        PlayerUI.{hpp,cpp} — ImGui controls dock, diagnostics HUD, audio panel, subtitle overlay
 └── video/     VideoDecoder.{hpp,cpp} — HW/SW decode, frame conversion
 ```
 
@@ -72,31 +73,29 @@ src/
            ▼
   ┌──────────────────────────────────────────────────────────┐
   │                      Demuxer Thread                      │
-  └─────────────┬──────────────────────────────┬─────────────┘
-                │ packets                      │ packets
-                ▼                              ▼
-  ┌───────────────────────────┐  ┌───────────────────────────┐
-  │   Video Packet Queue      │  │   Audio Packet Queue      │
-  │     (100 packets)         │  │     (150 packets)         │
-  └─────────────┬─────────────┘  └─────────────┬─────────────┘
-                │                              │
-                ▼                              ▼
-  ┌───────────────────────────┐  ┌───────────────────────────┐
-  │   Video Decoder Thread    │  │   Audio Decoder Callback  │
-  │    (HW / SW Fallback)     │  │   (SDL3 Audio Thread)     │
-  │Decode -> Convert -> Queue │  │ Resample(soxr)->DSP Chain │
-  │  (GPU-Mapped YUV Planes)  │  │  ->Loudness->Dither->S16  │
-  └─────────────┬─────────────┘  └─────────────┬─────────────┘
-                │ decoded frames               │ PCM Audio & PTS
-                ▼                              ▼
-  ┌───────────────────────────┐  ┌───────────────────────────┐
-  │   Decoded Frame Queue     │  │     Audio Master Clock    │
-  │        (8 frames)         │  │  (Sub-10ms A/V Sync Ref)  │
-  └─────────────┬─────────────┘  └─────────────┬─────────────┘
-                │                              │
-                └──────────────┬───────────────┘
-                               │
-                               ▼
+  └───────┬─────────────────────┬────────────────────┬───────┘
+          │ video packets       │ audio packets      │ subtitle packets
+          ▼                     ▼                    ▼
+  ┌──────────────┐      ┌──────────────┐     ┌──────────────┐
+  │ Video Packet │      │ Audio Packet │     │Subtitle Queue│
+  │ Queue (100)  │      │ Queue (150)  │     │  (50 pkts)   │
+  └───────┬──────┘      └───────┬──────┘     └───────┬──────┘
+          │                     │                    │
+          ▼                     ▼                    ▼
+  ┌──────────────┐      ┌──────────────┐     ┌──────────────┐
+  │Video Decoder │      │Audio Decoder │     │  Subtitle    │
+  │Thread (HW/SW)│      │  (SDL3 Audio)│     │Decoder/Parser│
+  └───────┬──────┘      └───────┬──────┘     └───────┬──────┘
+          │ decoded frames      │ PCM Audio & PTS    │ events
+          ▼                     ▼                    │
+  ┌──────────────┐      ┌──────────────┐             │
+  │Decoded Frame │      │ Audio Master │             │
+  │  Queue (8)   │      │    Clock     │             │
+  └───────┬──────┘      └───────┬──────┘             │
+          │                     │                    │
+          └──────────────┬──────┴────────────────────┘
+                         │
+                         ▼
   ┌──────────────────────────────────────────────────────────┐
   │                   Main / Render Loop                     │
   │  ┌────────────────────────────────────────────────────┐  │
@@ -104,14 +103,18 @@ src/
   │  │                            │                       │  │
   │  │                            ▼                       │  │
   │  │ Drop Late Frames ──► GPU YUV Texture Upload & UI   │  │
+  │  │                            │                       │  │
+  │  │                            ▼                       │  │
+  │  │ Subtitle Overlay Match ──► Render Contrast Backdrop│  │
   │  └────────────────────────────────────────────────────┘  │
   └──────────────────────────────────────────────────────────┘
 ```
 
-- **Demuxer Thread**: Reads raw packets via `av_read_frame` and routes them into bounded `ThreadSafeQueue<AVPacket*>` instances (video capacity: 100 packets, audio capacity: 150 packets). Pushes never block indefinitely — see [Stall-Proof Queue Backpressure](#stall-proof-queue-backpressure-deadlock-prevention) below.
+- **Demuxer Thread**: Reads raw packets via `av_read_frame` and routes them into bounded `ThreadSafeQueue<AVPacket*>` instances (video capacity: 100 packets, audio capacity: 150 packets, subtitle capacity: 50 packets). Pushes never block indefinitely — see [Stall-Proof Queue Backpressure](#stall-proof-queue-backpressure-deadlock-prevention) below.
 - **Video Decoder Thread**: Background worker thread that pops packets from the video queue, decodes them (via hardware or software fallback), converts frames, and pushes them into the bounded `m_decodedFrameQueue` (capacity: 8 frames), using the same bounded-wait backpressure.
 - **Audio Decoding**: Executed sample-accurately inside the SDL3 Audio Stream callback thread. It pulls packets from the audio queue, decodes them, resamples to the output layout/rate as interleaved float (`swr_convert`, libsoxr engine), runs the DSP chain and loudness normalization in place, then dithers and truncates to the device's 16-bit format — see [Audio DSP & Loudness Pipeline](#audio-dsp--loudness-pipeline) below.
-- **Main / Render Thread**: Dequeues decoded frames from `m_decodedFrameQueue` whose PTS matches the master clock time, updates the SDL YUV texture on the GPU, and renders the Dear ImGui interface overlay.
+- **Subtitle Decoder & Parser**: Handles container-embedded subtitle streams via FFmpeg decoders and standalone external files (`.srt`, `.vtt`, `.ass`, `.ssa`, `.sub`) parsed directly into in-memory timed events.
+- **Main / Render Thread**: Dequeues decoded frames from `m_decodedFrameQueue` whose PTS matches the master clock time, matches active subtitle events against playback PTS + delay offset, updates the SDL YUV texture on the GPU, and renders the Dear ImGui interface overlay.
 
 #### GPU-Mapped Planar YUV Uploads
 Instead of performing CPU-side YUV-to-RGB color space conversion, the video decoder pipeline extracts raw YUV 4:2:0 planar frame data directly. The main thread maps this data onto a hardware-accelerated SDL3 streaming texture (`SDL_PIXELFORMAT_IYUV`) using `SDL_UpdateYUVTexture`. This uploads plane segments directly to GPU texture memory, allowing graphics hardware to handle color space conversion and scaling efficiently.
