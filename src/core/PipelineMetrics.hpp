@@ -9,9 +9,10 @@ struct PipelineMetrics {
         m_profilingEnabled.store(enabled, std::memory_order_relaxed);
     }
 
-    // Queue depths (M1, M2, M3)
+    // Queue depths (M1, M2, M3, M3b)
     alignas(64) std::atomic<int> m_videoPacketQueueDepth{0};
     alignas(64) std::atomic<int> m_audioPacketQueueDepth{0};
+    alignas(64) std::atomic<int> m_subtitlePacketQueueDepth{0};
     alignas(64) std::atomic<int> m_decodedFrameQueueDepth{0};
 
     // Rings (M4, M5, M6, M7, M9)

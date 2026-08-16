@@ -148,6 +148,29 @@ std::string openNativeFileDialog(SDL_Window *window) {
   return "";
 }
 
+std::string openNativeSubtitleDialog(SDL_Window *window) {
+  NFD::UniquePathU8 outPath;
+  nfdfilteritem_t filterItem[1] = {
+      {"Subtitle Files", "srt,vtt,ass,ssa,sub"}};
+
+  nfdopendialogu8args_t args = {};
+  args.filterList = filterItem;
+  args.filterCount = 1;
+  setNfdParentWindow(args.parentWindow, window);
+
+  nfdu8char_t *rawPath = nullptr;
+  nfdresult_t result = NFD_OpenDialogU8_With(&rawPath, &args);
+  if (result == NFD_OKAY) {
+    outPath.reset(rawPath);
+    return std::string(outPath.get());
+  }
+  if (result == NFD_ERROR) {
+    std::cerr << "Error: NFD_OpenDialogU8_With failed: " << NFD_GetError()
+              << std::endl;
+  }
+  return "";
+}
+
 static SDL_Colorspace getSDLColorspace(const AVFrame *frame) {
   if (!frame)
     return SDL_COLORSPACE_UNKNOWN;
@@ -299,6 +322,8 @@ int main(int argc, char *argv[]) {
   // can be parented to it -- see setNfdParentWindow() for why that matters.
   playerUI.setFileDialogCallback(
       [window]() { return openNativeFileDialog(window); });
+  playerUI.setSubtitleDialogCallback(
+      [window]() { return openNativeSubtitleDialog(window); });
 
   // Enable drag and drop events
   SDL_SetEventEnabled(SDL_EVENT_DROP_FILE, true);
@@ -491,6 +516,15 @@ int main(int argc, char *argv[]) {
           break;
         case SDLK_A:
           playerUI.toggleAudioSettings();
+          break;
+        case SDLK_V:
+          playerUI.cycleSubtitleTrack();
+          break;
+        case SDLK_G:
+          playerUI.adjustSubtitleDelay(-0.05);
+          break;
+        case SDLK_H:
+          playerUI.adjustSubtitleDelay(0.05);
           break;
         default:
           break;

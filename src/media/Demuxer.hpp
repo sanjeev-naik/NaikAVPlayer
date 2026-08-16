@@ -1,11 +1,13 @@
 #pragma once
 
 #include <string>
+#include <vector>
 #include <thread>
 #include <atomic>
 #include <mutex>
 #include "core/ThreadSafeQueue.hpp"
 #include "core/MetricRing.hpp"
+#include "subtitle/SubtitleTrack.hpp"
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -25,6 +27,8 @@ private:
     
     std::atomic<int> m_videoStreamIdx;
     std::atomic<int> m_audioStreamIdx;
+    std::atomic<int> m_subtitleStreamIdx{-1};
+    std::vector<naikav::subtitle::SubtitleTrackInfo> m_subtitleTracks;
     
     AVCodecParameters* m_videoCodecParams;
     AVCodecParameters* m_audioCodecParams;
@@ -38,6 +42,7 @@ private:
     
     ThreadSafeQueue<AVPacket*>& m_videoQueue;
     ThreadSafeQueue<AVPacket*>& m_audioQueue;
+    ThreadSafeQueue<AVPacket*>* m_subtitleQueue = nullptr;
     
     std::thread m_thread;
     std::atomic<bool> m_running;
@@ -105,6 +110,9 @@ public:
     // this pointer assignment.
     void attachAudioPausedFlag(std::atomic<bool>* flag) { m_audioPausedFlag = flag; }
 
+    // Attach subtitle packet queue for embedded subtitle demuxing
+    void attachSubtitleQueue(ThreadSafeQueue<AVPacket*>* queue) { m_subtitleQueue = queue; }
+
     // Live pointer to the seek-generation counter, for VideoDecoder/
     // AudioDecoder to compare a popped packet's tag against (see
     // attachSeekGeneration() on those classes).
@@ -113,8 +121,16 @@ public:
     // Getters
     int getVideoStreamIndex() const { return m_videoStreamIdx; }
     int getAudioStreamIndex() const { return m_audioStreamIdx; }
+    int getSubtitleStreamIndex() const { return m_subtitleStreamIdx.load(); }
+    void setSubtitleStreamIndex(int idx) { m_subtitleStreamIdx.store(idx); }
+    const std::vector<naikav::subtitle::SubtitleTrackInfo>& getSubtitleTracks() const { return m_subtitleTracks; }
+
     AVCodecParameters* getVideoCodecParams() const { return m_videoCodecParams; }
     AVCodecParameters* getAudioCodecParams() const { return m_audioCodecParams; }
+    AVCodecParameters* getSubtitleCodecParams(int streamIdx) const;
+    AVRational getSubtitleTimeBase(int streamIdx) const;
+    int64_t getSubtitleStartTime(int streamIdx) const;
+
     AVRational getVideoTimeBase() const { return m_videoTimeBase; }
     AVRational getAudioTimeBase() const { return m_audioTimeBase; }
     int64_t getVideoStartTime() const { return m_videoStartTime; }
@@ -158,3 +174,4 @@ public:
         return "";
     }
 };
+

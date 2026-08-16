@@ -271,6 +271,8 @@ The user interface uses Dear ImGui with frosted translucency overlay.
 | **`Up Arrow`** / **`Down Arrow`** | Increase / Decrease Volume (±5%) |
 | **`Mouse Wheel`** (over video) | Adjust Volume Up / Down |
 | **`S`** | Capture Screenshot / Export Video Frame as PNG |
+| **`V`** | Cycle Subtitle Tracks (Off -> Embedded -> External -> Off) |
+| **`G`** / **`H`** | Adjust Subtitle Synchronization Delay (-50ms / +50ms) |
 | **`Left Arrow`** / **`Right Arrow`** | Seek backward / forward by 10 seconds |
 | **`[`** / **`]`** | Decrease / Increase playback speed by 0.25x (0.25x – 2.0x) |
 | **`Backspace`** | Reset playback speed to normal (1.0x) |
@@ -370,6 +372,22 @@ NaikAVPlayer provides a dedicated audio-only playback mode that activates automa
   - **Mirrored Stereo Spectrum**: Symmetrical top-and-bottom frequency equalizer bars meeting at a glowing horizon line.
   - **Vibrant Color Palettes**: `CYBER` (Cyan/Magenta), `SUNSET` (Amber/Hot Pink), `MINT` (Mint/Emerald), and `VIOLET` (Aqua/Purple).
   - **Telemetry Snapshots**: Self-synchronized thread-safe getters `getSpectrumMagnitudesDb()` (512 FFT bins) and `getWaveformSamples()` (1024 time-domain samples) feed the visualizer without requiring audio callback locks.
+
+---
+
+## 5d. Subtitle Pipeline (Internal & External)
+
+NaikAVPlayer provides end-to-end subtitle handling supporting both embedded container streams and external sidecar files:
+
+- **Embedded Subtitle Stream Detection & Routing**: `Demuxer::open()` enumerates all `AVMEDIA_TYPE_SUBTITLE` streams in the media file (e.g. SubRip/SRT, ASS/SSA, WebVTT, MOV Text). When a track is selected, the demuxer routes packets to `m_subtitleQueue` (bounded 50-packet queue). During seek operations, `m_subtitleQueue` is cleared and packet timestamps from stale seek epochs are rejected using `m_seekGeneration`.
+- **External Subtitle File Support**: Users can load external subtitle files (`.srt`, `.vtt`, `.ass`, `.ssa`, `.sub`) through the native file dialog or hotkeys. External subtitle files adjacent to media files with matching names are automatically probed and loaded on file open. External subtitles are parsed upfront into memory (`<2ms`), enabling instant random seeks without disk I/O.
+- **ASS Tag Stripping & Text Sanitization**: `sanitizeSubtitleText()` filters ASS override tags (e.g., `{\pos(x,y)}`, `{\an8}`, `{\b1}`, `{\c&H00FFFF&}`), normalizes ASS dialogue field headers and hard/soft breaks (`\N`, `\n`, `\h`), and strips standard HTML formatting tags (`<i>`, `<b>`, `<font>`).
+- **Timing Synchronization & Delay Offset**: `SubtitleDecoder` matches active subtitle events against the video playback presentation timestamp (`currentPts`). Users can fine-tune subtitle synchronization in real-time in 50ms increments via the Subtitle menu or keyboard hotkeys (`G` / `H`), with delay offsets displayed in the UI.
+- **Overlay Presentation & Video Contrast**: Subtitles are rendered directly over the video canvas in `PlayerUI::drawSubtitleOverlay()`. The overlay dynamically accounts for letterboxing/pillarboxing bounding boxes, centers multi-line text near the bottom edge above the controls dock, and renders text against a translucent dark rounded backdrop box (`rgba(5, 5, 8, 0.78)`) with high-contrast white text for legibility on both bright and dark scenes.
+- **UI & Control Options**:
+  - **Controls Dock**: `[CC]` icon button with popup menu for selecting `Off`, embedded tracks by language/title/codec, external tracks, loading new external files, and adjusting timing delay.
+  - **Diagnostics HUD (`D`)**: Displays active subtitle track name and live `Subtitle Packet Q` depth.
+  - **Hotkeys**: `V` cycles through available subtitle tracks; `G` / `H` adjusts delay offset (-/+50ms).
 
 ---
 

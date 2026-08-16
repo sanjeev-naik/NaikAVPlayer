@@ -11,6 +11,8 @@
 #include "media/Demuxer.hpp"
 #include "audio/AudioDecoder.hpp"
 #include "video/VideoDecoder.hpp"
+#include "subtitle/SubtitleTrack.hpp"
+#include "subtitle/SubtitleDecoder.hpp"
 #include "core/PipelineMetrics.hpp"
 #include <chrono>
 
@@ -45,11 +47,21 @@ private:
     // Packet queues
     ThreadSafeQueue<AVPacket*> m_videoQueue;
     ThreadSafeQueue<AVPacket*> m_audioQueue;
+    ThreadSafeQueue<AVPacket*> m_subtitleQueue;
     
     // Sub-modules
     std::unique_ptr<Demuxer> m_demuxer;
     std::unique_ptr<AudioDecoder> m_audioDecoder;
     std::unique_ptr<VideoDecoder> m_videoDecoder;
+    std::unique_ptr<naikav::subtitle::SubtitleDecoder> m_subtitleDecoder;
+
+    // Subtitle state
+    std::atomic<int> m_selectedSubtitleTrack{-1}; // -1 = Off, >= 0 = embedded stream index, -2 = external
+    std::atomic<double> m_subtitleDelay{0.0};      // Subtitle timing offset in seconds
+    mutable std::mutex m_subtitleMutex;
+    std::vector<naikav::subtitle::SubtitleTrackInfo> m_cachedSubtitleTracks;
+    naikav::subtitle::SubtitleTrackInfo m_externalSubtitleTrack;
+    bool m_hasExternalSubtitle = false;
     
     bool m_hasAudio;
     bool m_hasVideo;
@@ -339,11 +351,29 @@ public:
         saveSettings();
     }
 
+    // Subtitle management APIs
+    std::vector<naikav::subtitle::SubtitleTrackInfo> getSubtitleTracks() const;
+    int getSelectedSubtitleTrack() const { return m_selectedSubtitleTrack.load(); }
+    void selectSubtitleTrack(int trackId);
+    bool loadExternalSubtitle(const std::string& filepath);
+    std::string getCurrentSubtitleText();
+    void setSubtitleDelay(double delaySeconds) { m_subtitleDelay.store(delaySeconds); }
+    double getSubtitleDelay() const { return m_subtitleDelay.load(); }
+    void pollSubtitlePackets();
+    void autoProbeExternalSubtitles(const std::string& mediaFilename);
+    bool hasExternalSubtitle() const {
+        std::lock_guard<std::mutex> lock(m_subtitleMutex);
+        return m_hasExternalSubtitle;
+    }
+    std::string getActiveSubtitleTrackName() const;
+
     // Queue depths
     size_t getVideoPacketQueueSize() const { return m_videoQueue.size(); }
     size_t getVideoPacketQueueCapacity() const { return m_videoQueue.capacity(); }
     size_t getAudioPacketQueueSize() const { return m_audioQueue.size(); }
     size_t getAudioPacketQueueCapacity() const { return m_audioQueue.capacity(); }
+    size_t getSubtitlePacketQueueSize() const { return m_subtitleQueue.size(); }
+    size_t getSubtitlePacketQueueCapacity() const { return m_subtitleQueue.capacity(); }
     size_t getVideoFrameQueueSize() const { return m_decodedFrameQueue.size(); }
     size_t getVideoFrameQueueCapacity() const { return m_decodedFrameQueue.capacity(); }
     size_t getAudioFrameQueueSize() const;
