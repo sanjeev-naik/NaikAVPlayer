@@ -585,6 +585,65 @@ int real_main(int argc, char* argv[]) {
             bool convertRebindSuccess = testDecoder.convertFrame();
             test_assert(convertRebindSuccess, "convertFrame slow-path buffer re-binding succeeds");
 
+            // Test case 7: Resolution scaling options (4K, 1080p, 720p, 360p, Original)
+            {
+                testDecoder.m_decodedFrame->width = 1920;
+                testDecoder.m_decodedFrame->height = 1080;
+                testDecoder.m_decodedFrame->format = AV_PIX_FMT_YUV420P;
+                std::vector<uint8_t> hdBuffer(1920 * 1080 * 2, 128);
+                av_image_fill_arrays(
+                    testDecoder.m_decodedFrame->data,
+                    testDecoder.m_decodedFrame->linesize,
+                    hdBuffer.data(),
+                    AV_PIX_FMT_YUV420P,
+                    1920,
+                    1080,
+                    1
+                );
+
+                // Scale to 4K
+                bool to4K = testDecoder.convertFrame(ResolutionOption::R_4K);
+                test_assert(to4K, "convertFrame scales from 1080p to 4K");
+                test_assert(testDecoder.getYUVFrame()->width == 3840, "4K scaled frame width is 3840");
+                test_assert(testDecoder.getYUVFrame()->height == 2160, "4K scaled frame height is 2160");
+
+                // Re-feed 1080p frame and scale to 720p
+                testDecoder.m_decodedFrame->width = 1920;
+                testDecoder.m_decodedFrame->height = 1080;
+                testDecoder.m_decodedFrame->format = AV_PIX_FMT_YUV420P;
+                av_image_fill_arrays(
+                    testDecoder.m_decodedFrame->data,
+                    testDecoder.m_decodedFrame->linesize,
+                    hdBuffer.data(),
+                    AV_PIX_FMT_YUV420P,
+                    1920,
+                    1080,
+                    1
+                );
+                bool to720p = testDecoder.convertFrame(ResolutionOption::R_720P);
+                test_assert(to720p, "convertFrame scales from 1080p to 720p");
+                test_assert(testDecoder.getYUVFrame()->width == 1280, "720p scaled frame width is 1280");
+                test_assert(testDecoder.getYUVFrame()->height == 720, "720p scaled frame height is 720");
+
+                // Re-feed 1080p frame and scale to Original (fast-path native)
+                testDecoder.m_decodedFrame->width = 1920;
+                testDecoder.m_decodedFrame->height = 1080;
+                testDecoder.m_decodedFrame->format = AV_PIX_FMT_YUV420P;
+                av_image_fill_arrays(
+                    testDecoder.m_decodedFrame->data,
+                    testDecoder.m_decodedFrame->linesize,
+                    hdBuffer.data(),
+                    AV_PIX_FMT_YUV420P,
+                    1920,
+                    1080,
+                    1
+                );
+                bool toOrig = testDecoder.convertFrame(ResolutionOption::ORIGINAL);
+                test_assert(toOrig, "convertFrame restores Original native 1080p");
+                test_assert(testDecoder.getYUVFrame()->width == 1920, "Original frame width is 1920");
+                test_assert(testDecoder.getYUVFrame()->height == 1080, "Original frame height is 1080");
+            }
+
             avcodec_parameters_free(&testCodecParams);
         }
 

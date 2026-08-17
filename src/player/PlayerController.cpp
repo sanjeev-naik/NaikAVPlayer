@@ -1158,6 +1158,9 @@ void PlayerController::saveSettings() {
 void PlayerController::setResolutionOption(ResolutionOption option) {
     m_resolutionOption.store(option);
     saveSettings();
+    if (m_hasVideo && (m_state == PlayerState::OPENED || m_state == PlayerState::PAUSED)) {
+        seek(getCurrentTime());
+    }
 }
 
 int PlayerController::getPlaybackWidth() const {

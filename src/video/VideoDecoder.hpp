@@ -89,6 +89,8 @@ private:
     int m_allocatedWidth;
     int m_allocatedHeight;
     AVPixelFormat m_allocatedFormat;
+    int m_allocatedTargetWidth;
+    int m_allocatedTargetHeight;
 
     std::atomic<double> m_currentFramePts;
     std::atomic<bool> m_flushRequested;
