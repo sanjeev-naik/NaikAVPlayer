@@ -423,6 +423,7 @@ void PlayerController::stop() {
     m_videoQueue.abort();
     m_audioQueue.abort();
     m_subtitleQueue.abort();
+    m_dummyVideoQueue.abort();
 
     m_videoThreadRunning = false;
     if (m_videoThread.joinable()) {
@@ -446,6 +447,7 @@ void PlayerController::stop() {
     // Drop any packets remaining in queues
     m_videoQueue.clear([](AVPacket*& pkt) { av_packet_free(&pkt); });
     m_audioQueue.clear([](AVPacket*& pkt) { av_packet_free(&pkt); });
+    m_dummyVideoQueue.clear([](AVPacket*& pkt) { av_packet_free(&pkt); });
 
     // Reclaim memory
     m_demuxer.reset();
