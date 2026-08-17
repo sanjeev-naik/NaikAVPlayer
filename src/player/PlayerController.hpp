@@ -67,6 +67,7 @@ private:
     // Audio track state
     std::atomic<int> m_selectedAudioTrack{-1}; // -1 = Disabled/Off, >= 0 = embedded stream index, -2 = external
     mutable std::mutex m_audioTrackMutex;
+    mutable std::mutex m_audioDecoderMutex;
     std::vector<naikav::audio::AudioTrackInfo> m_cachedAudioTracks;
     naikav::audio::AudioTrackInfo m_externalAudioTrack;
     bool m_hasExternalAudio = false;
@@ -281,28 +282,34 @@ public:
     // not on every intermediate value change.
     void persistAudioDspSettings() { saveSettings(); }
     double getMeasuredIntegratedLufs() const {
+        std::lock_guard<std::mutex> lock(m_audioDecoderMutex);
         return (m_hasAudio && m_audioDecoder) ? m_audioDecoder->getMeasuredIntegratedLufs() : -120.0;
     }
     float getCurrentLoudnessGainDb() const {
+        std::lock_guard<std::mutex> lock(m_audioDecoderMutex);
         return (m_hasAudio && m_audioDecoder) ? m_audioDecoder->getCurrentLoudnessGainDb() : 0.0f;
     }
     // Live magnitude-spectrum snapshot for the Audio Processing panel's
     // visualizer (dB per bin, empty if there's no audio decoder yet).
     // See AudioDecoder::getSpectrumMagnitudesDb().
     std::vector<float> getSpectrumMagnitudesDb() const {
+        std::lock_guard<std::mutex> lock(m_audioDecoderMutex);
         return (m_hasAudio && m_audioDecoder) ? m_audioDecoder->getSpectrumMagnitudesDb() : std::vector<float>{};
     }
     std::vector<float> getWaveformSamples() const {
+        std::lock_guard<std::mutex> lock(m_audioDecoderMutex);
         return (m_hasAudio && m_audioDecoder) ? m_audioDecoder->getWaveformSamples() : std::vector<float>{};
     }
     static int getSpectrumNumBins() { return AudioDecoder::getSpectrumNumBins(); }
     double getSpectrumBinFrequencyHz(int bin) const {
+        std::lock_guard<std::mutex> lock(m_audioDecoderMutex);
         return (m_hasAudio && m_audioDecoder) ? m_audioDecoder->getSpectrumBinFrequencyHz(bin) : 0.0;
     }
     // Resolved output channel count (e.g. 2 for stereo, 6 for 5.1). 0 if
     // there's no audio stream. See getAudioChannelLayoutName() for the
     // human-readable name (e.g. "5.1(side)").
     int getAudioChannelCount() const {
+        std::lock_guard<std::mutex> lock(m_audioDecoderMutex);
         return (m_hasAudio && m_audioDecoder) ? m_audioDecoder->getOutputChannelCount() : 0;
     }
     // The real default playback device's native channel count as reported
@@ -311,6 +318,7 @@ public:
     // sends -- the resolved output layout does not guarantee that many
     // physical speakers are actually reproducing discrete channels.
     int getAudioDeviceNativeChannels() const {
+        std::lock_guard<std::mutex> lock(m_audioDecoderMutex);
         return (m_hasAudio && m_audioDecoder) ? m_audioDecoder->getDeviceNativeChannels() : 0;
     }
 
@@ -319,6 +327,7 @@ public:
     // AudioDecoder::isVirtualSurroundActive()), rather than either
     // preserving it untouched or downmixing it flat.
     bool isAudioVirtualSurroundActive() const {
+        std::lock_guard<std::mutex> lock(m_audioDecoderMutex);
         return (m_hasAudio && m_audioDecoder) ? m_audioDecoder->isVirtualSurroundActive() : false;
     }
 
@@ -405,17 +414,23 @@ public:
     // Audio underrun diagnostics -- see
     // AudioDecoder::getSilenceInjectionCount(). Zero when there's no audio.
     uint64_t getAudioCallbackCount() const {
+        std::lock_guard<std::mutex> lock(m_audioDecoderMutex);
         return (m_hasAudio && m_audioDecoder) ? m_audioDecoder->getCallbackCount() : 0;
     }
     uint64_t getAudioSilenceInjectionCount() const {
+        std::lock_guard<std::mutex> lock(m_audioDecoderMutex);
         return (m_hasAudio && m_audioDecoder) ? m_audioDecoder->getSilenceInjectionCount() : 0;
     }
     uint64_t getAudioSilenceBytes() const {
+        std::lock_guard<std::mutex> lock(m_audioDecoderMutex);
         return (m_hasAudio && m_audioDecoder) ? m_audioDecoder->getSilenceBytes() : 0;
     }
     // Diagnostics only -- lets a smoke test attribute underruns to a
     // specific decodeAndResample() exit path. Not for playback control.
-    AudioDecoder* audioDecoderForDiagnostics() const { return m_audioDecoder.get(); }
+    AudioDecoder* audioDecoderForDiagnostics() const {
+        std::lock_guard<std::mutex> lock(m_audioDecoderMutex);
+        return m_audioDecoder.get();
+    }
     static size_t getAudioFrameQueueCapacity() { return 48000; } // target scale for visual (48k samples ~ 1 sec)
 
     // Timing setters/getters
