@@ -2240,64 +2240,6 @@ void PlayerUI::drawAudioSettingsPanel(int windowWidth, int windowHeight) {
   }
 
   ImGui::Spacing();
-  ImGui::TextColored(sectionColor, "Playback & Audio Speed");
-  ImGui::Separator();
-  {
-    float currentPlaybackSpeed = m_controller.getPlaybackSpeed();
-    float speedVal = currentPlaybackSpeed;
-    ImGui::PushItemWidth(240.0f);
-    if (ImGui::SliderFloat("##audio_speed_slider", &speedVal, 0.25f, 2.0f, "Speed: %.2fx")) {
-      m_controller.setPlaybackSpeed(std::round(speedVal * 100.0f) / 100.0f);
-    }
-    ImGui::PopItemWidth();
-    ImGui::SameLine();
-    char speedRatioBuf[32];
-    std::snprintf(speedRatioBuf, sizeof(speedRatioBuf), "(%.0f%%)", currentPlaybackSpeed * 100.0f);
-    ImGui::TextColored(ImVec4(0.00f, 0.83f, 0.88f, 1.00f), "%s", speedRatioBuf);
-
-    // Preset Speed Buttons
-    const float kAudioSpeeds[] = {0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 1.75f, 2.0f};
-    const float kAudioSpeedBtnWidth = 42.0f;
-    for (size_t i = 0; i < sizeof(kAudioSpeeds)/sizeof(kAudioSpeeds[0]); ++i) {
-      float sp = kAudioSpeeds[i];
-      char spBuf[16];
-      if (std::fabs(sp - 1.0f) < 0.01f) {
-        std::snprintf(spBuf, sizeof(spBuf), "1.0x");
-      } else {
-        std::snprintf(spBuf, sizeof(spBuf), "%.2fx", sp);
-      }
-      bool isCur = (std::fabs(currentPlaybackSpeed - sp) < 0.01f);
-      if (isCur) {
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.53f, 0.90f, 0.85f));
-      }
-      if (ImGui::Button(spBuf, ImVec2(kAudioSpeedBtnWidth, 24))) {
-        m_controller.setPlaybackSpeed(sp);
-      }
-      if (isCur) {
-        ImGui::PopStyleColor();
-      }
-      if (i + 1 < sizeof(kAudioSpeeds)/sizeof(kAudioSpeeds[0])) {
-        ImGui::SameLine(0.0f, 4.0f);
-      }
-    }
-
-    // Fine adjustment row
-    if (ImGui::SmallButton("-0.05x##audiospeed")) {
-      m_controller.setPlaybackSpeed(std::round((currentPlaybackSpeed - 0.05f) * 100.0f) / 100.0f);
-    }
-    ImGui::SameLine();
-    if (ImGui::SmallButton("Reset 1.0x##audiospeed")) {
-      m_controller.setPlaybackSpeed(1.0f);
-    }
-    ImGui::SameLine();
-    if (ImGui::SmallButton("+0.05x##audiospeed")) {
-      m_controller.setPlaybackSpeed(std::round((currentPlaybackSpeed + 0.05f) * 100.0f) / 100.0f);
-    }
-    ImGui::SameLine();
-    ImGui::TextDisabled("[Hotkeys: [ / ] or Backspace]");
-  }
-
-  ImGui::Spacing();
   ImGui::TextColored(sectionColor, "Presets");
 
   ImGui::Separator();

@@ -4058,7 +4058,7 @@ int main(int argc, char* argv[]) {
                         // Validate audio codec params & timebase getters
                         int firstAudioStream = d.getAudioStreamIndex();
                         test_assert(firstAudioStream >= 0, "Demuxer has valid audio stream index");
-                        AVCodecParameters* cp = d.getAudioCodecParams(firstAudioStream);
+                        const AVCodecParameters* cp = d.getAudioCodecParams(firstAudioStream);
                         test_assert(cp != nullptr, "getAudioCodecParams(idx) returns valid params");
                         test_assert(cp->codec_type == AVMEDIA_TYPE_AUDIO, "Codec type is audio");
 

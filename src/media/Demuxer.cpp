@@ -185,15 +185,12 @@ bool Demuxer::open() {
 
     // Select default audio stream if audio tracks were found
     if (!m_audioTracks.empty()) {
-        int defaultIdx = m_audioTracks[0].id;
-        for (const auto& track : m_audioTracks) {
-            if (track.isDefault) {
-                defaultIdx = track.id;
-                break;
-            }
-        }
+        auto it = std::find_if(m_audioTracks.begin(), m_audioTracks.end(),
+                               [](const auto& track) { return track.isDefault; });
+        int defaultIdx = (it != m_audioTracks.end()) ? it->id : m_audioTracks[0].id;
         selectAudioStream(defaultIdx);
     }
+
 
     if (m_videoStreamIdx < 0 && m_audioStreamIdx < 0) {
         std::cerr << "Error: Could not find any video or audio streams" << std::endl;

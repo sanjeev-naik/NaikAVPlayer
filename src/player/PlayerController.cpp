@@ -1574,14 +1574,11 @@ void PlayerController::removeExternalAudio() {
         m_externalAudioTrack = naikav::audio::AudioTrackInfo{};
 
         if (!m_cachedAudioTracks.empty()) {
-            fallbackTrackId = m_cachedAudioTracks[0].id;
-            for (const auto& t : m_cachedAudioTracks) {
-                if (t.isDefault) {
-                    fallbackTrackId = t.id;
-                    break;
-                }
-            }
+            auto it = std::find_if(m_cachedAudioTracks.begin(), m_cachedAudioTracks.end(),
+                                   [](const auto& t) { return t.isDefault; });
+            fallbackTrackId = (it != m_cachedAudioTracks.end()) ? it->id : m_cachedAudioTracks[0].id;
         }
+
     }
 
     selectAudioTrack(fallbackTrackId);
