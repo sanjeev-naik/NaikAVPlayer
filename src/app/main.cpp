@@ -171,6 +171,30 @@ std::string openNativeSubtitleDialog(SDL_Window *window) {
   return "";
 }
 
+std::string openNativeAudioDialog(SDL_Window *window) {
+  NFD::UniquePathU8 outPath;
+  nfdfilteritem_t filterItem[1] = {
+      {"Audio Files", "m4a,aac,ac3,mp3,wav,flac,ogg,opus,wma,mka"}};
+
+  nfdopendialogu8args_t args = {};
+  args.filterList = filterItem;
+  args.filterCount = 1;
+  setNfdParentWindow(args.parentWindow, window);
+
+  nfdu8char_t *rawPath = nullptr;
+  nfdresult_t result = NFD_OpenDialogU8_With(&rawPath, &args);
+  if (result == NFD_OKAY) {
+    outPath.reset(rawPath);
+    return std::string(outPath.get());
+  }
+  if (result == NFD_ERROR) {
+    std::cerr << "Error: NFD_OpenDialogU8_With failed: " << NFD_GetError()
+              << std::endl;
+  }
+  return "";
+}
+
+
 static SDL_Colorspace getSDLColorspace(const AVFrame *frame) {
   if (!frame)
     return SDL_COLORSPACE_UNKNOWN;
@@ -324,6 +348,8 @@ int main(int argc, char *argv[]) {
       [window]() { return openNativeFileDialog(window); });
   playerUI.setSubtitleDialogCallback(
       [window]() { return openNativeSubtitleDialog(window); });
+  playerUI.setAudioDialogCallback(
+      [window]() { return openNativeAudioDialog(window); });
 
   // Enable drag and drop events
   SDL_SetEventEnabled(SDL_EVENT_DROP_FILE, true);
@@ -496,26 +522,27 @@ int main(int argc, char *argv[]) {
           }
           break;
         case SDLK_L:
-          controller.setLoopEnabled(!controller.isLoopEnabled());
+          playerUI.toggleLoop();
           break;
-        case SDLK_LEFTBRACKET: {
-          float current = controller.getPlaybackSpeed();
-          controller.setPlaybackSpeed(std::round((current - 0.25f) * 100.0f) / 100.0f);
+
+        case SDLK_LEFTBRACKET:
+          playerUI.adjustPlaybackSpeed(-0.25f);
           break;
-        }
-        case SDLK_RIGHTBRACKET: {
-          float current = controller.getPlaybackSpeed();
-          controller.setPlaybackSpeed(std::round((current + 0.25f) * 100.0f) / 100.0f);
+        case SDLK_RIGHTBRACKET:
+          playerUI.adjustPlaybackSpeed(+0.25f);
           break;
-        }
         case SDLK_BACKSPACE:
-          controller.setPlaybackSpeed(1.0f);
+          playerUI.resetPlaybackSpeed();
           break;
+
         case SDLK_D:
           playerUI.toggleDiagnostics();
           break;
         case SDLK_A:
           playerUI.toggleAudioSettings();
+          break;
+        case SDLK_B:
+          playerUI.cycleAudioTrack();
           break;
         case SDLK_V:
           playerUI.cycleSubtitleTrack();

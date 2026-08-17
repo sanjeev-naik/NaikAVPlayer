@@ -1,4 +1,21 @@
 # LeakSanitizer suppressions for external libraries
-# Suppress all leaks originating from the SDL2 library (including TLS error buffers and driver structures)
+# Suppress all leaks originating from SDL3 and external third-party shared libraries
 leak:SDL_
 leak:libSDL3
+leak:libavcodec
+leak:libavformat
+leak:libavutil
+leak:libswresample
+leak:libswscale
+leak:libpulse
+leak:libpulsecommon
+leak:libasound
+leak:libpipewire
+leak:libfontconfig
+leak:libfreetype
+leak:libgtk
+leak:libgobject
+leak:libglib
+leak:swr_alloc
+leak:avcodec_open2
+leak:avformat_open_input

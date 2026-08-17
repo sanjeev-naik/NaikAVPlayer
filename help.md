@@ -254,11 +254,28 @@ The user interface uses Dear ImGui with frosted translucency overlay.
 
 ### Media Selection
 - **Drag-and-Drop**: Drag any video or audio file onto the application window to open and play immediately.
-- **Native File Dialog**: Click "Open Media File" or the folder icon to launch the platform-native file selector (automatically pauses background playback during file selection).
+- **Native File Dialog**: Click "Open Media File" or the folder icon in the controls dock to launch the platform-native file selector (automatically pauses background playback during file selection).
+
+### Audio Track Selection & External Audio
+- **Controls Dock Audio Button (`[Audio]`)**: Click the headphone icon button in the controls dock bar to open the audio tracks popup menu.
+  - **Embedded Audio Streams**: Lists all audio streams present in the container with language tags, titles, codecs (e.g. AAC, Opus, FLAC, AC3, DTS, TrueHD), channel layouts (Stereo, 5.1, 7.1), and sample rates.
+  - **External Audio Tracks**: Select and play loaded external audio tracks with auto-synced A/V clock pacing.
+  - **Load External Audio File**: Native file picker to load standalone audio files (`.m4a`, `.aac`, `.ac3`, `.mp3`, `.wav`, `.flac`, `.ogg`, `.opus`, `.wma`, `.mka`).
+  - **Remove External Audio**: Unloads external audio and automatically restores the default embedded track.
+  - **Disable Audio (Mute Stream)**: Turns off audio decoding and routes silent frames.
+- **Hotkey `B`**: Press `B` to cycle sequentially through available audio streams (Off -> Embedded -> External -> Off) with on-screen Toast feedback.
 
 ### Playback Speed Control
-- **Controls Bar Selector**: Click the playback speed button (e.g. `1x`, `1.5x`) next to the loop toggle to open a quick-selection popup menu with presets (`0.25x`, `0.5x`, `0.75x`, `1.0x`, `1.25x`, `1.5x`, `1.75x`, `2.0x`).
-- **Real-Time Resampling**: Uses SDL3 dynamic audio stream frequency resampling to maintain smooth, synchronized audio and video playback without audio glitches or drift.
+- **Controls Dock Speed Button (`[Speed]`)**: Click the dedicated Speedometer icon button next to Resolution in the dock bar to open the speed popup:
+  - Continuous slider (`0.25x` to `2.0x`).
+  - One-click preset buttons (`0.25x`, `0.5x`, `0.75x`, `1.0x (Normal)`, `1.25x`, `1.5x`, `1.75x`, `2.0x`) with active checkmarks.
+  - Fine-tuning step buttons (`-0.1x`, `Reset 1.0x`, `+0.1x`).
+- **Hotkeys**: Press `[` to decrease speed by 0.25x, `]` to increase speed by 0.25x, and `Backspace` to reset to normal (1.0x).
+- **Real-Time Resampling**: Uses SDL3 dynamic audio stream frequency resampling (`SDL_SetAudioStreamFrequencyRatio`) synchronized with master audio/video clock pacing for pitch-preserving speed changes.
+
+### Loop Playback Mode
+- **Controls Dock Loop Button (`[Loop]`)**: Click the loop icon button in the transport group (`[<<] [Play/Pause] [Stop] [>>] [Loop]`) to toggle continuous playback. The button lights up with a cyan accent glow when active.
+- **Hotkey `L`**: Press `L` to toggle continuous loop mode on/off with on-screen Toast feedback.
 
 ### Keyboard Shortcuts & Gestures
 
@@ -271,16 +288,16 @@ The user interface uses Dear ImGui with frosted translucency overlay.
 | **`Up Arrow`** / **`Down Arrow`** | Increase / Decrease Volume (±5%) |
 | **`Mouse Wheel`** (over video) | Adjust Volume Up / Down |
 | **`S`** | Capture Screenshot / Export Video Frame as PNG |
+| **`B`** | Cycle Audio Tracks (Off -> Embedded -> External -> Off) |
 | **`V`** | Cycle Subtitle Tracks (Off -> Embedded -> External -> Off) |
 | **`G`** / **`H`** | Adjust Subtitle Synchronization Delay (-50ms / +50ms) |
 | **`Left Arrow`** / **`Right Arrow`** | Seek backward / forward by 10 seconds |
 | **`[`** / **`]`** | Decrease / Increase playback speed by 0.25x (0.25x – 2.0x) |
 | **`Backspace`** | Reset playback speed to normal (1.0x) |
-| **`L`** | Toggle Loop Mode |
+| **`L`** | Toggle Continuous Loop Mode |
 | **`D`** | Toggle Diagnostics HUD overlay |
 | **`A`** | Toggle Audio Processing panel (EQ, noise gate, compressor, multiband compressor, limiter, crossover, loudness, 3D surround, widener, balance, channel/device/format selection) |
 | **`Escape`** | Exit Fullscreen (if in fullscreen) or Exit application |
-
 
 ---
 
@@ -291,15 +308,16 @@ Sources are grouped by subsystem under `src/`. Headers are included by that subs
 ```text
 src/
 ├── app/       main.cpp — entry point, SDL window/event loop, render loop, CLI flags
-├── audio/     AudioDecoder.{hpp,cpp} — decode, resample, SDL callback, output selectors
+├── audio/     AudioDecoder.{hpp,cpp}, AudioTrack.hpp — decode, resample, SDL callback, track models, output selectors
 │   └── dsp/   header-only DSP module (see Section 5b)
 ├── core/      ThreadSafeQueue.hpp, MetricRing.hpp, PipelineMetrics.hpp
-├── media/     Demuxer.{hpp,cpp} — packet reading and routing
-├── player/    PlayerController.{hpp,cpp} — state machine, seeking, settings persistence
+├── media/     Demuxer.{hpp,cpp} — packet reading, multi-stream track enumeration and routing
+├── player/    PlayerController.{hpp,cpp} — state machine, track switching, seeking, settings persistence
 ├── subtitle/  SubtitleDecoder.{hpp,cpp}, SubtitleTrack.hpp — decoding, parsing, sync, sanitization
 ├── ui/        PlayerUI.{hpp,cpp} — ImGui controls dock, diagnostics HUD, audio panel, subtitle overlay
 └── video/     VideoDecoder.{hpp,cpp} — HW/SW decode, frame conversion
 ```
+
 
 `src/audio/dsp/` is entirely header-only: `AudioDspSettings.hpp` (settings struct, the 9 presets, and genre mapping), `Biquad.hpp`, `ParametricEQ.hpp`, `NoiseGate.hpp`, `Compressor.hpp`, `MultibandCompressor.hpp`, `Limiter.hpp`, `Crossover.hpp`, `DspChain.hpp`, `LoudnessMeter.hpp`, `LoudnessNormalizer.hpp`, `LoudnessPrescan.hpp`, `ReplayGainTags.hpp`, `SpatialDownmixer.hpp`, `Surround3D.hpp`, `StereoWidener.hpp`, `BalanceControl.hpp`, `SpectrumAnalyzer.hpp`, `DspMath.hpp`.
 
@@ -392,7 +410,27 @@ NaikAVPlayer provides end-to-end subtitle handling supporting both embedded cont
 
 ---
 
+## 5e. Multiple Audio Track Switching & External Audio Architecture
+
+NaikAVPlayer provides full multi-track audio stream discovery, selection, and external audio demuxing:
+
+- **Multi-Stream Audio Discovery**: `Demuxer::open()` traverses all streams in the media container, identifying every stream with `AVMEDIA_TYPE_AUDIO`. It populates `m_audioTracks` with detailed stream metadata, including FFmpeg stream index, ISO 639-1/2 language tags (e.g., `eng`, `jpn`, `hin`, `und`), track titles (e.g., `Main Audio`, `Commentary`, `Surround 5.1`), codec descriptors (AAC, Opus, FLAC, AC3, DTS, TrueHD, Vorbis), channel layouts (Mono, Stereo, 5.1, 7.1), and sample rates.
+- **Dynamic Audio Stream Switching**: When a new audio track is selected via `PlayerController::selectAudioTrack(int trackId)` or the `B` hotkey:
+  1. The controller switches the active stream in `Demuxer` via `selectAudioStream(streamIdx)`.
+  2. The demuxer flushes the audio packet queue (`m_audioQueue.clear()`) and increments `m_seekGeneration` to drop stale packets from the previous stream.
+  3. The `AudioDecoder` re-initializes its `AVCodecContext` with the new stream's codec parameters without stopping video playback or dropping video frames.
+  4. The audio master clock resumes sample-accurate pacing from the current video presentation timestamp.
+- **External Audio File Demuxing & Synchronization**:
+  - Standalone audio files (`.m4a`, `.aac`, `.ac3`, `.mp3`, `.wav`, `.flac`, `.ogg`, `.opus`, `.wma`, `.mka`) can be loaded concurrently with video.
+  - A dedicated background `m_externalAudioDemuxer` thread is spawned to demux packets from the external audio container into `m_audioQueue`.
+  - On seek operations, `PlayerController::seek()` seeks both the primary video demuxer and the external audio demuxer in parallel, synchronizing PTS timebases accurately.
+  - Users can switch back and forth between external audio and embedded tracks at any time without losing the loaded external file reference.
+- **Stream Muting & Silence Injections**: When audio is disabled (`trackId == -1`), `AudioDecoder` generates silent PCM frames at the configured device format, keeping the master clock progression stable.
+
+---
+
 ## 6. Security, Maintenance & Dependency Management
+
 
 - **Upstream Dependencies**: Build dependencies are pinned in `CMakeLists.txt` by commit SHA, with the semantic version in a trailing comment — `SDL3` `release-3.4.0`, `imgui` `v1.91.9`, `nativefiledialog-extended` `v1.2.1` (all via `FetchContent`), and FFmpeg `n8.1.2` (prebuilt archive, verified by SHA-256).
 - **Updating Dependencies**: Update the `GIT_TAG` commit SHAs or the FFmpeg archive filename/SHA-256 hashes inside `CMakeLists.txt`, keeping the trailing version comments in sync.

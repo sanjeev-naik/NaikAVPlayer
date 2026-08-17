@@ -14,7 +14,8 @@ VideoDecoder::VideoDecoder(AVCodecParameters *codecParams, AVRational timeBase,
       m_queue(queue), m_timeBase(timeBase), m_startTime(startTime),
       m_decodedFrame(nullptr), m_yuvFrame(nullptr), m_yuvBuffer(nullptr),
       m_yuvBufferSize(0), m_allocatedWidth(0), m_allocatedHeight(0),
-      m_allocatedFormat(AV_PIX_FMT_NONE), m_currentFramePts(0.0),
+      m_allocatedFormat(AV_PIX_FMT_NONE), m_allocatedTargetWidth(0),
+      m_allocatedTargetHeight(0), m_currentFramePts(0.0),
       m_flushRequested(false), m_startTimeSaved(false), m_seeking(false),
       m_consecutiveEagainCount(0), m_hardwareRecoveryAttempts(0),
       m_decodeTimeRing(decodeTimeRing),
@@ -231,6 +232,8 @@ bool VideoDecoder::init() {
   m_allocatedWidth = m_codecCtx->width;
   m_allocatedHeight = m_codecCtx->height;
   m_allocatedFormat = m_codecCtx->pix_fmt;
+  m_allocatedTargetWidth = m_codecCtx->width;
+  m_allocatedTargetHeight = m_codecCtx->height;
 
   std::cout << "Video initialized successfully. Resolution: "
             << m_codecCtx->width << "x" << m_codecCtx->height << std::endl;
@@ -477,6 +480,8 @@ bool VideoDecoder::convertFrame(ResolutionOption option) {
     m_allocatedWidth = srcFrame->width;
     m_allocatedHeight = srcFrame->height;
     m_allocatedFormat = static_cast<AVPixelFormat>(srcFrame->format);
+    m_allocatedTargetWidth = targetW;
+    m_allocatedTargetHeight = targetH;
 
     av_frame_unref(m_yuvFrame);
 
@@ -513,6 +518,8 @@ bool VideoDecoder::convertFrame(ResolutionOption option) {
   if (srcFrame->width != m_allocatedWidth ||
       srcFrame->height != m_allocatedHeight ||
       srcFrame->format != m_allocatedFormat ||
+      targetW != m_allocatedTargetWidth ||
+      targetH != m_allocatedTargetHeight ||
       !m_swsCtx) {
 
     SwsContext *newSwsCtx =
@@ -535,6 +542,8 @@ bool VideoDecoder::convertFrame(ResolutionOption option) {
     m_allocatedWidth = srcFrame->width;
     m_allocatedHeight = srcFrame->height;
     m_allocatedFormat = static_cast<AVPixelFormat>(srcFrame->format);
+    m_allocatedTargetWidth = targetW;
+    m_allocatedTargetHeight = targetH;
   }
 
   m_yuvBufferSize = av_image_get_buffer_size(AV_PIX_FMT_YUV420P, targetW, targetH, 1);

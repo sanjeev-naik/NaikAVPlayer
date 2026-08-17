@@ -18,6 +18,7 @@ NaikAVPlayer is a native, multi-threaded C++17 media engine and video player bui
 - **Stall-Proof Pipeline Backpressure:** Producer threads never block indefinitely on a full queue — bounded-wait pushes fall back to dropping the oldest queued item once a timeout elapses, so a paused audio device, a stalled render loop, or a wedged decoder can never freeze the single demuxer thread that feeds both the video and audio queues.
 - **Dynamic Hardware Decoder Fallback:** Tries platform-specific hardware decoders (D3D11VA, DXVA2, QSV, CUVID on Windows; V4L2M2M, VAAPI, QSV, CUVID on Linux), falling back dynamically to software H.264 decoding if hardware context allocation fails or encounters runtime surface mapping errors.
 - **Sub-10ms Audio-Video Synchronization:** Reconstructs the audio clock sample-accurately from PCM sample offsets to maintain A/V drift under 10ms.
+- **Multiple Audio Track Switching & External Audio Support:** Full multi-stream container discovery for MP4/MKV files containing multiple embedded audio tracks (e.g. multi-language English/Japanese/Hindi, Director's commentary, stereo vs 5.1/7.1 surround). Supports seamless runtime audio track switching via the dedicated `[Audio]` headphone button or `B` hotkey without stalling video playback. Includes loading external standalone audio files (`.m4a`, `.aac`, `.ac3`, `.mp3`, `.wav`, `.flac`, `.ogg`, `.opus`, `.wma`, `.mka`) with automatic demuxer clock synchronization, switching back and forth between external and embedded tracks, and stream muting/disabling.
 - **Complete Subtitle Support (Internal & External):** Detects, decodes, and renders both embedded container subtitles (SRT, ASS, SSA, WebVTT, MOV Text) and external subtitle files (`.srt`, `.vtt`, `.ass`, `.ssa`, `.sub`). Features auto-detection of matching subtitle files adjacent to media, interactive track selection menu (`[CC]` button in controls dock), on-the-fly subtitle cycling (`V`), millisecond-accurate sync timing delay offset adjustments (`G` / `H`), and clean on-screen rendering with dark backdrop contrast overlays.
 - **Multichannel Audio Preservation:** Reads the source stream's real channel layout and drives 2.1/5.1/5.1(back)/7.1 straight through to a matching SDL3 multichannel device instead of always downmixing to stereo, with a device-native-channel check that flags when the OS is silently downmixing anyway, and a manual Auto / Force Stereo / Virtual Surround override.
 - **Virtual Surround & 3D Spatial Audio:** `VIRTUAL_SURROUND` folds a discrete 2.1/5.1/5.1(back)/7.1 source down to stereo with positional delay/filter cues (`SpatialDownmixer`) instead of a flat downmix, so surround content stays spatial on headphones/stereo speakers; a separate "3D Surround" ambience synthesizer (`Surround3D`) adds a similar spatial feel to any plain stereo source, and a mid-side Stereo Widener adjusts the perceived image width independently of either.
@@ -31,10 +32,10 @@ NaikAVPlayer is a native, multi-threaded C++17 media engine and video player bui
 - **Selectable Output Format & Device:** 16-bit integer (default), 32-bit integer, or 32-bit float device output (the internal pipeline is always float — 32-bit float skips dithering/truncation entirely), and a playback device picker (`AudioDecoder::enumeratePlaybackDeviceNames()`) instead of always using the OS default device.
 - **DSP Presets & Persistent Settings:** One-click Flat / Music / Cinema / Night / Podcast / Gaming / Live / Bass Boost / Vocal Boost presets for the whole audio chain, all settings (resolution, DSP, loudness, output format/device, channel selection) surviving restarts via `player_settings.txt`.
 - **Dynamic Resolution Scaling:** Real-time playback scaling supporting dynamic output resolution selection (Original source, 360p, 480p, 720p, 1080p, 1440p, 4K) from the UI dropdown to optimize GPU upload bandwidth.
-- **Variable Playback Speed Control (0.25x - 2.0x):** Real-time, pitch-preserving playback rate adjustments using SDL3 dynamic audio stream frequency resampling (`SDL_SetAudioStreamFrequencyRatio`) synchronized with master audio/video clock pacing.
+- **Variable Playback Speed Control (0.25x - 2.0x):** Real-time, pitch-preserving playback rate adjustments using SDL3 dynamic audio stream frequency resampling (`SDL_SetAudioStreamFrequencyRatio`) synchronized with master audio/video clock pacing. Accessible via a dedicated Speedometer icon button in the controls dock, popup slider with preset buttons, fine-tuning buttons, and keyboard hotkeys (`[` / `]` / `Backspace`).
 - **Auto-Pause on File Selection:** Automatically pauses background audio and video playback whenever the native file explorer dialog is opened, preserving the exact playback position and keeping the audio silent while browsing.
 - **Software Volume Attenuation:** Scalable audio output level adjustments with memcpy/memset bypasses for 100% and 0% volume states.
-- **Loop Playback:** Wraparound seek to 0.0 upon reaching end-of-file for continuous playback.
+- **Loop Playback:** Wraparound seek to 0.0 upon reaching end-of-file for continuous playback, toggleable via the controls dock `[Loop]` icon button and `L` hotkey.
 - **Native File Picker:** Cross-platform native file picker integration using `nativefiledialog-extended` (NFD) on Win32 and GTK3/Portal backends.
 - **Pipeline Diagnostics & System Info HUD:** Real-time overlay (`--metrics` or `D` key) displaying active player states, media telemetry (native vs. playback resolution, pixel format, hardware vs. software decoder type), Color & HDR pipeline characteristics (Color Space, Primaries, TRC, Range, Chroma Subsampling, Bit Depth, HDR10/HDR10+/Dolby Vision/HLG standard), pipeline queue depth levels, decode/render frame pacing budgets, and rolling clock synchronization offsets.
 - **Audio Processing Panel:** Dedicated overlay (`A` key) for the full DSP chain (EQ, noise gate, compressor, multiband compressor, limiter, crossover, loudness, 3D surround, widener, balance), a live FFT spectrum visualizer, plus channel/output-device/bit-depth/resampler-quality selection, separate from the diagnostics HUD.
@@ -53,15 +54,16 @@ Sources are grouped by subsystem under `src/`, and headers are included by that 
 ```text
 src/
 ├── app/       main.cpp — entry point, SDL window/event loop, render loop, CLI flags
-├── audio/     AudioDecoder.{hpp,cpp} — decode, resample, SDL callback, output selectors
+├── audio/     AudioDecoder.{hpp,cpp}, AudioTrack.hpp — decode, resample, SDL callback, track models, output selectors
 │   └── dsp/   header-only DSP module (see Audio DSP & Loudness Pipeline below)
 ├── core/      ThreadSafeQueue.hpp, MetricRing.hpp, PipelineMetrics.hpp
-├── media/     Demuxer.{hpp,cpp} — packet reading and routing
-├── player/    PlayerController.{hpp,cpp} — state machine, seeking, settings persistence
+├── media/     Demuxer.{hpp,cpp} — packet reading, multi-stream track enumeration and routing
+├── player/    PlayerController.{hpp,cpp} — state machine, track switching, seeking, settings persistence
 ├── subtitle/  SubtitleDecoder.{hpp,cpp}, SubtitleTrack.hpp — decoding, parsing, sync, sanitization
 ├── ui/        PlayerUI.{hpp,cpp} — ImGui controls dock, diagnostics HUD, audio panel, subtitle overlay
 └── video/     VideoDecoder.{hpp,cpp} — HW/SW decode, frame conversion
 ```
+
 
 ### Thread Model
 
@@ -452,6 +454,7 @@ effect when launched by double-click, and ignored on Linux.
 | **`Up Arrow`** / **`Down Arrow`** | Increase / Decrease Volume (±5%) |
 | **`Mouse Wheel`** (over video) | Adjust Volume Up / Down |
 | **`S`** | Capture Screenshot / Export Video Frame as PNG |
+| **`B`** | Cycle Audio Tracks (Off -> Embedded -> External -> Off) |
 | **`V`** | Cycle Subtitle Tracks (Off -> Embedded -> External -> Off) |
 | **`G`** / **`H`** | Adjust Subtitle Synchronization Delay (-50ms / +50ms) |
 | **`Left Arrow`** / **`Right Arrow`** | Seek backward / forward by 10 seconds |
@@ -461,6 +464,7 @@ effect when launched by double-click, and ignored on Linux.
 | **`D`** | Toggle Diagnostics HUD & Telemetry Metrics |
 | **`A`** | Toggle Audio Processing Panel (EQ, Noise Gate, Compressor, Multiband, Limiter, Crossover, Loudness, Surround, Balance, Channel/Device/Format Selection) |
 | **`Escape`** | Exit Fullscreen (if in fullscreen) or Exit Application |
+
 
 
 ---

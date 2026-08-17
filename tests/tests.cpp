@@ -585,6 +585,65 @@ int real_main(int argc, char* argv[]) {
             bool convertRebindSuccess = testDecoder.convertFrame();
             test_assert(convertRebindSuccess, "convertFrame slow-path buffer re-binding succeeds");
 
+            // Test case 7: Resolution scaling options (4K, 1080p, 720p, 360p, Original)
+            {
+                testDecoder.m_decodedFrame->width = 1920;
+                testDecoder.m_decodedFrame->height = 1080;
+                testDecoder.m_decodedFrame->format = AV_PIX_FMT_YUV420P;
+                std::vector<uint8_t> hdBuffer(1920 * 1080 * 2, 128);
+                av_image_fill_arrays(
+                    testDecoder.m_decodedFrame->data,
+                    testDecoder.m_decodedFrame->linesize,
+                    hdBuffer.data(),
+                    AV_PIX_FMT_YUV420P,
+                    1920,
+                    1080,
+                    1
+                );
+
+                // Scale to 4K
+                bool to4K = testDecoder.convertFrame(ResolutionOption::R_4K);
+                test_assert(to4K, "convertFrame scales from 1080p to 4K");
+                test_assert(testDecoder.getYUVFrame()->width == 3840, "4K scaled frame width is 3840");
+                test_assert(testDecoder.getYUVFrame()->height == 2160, "4K scaled frame height is 2160");
+
+                // Re-feed 1080p frame and scale to 720p
+                testDecoder.m_decodedFrame->width = 1920;
+                testDecoder.m_decodedFrame->height = 1080;
+                testDecoder.m_decodedFrame->format = AV_PIX_FMT_YUV420P;
+                av_image_fill_arrays(
+                    testDecoder.m_decodedFrame->data,
+                    testDecoder.m_decodedFrame->linesize,
+                    hdBuffer.data(),
+                    AV_PIX_FMT_YUV420P,
+                    1920,
+                    1080,
+                    1
+                );
+                bool to720p = testDecoder.convertFrame(ResolutionOption::R_720P);
+                test_assert(to720p, "convertFrame scales from 1080p to 720p");
+                test_assert(testDecoder.getYUVFrame()->width == 1280, "720p scaled frame width is 1280");
+                test_assert(testDecoder.getYUVFrame()->height == 720, "720p scaled frame height is 720");
+
+                // Re-feed 1080p frame and scale to Original (fast-path native)
+                testDecoder.m_decodedFrame->width = 1920;
+                testDecoder.m_decodedFrame->height = 1080;
+                testDecoder.m_decodedFrame->format = AV_PIX_FMT_YUV420P;
+                av_image_fill_arrays(
+                    testDecoder.m_decodedFrame->data,
+                    testDecoder.m_decodedFrame->linesize,
+                    hdBuffer.data(),
+                    AV_PIX_FMT_YUV420P,
+                    1920,
+                    1080,
+                    1
+                );
+                bool toOrig = testDecoder.convertFrame(ResolutionOption::ORIGINAL);
+                test_assert(toOrig, "convertFrame restores Original native 1080p");
+                test_assert(testDecoder.getYUVFrame()->width == 1920, "Original frame width is 1920");
+                test_assert(testDecoder.getYUVFrame()->height == 1080, "Original frame height is 1080");
+            }
+
             avcodec_parameters_free(&testCodecParams);
         }
 
@@ -3929,9 +3988,160 @@ int main(int argc, char* argv[]) {
                     std::remove(srtPath.c_str());
                 }
 
-
-
                 std::cout << "Comprehensive Subtitle unit tests passed!" << std::endl;
+
+                // -------------------------------------------------------------
+                // 6. Audio Track Enumeration, Selection, and External Audio Tests
+                // -------------------------------------------------------------
+                {
+                    std::cout << "Running Audio Track & External Audio unit tests..." << std::endl;
+
+                    // A. AudioTrackInfo struct tests
+                    {
+                        naikav::audio::AudioTrackInfo info;
+                        test_assert(info.id == -1, "Default audio track id is -1");
+                        test_assert(!info.isDefault, "Default isDefault is false");
+                        test_assert(!info.isExternal, "Default isExternal is false");
+                    }
+
+                    // B. PlayerController Audio Track APIs with media file
+                    {
+                        PlayerController audioCtrl;
+                        test_assert(audioCtrl.getSelectedAudioTrack() == -1, "Initial audio track is -1");
+                        test_assert(audioCtrl.getAudioTracks().empty(), "Initial audio tracks list is empty");
+                        test_assert(!audioCtrl.hasExternalAudio(), "hasExternalAudio() is initially false");
+                        test_assert(audioCtrl.getActiveAudioTrackName() == "Off", "Active audio track is Off initially");
+
+                        bool opened = audioCtrl.openFile(testFile);
+                        test_assert(opened, "File opened for audio track tests");
+
+                        auto tracks = audioCtrl.getAudioTracks();
+                        test_assert(!tracks.empty(), "Discovered at least one audio track in test file");
+                        std::cout << "[AudioTrack Test] Found " << tracks.size() << " audio tracks in " << testFile << std::endl;
+                        for (size_t i = 0; i < tracks.size(); ++i) {
+                            std::cout << "  Track #" << i << ": id=" << tracks[i].id
+                                      << ", title=" << tracks[i].title
+                                      << ", lang=" << tracks[i].language
+                                      << ", codec=" << tracks[i].codecName
+                                      << ", ch=" << tracks[i].channels
+                                      << ", layout=" << tracks[i].channelLayout
+                                      << ", rate=" << tracks[i].sampleRate << "Hz"
+                                      << ", default=" << (tracks[i].isDefault ? "yes" : "no")
+                                      << std::endl;
+                            test_assert(tracks[i].id >= 0, "Embedded track id >= 0");
+                            test_assert(!tracks[i].codecName.empty(), "Track codecName is populated");
+                        }
+
+                        int currentTrack = audioCtrl.getSelectedAudioTrack();
+                        test_assert(currentTrack >= 0, "Selected audio track is >= 0");
+                        test_assert(audioCtrl.hasAudio(), "hasAudio() is true for audio file");
+                        std::string activeName = audioCtrl.getActiveAudioTrackName();
+                        test_assert(!activeName.empty() && activeName != "Off", "Active track name is populated");
+                        std::cout << "[AudioTrack Test] Active track: " << activeName << std::endl;
+
+                        // Test switching to same track (noop, should return true)
+                        bool switchSame = audioCtrl.selectAudioTrack(currentTrack);
+                        test_assert(switchSame, "selectAudioTrack() on current track returns true");
+
+                        // Test disabling audio track (-1)
+                        bool disableOk = audioCtrl.selectAudioTrack(-1);
+                        test_assert(disableOk, "selectAudioTrack(-1) succeeds");
+                        test_assert(audioCtrl.getSelectedAudioTrack() == -1, "getSelectedAudioTrack() is -1");
+                        test_assert(!audioCtrl.hasAudio(), "hasAudio() is false when disabled");
+                        test_assert(audioCtrl.getActiveAudioTrackName() == "Off", "getActiveAudioTrackName() is Off");
+
+                        // Test re-enabling audio track
+                        bool enableOk = audioCtrl.selectAudioTrack(tracks[0].id);
+                        test_assert(enableOk, "Re-enabling audio track succeeds");
+                        test_assert(audioCtrl.getSelectedAudioTrack() == tracks[0].id, "Selected track matches re-enabled id");
+                        test_assert(audioCtrl.hasAudio(), "hasAudio() is true again");
+
+                        // Test external audio loading using testFile as external audio source
+                        bool extOk = audioCtrl.loadExternalAudio(testFile);
+                        test_assert(extOk, "loadExternalAudio() succeeds");
+                        test_assert(audioCtrl.hasExternalAudio(), "hasExternalAudio() is true");
+                        test_assert(audioCtrl.getSelectedAudioTrack() == -2, "getSelectedAudioTrack() is -2 (external)");
+                        test_assert(audioCtrl.hasAudio(), "hasAudio() is true with external audio");
+                        std::string extName = audioCtrl.getActiveAudioTrackName();
+                        test_assert(!extName.empty() && extName != "Off", "External audio track name is valid");
+
+                        // Test track list includes external track
+                        auto tracksWithExt = audioCtrl.getAudioTracks();
+                        test_assert(tracksWithExt.size() == tracks.size() + 1, "Audio tracks count increased by 1 with external audio");
+                        test_assert(tracksWithExt.back().isExternal, "Last track in list is marked external");
+                        test_assert(tracksWithExt.back().id == -2, "External track has id == -2");
+
+                        // Test switching from external back to embedded track
+                        bool switchBack = audioCtrl.selectAudioTrack(tracks[0].id);
+                        test_assert(switchBack, "Switching back to embedded track succeeds");
+                        test_assert(audioCtrl.getSelectedAudioTrack() == tracks[0].id, "Selected track is embedded track");
+
+                        // Test switching back to external
+                        bool switchExt = audioCtrl.selectAudioTrack(-2);
+                        test_assert(switchExt, "Switching back to external track succeeds");
+                        test_assert(audioCtrl.getSelectedAudioTrack() == -2, "Selected track is external");
+
+                        // Test seeking with external audio
+                        audioCtrl.play();
+                        audioCtrl.seek(1.0);
+                        test_assert(audioCtrl.getState() == PlayerState::PLAYING, "Player continues playing after seek with external audio");
+
+                        // Test removeExternalAudio()
+                        audioCtrl.removeExternalAudio();
+                        test_assert(!audioCtrl.hasExternalAudio(), "hasExternalAudio() is false after removal");
+                        test_assert(audioCtrl.getSelectedAudioTrack() == tracks[0].id, "Reverted to embedded track after removal");
+
+                        // Test invalid external file loading
+                        bool badExt = audioCtrl.loadExternalAudio("non_existent_audio_file.xyz");
+                        test_assert(!badExt, "loadExternalAudio() fails on non-existent file");
+
+                        audioCtrl.stop();
+                        test_assert(audioCtrl.getSelectedAudioTrack() == -1, "stop() resets selected audio track to -1");
+                        test_assert(!audioCtrl.hasExternalAudio(), "stop() clears external audio");
+                    }
+
+                    // C. Demuxer direct stream selection tests
+                    {
+                        ThreadSafeQueue<AVPacket*> vq;
+                        ThreadSafeQueue<AVPacket*> aq;
+                        MetricRing<256> ring;
+                        std::atomic<bool> prof{false};
+
+                        Demuxer d(testFile, vq, aq, ring, prof);
+                        bool dOk = d.open();
+                        test_assert(dOk, "Demuxer opens test file");
+
+                        const auto& dTracks = d.getAudioTracks();
+                        test_assert(!dTracks.empty(), "Demuxer found audio tracks");
+
+                        // Validate audio codec params & timebase getters
+                        int firstAudioStream = d.getAudioStreamIndex();
+                        test_assert(firstAudioStream >= 0, "Demuxer has valid audio stream index");
+                        const AVCodecParameters* cp = d.getAudioCodecParams(firstAudioStream);
+                        test_assert(cp != nullptr, "getAudioCodecParams(idx) returns valid params");
+                        test_assert(cp->codec_type == AVMEDIA_TYPE_AUDIO, "Codec type is audio");
+
+                        AVRational tb = d.getAudioTimeBase(firstAudioStream);
+                        test_assert(tb.den > 0, "TimeBase has valid denominator");
+
+                        // Test selectAudioStream(-1) and invalid index
+                        bool selNeg = d.selectAudioStream(-1);
+                        test_assert(selNeg, "selectAudioStream(-1) succeeds");
+                        test_assert(d.getAudioStreamIndex() == -1, "getAudioStreamIndex() is -1");
+
+                        bool selInvalid = d.selectAudioStream(99999);
+                        test_assert(!selInvalid, "selectAudioStream(99999) fails gracefully");
+
+                        bool selRestore = d.selectAudioStream(firstAudioStream);
+                        test_assert(selRestore, "selectAudioStream(firstAudioStream) succeeds");
+                        test_assert(d.getAudioStreamIndex() == firstAudioStream, "Audio stream index restored");
+
+                        d.stop();
+                    }
+
+                    std::cout << "Audio Track & External Audio unit tests PASSED!" << std::endl;
+                }
+
             }
 
             std::cout << "ReplayGain tag / genre preset / output selector tests passed!" << std::endl;

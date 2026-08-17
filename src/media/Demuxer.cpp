@@ -85,6 +85,8 @@ bool Demuxer::open() {
     // Find video, audio and subtitle streams
     m_subtitleTracks.clear();
     m_subtitleStreamIdx = -1;
+    m_audioTracks.clear();
+    m_audioStreamIdx = -1;
 
     for (unsigned int i = 0; i < m_formatCtx->nb_streams; i++) {
         AVCodecParameters* codecParams = m_formatCtx->streams[i]->codecpar;
@@ -96,12 +98,56 @@ bool Demuxer::open() {
             m_videoTimeBase = m_formatCtx->streams[i]->time_base;
             m_videoStartTime = m_formatCtx->streams[i]->start_time;
             if (m_videoStartTime == AV_NOPTS_VALUE) m_videoStartTime = 0;
-        } else if (codecParams->codec_type == AVMEDIA_TYPE_AUDIO && m_audioStreamIdx < 0) {
-            m_audioStreamIdx = i;
-            m_audioCodecParams = codecParams;
-            m_audioTimeBase = m_formatCtx->streams[i]->time_base;
-            m_audioStartTime = m_formatCtx->streams[i]->start_time;
-            if (m_audioStartTime == AV_NOPTS_VALUE) m_audioStartTime = 0;
+        } else if (codecParams->codec_type == AVMEDIA_TYPE_AUDIO) {
+            naikav::audio::AudioTrackInfo info;
+            info.id = static_cast<int>(i);
+
+            // Extract title / handler name / description
+            const char* titleTag = nullptr;
+            if (const AVDictionaryEntry* e = av_dict_get(m_formatCtx->streams[i]->metadata, "title", nullptr, 0)) {
+                titleTag = e->value;
+            } else if (const AVDictionaryEntry* e2 = av_dict_get(m_formatCtx->streams[i]->metadata, "handler_name", nullptr, 0)) {
+                titleTag = e2->value;
+            } else if (const AVDictionaryEntry* e3 = av_dict_get(m_formatCtx->streams[i]->metadata, "description", nullptr, 0)) {
+                titleTag = e3->value;
+            }
+            if (titleTag && std::strlen(titleTag) > 0) {
+                info.title = titleTag;
+            } else {
+                info.title = "Audio Track " + std::to_string(m_audioTracks.size() + 1);
+            }
+
+            // Extract language
+            const char* langTag = nullptr;
+            if (const AVDictionaryEntry* e = av_dict_get(m_formatCtx->streams[i]->metadata, "language", nullptr, 0)) {
+                langTag = e->value;
+            } else if (const AVDictionaryEntry* e2 = av_dict_get(m_formatCtx->streams[i]->metadata, "lang", nullptr, 0)) {
+                langTag = e2->value;
+            }
+            info.language = (langTag && std::strlen(langTag) > 0) ? langTag : "und";
+
+            // Codec name
+            const char* cname = avcodec_get_name(codecParams->codec_id);
+            info.codecName = (cname && std::strlen(cname) > 0) ? cname : "unknown";
+
+            // Channels & layout
+#if LIBAVUTIL_VERSION_MAJOR >= 57
+            info.channels = codecParams->ch_layout.nb_channels;
+            char layoutBuf[64] = {0};
+            av_channel_layout_describe(&codecParams->ch_layout, layoutBuf, sizeof(layoutBuf));
+            info.channelLayout = (layoutBuf[0] != '\0') ? layoutBuf : (info.channels == 2 ? "stereo" : (info.channels == 1 ? "mono" : std::to_string(info.channels) + " ch"));
+#else
+            info.channels = codecParams->channels;
+            char layoutBuf[64] = {0};
+            av_get_channel_layout_string(layoutBuf, sizeof(layoutBuf), info.channels, codecParams->channel_layout);
+            info.channelLayout = (layoutBuf[0] != '\0') ? layoutBuf : (info.channels == 2 ? "stereo" : (info.channels == 1 ? "mono" : std::to_string(info.channels) + " ch"));
+#endif
+            info.sampleRate = codecParams->sample_rate;
+            info.bitRate = codecParams->bit_rate;
+            info.isDefault = (m_formatCtx->streams[i]->disposition & AV_DISPOSITION_DEFAULT) != 0;
+            info.isExternal = false;
+
+            m_audioTracks.push_back(info);
         } else if (codecParams->codec_type == AVMEDIA_TYPE_SUBTITLE) {
             naikav::subtitle::SubtitleTrackInfo info;
             info.id = static_cast<int>(i);
@@ -137,6 +183,15 @@ bool Demuxer::open() {
         }
     }
 
+    // Select default audio stream if audio tracks were found
+    if (!m_audioTracks.empty()) {
+        auto it = std::find_if(m_audioTracks.begin(), m_audioTracks.end(),
+                               [](const auto& track) { return track.isDefault; });
+        int defaultIdx = (it != m_audioTracks.end()) ? it->id : m_audioTracks[0].id;
+        selectAudioStream(defaultIdx);
+    }
+
+
     if (m_videoStreamIdx < 0 && m_audioStreamIdx < 0) {
         std::cerr << "Error: Could not find any video or audio streams" << std::endl;
         return false;
@@ -152,12 +207,58 @@ bool Demuxer::open() {
     std::cout << "Opened media file: " << m_filename 
               << ", Duration: " << m_duration << "s" 
               << ", Video Stream: " << m_videoStreamIdx 
-              << ", Audio Stream: " << m_audioStreamIdx 
+              << ", Audio Stream: " << m_audioStreamIdx.load()
+              << ", Audio Tracks: " << m_audioTracks.size()
               << ", Subtitle Tracks: " << m_subtitleTracks.size() << std::endl;
 
     m_eof = false;
     return true;
 }
+
+bool Demuxer::selectAudioStream(int streamIdx) {
+    if (streamIdx < 0) {
+        m_audioStreamIdx.store(-1);
+        m_audioCodecParams = nullptr;
+        m_audioTimeBase = AVRational{0, 1};
+        m_audioStartTime = 0;
+        return true;
+    }
+    if (!m_formatCtx || streamIdx >= static_cast<int>(m_formatCtx->nb_streams)) {
+        return false;
+    }
+    if (m_formatCtx->streams[streamIdx]->codecpar->codec_type != AVMEDIA_TYPE_AUDIO) {
+        return false;
+    }
+    m_audioStreamIdx.store(streamIdx);
+    m_audioCodecParams = m_formatCtx->streams[streamIdx]->codecpar;
+    m_audioTimeBase = m_formatCtx->streams[streamIdx]->time_base;
+    m_audioStartTime = m_formatCtx->streams[streamIdx]->start_time;
+    if (m_audioStartTime == AV_NOPTS_VALUE) m_audioStartTime = 0;
+    return true;
+}
+
+AVCodecParameters* Demuxer::getAudioCodecParams(int streamIdx) const {
+    if (!m_formatCtx || streamIdx < 0 || streamIdx >= static_cast<int>(m_formatCtx->nb_streams)) {
+        return nullptr;
+    }
+    return m_formatCtx->streams[streamIdx]->codecpar;
+}
+
+AVRational Demuxer::getAudioTimeBase(int streamIdx) const {
+    if (!m_formatCtx || streamIdx < 0 || streamIdx >= static_cast<int>(m_formatCtx->nb_streams)) {
+        return AVRational{0, 1};
+    }
+    return m_formatCtx->streams[streamIdx]->time_base;
+}
+
+int64_t Demuxer::getAudioStartTime(int streamIdx) const {
+    if (!m_formatCtx || streamIdx < 0 || streamIdx >= static_cast<int>(m_formatCtx->nb_streams)) {
+        return 0;
+    }
+    int64_t st = m_formatCtx->streams[streamIdx]->start_time;
+    return (st != AV_NOPTS_VALUE) ? st : 0;
+}
+
 
 void Demuxer::start() {
     if (m_running) return;
@@ -243,12 +344,13 @@ void Demuxer::performSeek() {
     int streamIdx = -1;
     
     // Convert target time to the timebase of the selected stream for seeking
+    int audioIdx = m_audioStreamIdx.load();
     if (m_videoStreamIdx >= 0) {
         streamIdx = m_videoStreamIdx;
         // In FFmpeg, stream-specific seek requires the timestamp in stream timebase units
         targetTs = static_cast<int64_t>(targetTime / av_q2d(m_videoTimeBase));
-    } else if (m_audioStreamIdx >= 0) {
-        streamIdx = m_audioStreamIdx;
+    } else if (audioIdx >= 0) {
+        streamIdx = audioIdx;
         targetTs = static_cast<int64_t>(targetTime / av_q2d(m_audioTimeBase));
     } else {
         targetTs = static_cast<int64_t>(targetTime * AV_TIME_BASE);
@@ -310,6 +412,8 @@ void Demuxer::threadLoop() {
                 static_cast<uintptr_t>(m_seekGeneration.load(std::memory_order_relaxed)));
 
             SeekCatchupMode cmode = m_catchupMode.load();
+            int currentAudioIdx = m_audioStreamIdx.load();
+            int currentSubIdx = m_subtitleStreamIdx.load();
 
             if (packet->stream_index == m_videoStreamIdx) {
                 // Bounded wait, not an unconditional block: this is the only
@@ -320,24 +424,17 @@ void Demuxer::threadLoop() {
                 // to recover short of tearing down playback. Past the
                 // timeout, drop the oldest queued packet and keep reading
                 // instead, so the pipeline can never get permanently stuck.
-                // This 100-packet cap is also what naturally throttles
-                // read-ahead during a seek catch-up scan, in place of a
-                // separate pts-based throttle: it tracks actual decoder
-                // throughput (including B-frame reorder delay) instead of a
-                // fixed "1 second past target" heuristic that can't tell the
-                // difference between "nearly done" and "decoder needs many
-                // more packets before it can produce the target frame".
                 if (!m_videoQueue.push_wait_or_drop(packet, kQueuePushTimeout,
                                                      [](AVPacket*& p) { av_packet_free(&p); })) {
                     av_packet_free(&packet);
                 }
-            } else if (packet->stream_index == m_audioStreamIdx) {
+            } else if (currentAudioIdx >= 0 && packet->stream_index == currentAudioIdx) {
                 // During catch-up the audio device is paused: audio from
                 // before the seek target is useless and would only clog the
                 // queue, so drop it here.
                 bool drop = false;
                 if (cmode != SeekCatchupMode::NONE) {
-                    double ptsSec = packetTimeSeconds(packet, m_audioStreamIdx);
+                    double ptsSec = packetTimeSeconds(packet, currentAudioIdx);
                     if (!std::isnan(ptsSec) &&
                         ptsSec < m_catchupTarget.load() - 0.1) {
                         drop = true;
@@ -364,7 +461,7 @@ void Demuxer::threadLoop() {
                 if (!pushed) {
                     av_packet_free(&packet);
                 }
-            } else if (m_subtitleQueue && packet->stream_index == m_subtitleStreamIdx.load()) {
+            } else if (m_subtitleQueue && currentSubIdx >= 0 && packet->stream_index == currentSubIdx) {
                 if (!m_subtitleQueue->push_wait_or_drop(packet, kQueuePushTimeout,
                                                         [](AVPacket*& p) { av_packet_free(&p); })) {
                     av_packet_free(&packet);
@@ -373,6 +470,7 @@ void Demuxer::threadLoop() {
                 av_packet_free(&packet);
             }
         } else {
+
             // Error or EOF
             av_packet_free(&packet);
             
