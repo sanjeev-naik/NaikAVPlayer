@@ -546,7 +546,7 @@ option(ENABLE_COVERAGE "Enable code coverage instrumentation" ON)
 
 if(ENABLE_COVERAGE AND NOT ENABLE_TSAN)
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-        target_compile_options(NaikAVPlayer_tests PRIVATE --coverage -O0 -g -U_FORTIFY_SOURCE)
+        target_compile_options(NaikAVPlayer_tests PRIVATE --coverage -fprofile-update=atomic -O0 -g -U_FORTIFY_SOURCE)
         target_link_options(NaikAVPlayer_tests PRIVATE --coverage)
     elseif(MSVC)
         target_compile_options(NaikAVPlayer_tests PRIVATE /Zi /Od)
