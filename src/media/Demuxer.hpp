@@ -8,10 +8,12 @@
 #include "core/ThreadSafeQueue.hpp"
 #include "core/MetricRing.hpp"
 #include "subtitle/SubtitleTrack.hpp"
+#include "audio/AudioTrack.hpp"
 
 extern "C" {
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
+#include <libavutil/channel_layout.h>
 }
 
 // Coordinates the seek catch-up phase between PlayerController and the
@@ -29,6 +31,7 @@ private:
     std::atomic<int> m_audioStreamIdx;
     std::atomic<int> m_subtitleStreamIdx{-1};
     std::vector<naikav::subtitle::SubtitleTrackInfo> m_subtitleTracks;
+    std::vector<naikav::audio::AudioTrackInfo> m_audioTracks;
     
     AVCodecParameters* m_videoCodecParams;
     AVCodecParameters* m_audioCodecParams;
@@ -66,13 +69,7 @@ private:
     // counter's *current* live value at the moment they pop it, and drop
     // the packet if it doesn't match -- catching staleness by where the
     // packet's data actually came from, not by when the consumer thread's
-    // loop iteration happened to start. That distinction matters: a packet
-    // can be read from the pre-seek position and pushed to the queue in the
-    // brief window between a new seek being requested and this thread
-    // noticing it, surviving the caller's one-shot queue clear; a purely
-    // consumer-side "epoch snapshot before decoding" check (as used
-    // elsewhere for catch-up landing) can't see that, since by the time the
-    // consumer picks the packet up its own epoch may already have advanced.
+    // loop iteration happened to start.
     std::atomic<uint64_t> m_seekGeneration{0};
 
     // Set once the AudioDecoder exists (see attachAudioPausedFlag). Lets the
@@ -118,15 +115,23 @@ public:
     // attachSeekGeneration() on those classes).
     std::atomic<uint64_t>* seekGenerationPtr() { return &m_seekGeneration; }
 
+    // Audio stream selection & track querying
+    const std::vector<naikav::audio::AudioTrackInfo>& getAudioTracks() const { return m_audioTracks; }
+    bool selectAudioStream(int streamIdx);
+
     // Getters
     int getVideoStreamIndex() const { return m_videoStreamIdx; }
-    int getAudioStreamIndex() const { return m_audioStreamIdx; }
+    int getAudioStreamIndex() const { return m_audioStreamIdx.load(); }
     int getSubtitleStreamIndex() const { return m_subtitleStreamIdx.load(); }
     void setSubtitleStreamIndex(int idx) { m_subtitleStreamIdx.store(idx); }
     const std::vector<naikav::subtitle::SubtitleTrackInfo>& getSubtitleTracks() const { return m_subtitleTracks; }
 
     AVCodecParameters* getVideoCodecParams() const { return m_videoCodecParams; }
     AVCodecParameters* getAudioCodecParams() const { return m_audioCodecParams; }
+    AVCodecParameters* getAudioCodecParams(int streamIdx) const;
+    AVRational getAudioTimeBase(int streamIdx) const;
+    int64_t getAudioStartTime(int streamIdx) const;
+
     AVCodecParameters* getSubtitleCodecParams(int streamIdx) const;
     AVRational getSubtitleTimeBase(int streamIdx) const;
     int64_t getSubtitleStartTime(int streamIdx) const;
@@ -174,4 +179,5 @@ public:
         return "";
     }
 };
+
 

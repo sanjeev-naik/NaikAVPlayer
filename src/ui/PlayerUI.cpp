@@ -458,6 +458,50 @@ bool PlayerUI::drawIconButton(const char *str_id, IconType icon, ImVec2 size) {
     drawList->AddLine(ImVec2(lineL + boxW * 0.1f, center.y + boxH * 0.15f), ImVec2(lineR - boxW * 0.1f, center.y + boxH * 0.15f), color, 1.5f);
     break;
   }
+  case IconType::AudioTrack: {
+    float r = sz * 0.5f;
+    // Headband arc
+    drawList->PathArcTo(ImVec2(center.x, center.y - r * 0.05f), r * 0.55f, 3.14159f, 0.0f, 16);
+    drawList->PathStroke(color, ImDrawFlags_None, 1.5f);
+    // Left earcup
+    drawList->AddRectFilled(ImVec2(center.x - r * 0.65f, center.y - r * 0.2f),
+                            ImVec2(center.x - r * 0.42f, center.y + r * 0.45f), color, 1.5f);
+    // Right earcup
+    drawList->AddRectFilled(ImVec2(center.x + r * 0.42f, center.y - r * 0.2f),
+                            ImVec2(center.x + r * 0.65f, center.y + r * 0.45f), color, 1.5f);
+    break;
+  }
+  case IconType::Speed: {
+    constexpr float kPi = 3.14159265358979323846f;
+    float r = sz * 0.48f;
+    ImVec2 hubCenter(center.x, center.y + r * 0.12f);
+
+    // Speedometer outer dial arc (from 135 deg to 405 deg)
+    drawList->PathArcTo(hubCenter, r * 0.72f, kPi * 0.75f, kPi * 2.25f, 20);
+    drawList->PathStroke(color, ImDrawFlags_None, 1.5f);
+
+    // Speedometer center hub
+    drawList->AddCircleFilled(hubCenter, r * 0.18f, color);
+
+    // Needle pointing towards top-right (speed position)
+    float needleAngle = -kPi * 0.25f;
+    ImVec2 needleEnd(hubCenter.x + cosf(needleAngle) * r * 0.62f,
+                     hubCenter.y + sinf(needleAngle) * r * 0.62f);
+    drawList->AddLine(hubCenter, needleEnd, color, 1.8f);
+
+    // Left tick mark
+    float t1Angle = kPi * 0.95f;
+    drawList->AddLine(ImVec2(hubCenter.x + cosf(t1Angle) * r * 0.55f, hubCenter.y + sinf(t1Angle) * r * 0.55f),
+                      ImVec2(hubCenter.x + cosf(t1Angle) * r * 0.72f, hubCenter.y + sinf(t1Angle) * r * 0.72f),
+                      color, 1.2f);
+
+    // Top tick mark
+    float t2Angle = -kPi * 0.5f;
+    drawList->AddLine(ImVec2(hubCenter.x + cosf(t2Angle) * r * 0.55f, hubCenter.y + sinf(t2Angle) * r * 0.55f),
+                      ImVec2(hubCenter.x + cosf(t2Angle) * r * 0.72f, hubCenter.y + sinf(t2Angle) * r * 0.72f),
+                      color, 1.2f);
+    break;
+  }
   }
 
   ImGui::PopID();
@@ -552,13 +596,14 @@ void PlayerUI::drawWelcomeHUD(int windowWidth, int windowHeight) {
   // Centering the shortcut display
   float rowWidth =
       ImGui::CalcTextSize(
-          " [Space] Play/Pause    [<- / ->] Seek 10s    [ [ / ] ] Speed    [V] Subtitles    [G/H] Sub Delay    [F11] Fullscreen    [M] Mute    [Up/Down] Vol    [S] Screenshot    [L] Loop    [Esc] Exit")
+          " [Space] Play/Pause    [<- / ->] Seek 10s    [ [ / ] ] Speed    [B] Audio    [V] Subtitles    [G/H] Sub Delay    [F11] Fullscreen    [M] Mute    [Up/Down] Vol    [S] Screenshot    [L] Loop    [Esc] Exit")
           .x;
   ImGui::SetCursorPosX((cardWidth - rowWidth) * 0.5f);
 
   renderKey("Space", "Play/Pause");
   renderKey("<- / ->", "Seek 10s");
   renderKey("[ / ]", "Speed -/+");
+  renderKey("B", "Audio");
   renderKey("V", "Subtitles");
   renderKey("G/H", "Sub Delay");
   renderKey("F11", "Fullscreen");
@@ -1050,7 +1095,7 @@ void PlayerUI::drawTitleBar(int windowWidth, int windowHeight) {
 
 void PlayerUI::drawControlsBar(int windowWidth, int windowHeight) {
   // Floating centered dock design.
-  float barWidth = std::min(980.0f, windowWidth * 0.95f);
+  float barWidth = std::min(1080.0f, std::max(600.0f, static_cast<float>(windowWidth) - 24.0f));
   float barHeight = 85.0f;
   float posX = (windowWidth - barWidth) * 0.5f;
   float posY = windowHeight - barHeight - 20.0f;
@@ -1114,8 +1159,25 @@ void PlayerUI::drawControlsBar(int windowWidth, int windowHeight) {
   // Row 2: Controls and Volume
   ImGui::SetCursorPosY(46.0f);
 
+  const float groupItemSpacing = 6.0f;
+  const float openButtonWidth = 32.0f;
+  const float seekBtnWidth = 32.0f;
+  const float playBtnWidth = 36.0f;
+  const float stopBtnWidth = 32.0f;
+  const float loopBtnWidth = 32.0f;
+
+  const float resolutionGroupWidth = 92.0f;
+
+  const float speedButtonWidth = 32.0f;
+  const float audioTrackButtonWidth = 32.0f;
+  const float subButtonWidth = 32.0f;
+  const float eqButtonWidth = 32.0f;
+  const float muteButtonWidth = 32.0f;
+  const float volumeSliderWidth = 70.0f;
+  const float barRightPadding = 14.0f;
+
   // Left Group: Open File Button
-  if (drawIconButton("##browse", IconType::Folder, ImVec2(36, 28))) {
+  if (drawIconButton("##browse", IconType::Folder, ImVec2(openButtonWidth, 28))) {
     openMediaFileDialog();
   }
   if (ImGui::IsItemHovered()) {
@@ -1123,23 +1185,34 @@ void PlayerUI::drawControlsBar(int windowWidth, int windowHeight) {
   }
 
   // Middle Group: Playback buttons
-  float centerButtonsGroupWidth = 268.0f;
-  ImGui::SameLine((barWidth - centerButtonsGroupWidth) * 0.5f);
+  float centerButtonsGroupWidth = seekBtnWidth + groupItemSpacing + playBtnWidth + groupItemSpacing +
+                                  stopBtnWidth + groupItemSpacing + seekBtnWidth + groupItemSpacing + loopBtnWidth;
+
+  float rightGroupWidth = resolutionGroupWidth + speedButtonWidth + audioTrackButtonWidth + subButtonWidth +
+                          eqButtonWidth + muteButtonWidth + volumeSliderWidth +
+                          groupItemSpacing * 6.0f;
+
+  float minCenterX = openButtonWidth + 16.0f;
+  float maxCenterX = barWidth - rightGroupWidth - centerButtonsGroupWidth - barRightPadding - 10.0f;
+  float targetCenterX = (barWidth - centerButtonsGroupWidth) * 0.5f;
+  float actualCenterX = std::clamp(targetCenterX, minCenterX, std::max(minCenterX, maxCenterX));
+
+  ImGui::SameLine(actualCenterX);
 
   // Seek back button (<<)
-  if (drawIconButton("##seek_back", IconType::SeekBackward, ImVec2(36, 28))) {
+  if (drawIconButton("##seek_back", IconType::SeekBackward, ImVec2(seekBtnWidth, 28))) {
     m_controller.seek(m_controller.getSeekReferenceTime() - 10.0);
   }
   if (ImGui::IsItemHovered()) {
     ImGui::SetTooltip("Seek Backward 10s");
   }
-  ImGui::SameLine(0.0f, 8.0f);
+  ImGui::SameLine(0.0f, groupItemSpacing);
 
   // Play/Pause button
   bool isPlaying = (state == PlayerState::PLAYING);
   if (isPlaying) {
     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.53f, 0.90f, 0.75f));
-    if (drawIconButton("##pause", IconType::Pause, ImVec2(40, 28))) {
+    if (drawIconButton("##pause", IconType::Pause, ImVec2(playBtnWidth, 28))) {
       m_controller.pause();
     }
     ImGui::PopStyleColor();
@@ -1147,7 +1220,7 @@ void PlayerUI::drawControlsBar(int windowWidth, int windowHeight) {
       ImGui::SetTooltip("Pause Playback");
     }
   } else {
-    if (drawIconButton("##play", IconType::Play, ImVec2(40, 28))) {
+    if (drawIconButton("##play", IconType::Play, ImVec2(playBtnWidth, 28))) {
       if (state != PlayerState::UNINITIALIZED) {
         m_controller.play();
       } else {
@@ -1158,96 +1231,47 @@ void PlayerUI::drawControlsBar(int windowWidth, int windowHeight) {
       ImGui::SetTooltip("Start Playback");
     }
   }
-  ImGui::SameLine(0.0f, 8.0f);
+  ImGui::SameLine(0.0f, groupItemSpacing);
 
   // Stop button
-  if (drawIconButton("##stop", IconType::Stop, ImVec2(36, 28))) {
+  if (drawIconButton("##stop", IconType::Stop, ImVec2(stopBtnWidth, 28))) {
     m_controller.stop();
   }
   if (ImGui::IsItemHovered()) {
     ImGui::SetTooltip("Stop Playback");
   }
-  ImGui::SameLine(0.0f, 8.0f);
+  ImGui::SameLine(0.0f, groupItemSpacing);
 
   // Seek forward button (>>)
-  if (drawIconButton("##seek_forward", IconType::SeekForward, ImVec2(36, 28))) {
+  if (drawIconButton("##seek_forward", IconType::SeekForward, ImVec2(seekBtnWidth, 28))) {
     m_controller.seek(m_controller.getSeekReferenceTime() + 10.0);
   }
   if (ImGui::IsItemHovered()) {
     ImGui::SetTooltip("Seek Forward 10s");
   }
-  ImGui::SameLine(0.0f, 8.0f);
+  ImGui::SameLine(0.0f, groupItemSpacing);
 
   // Loop toggle button
   bool loopEnabled = m_controller.isLoopEnabled();
   if (loopEnabled) {
-    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.53f, 0.90f, 0.75f));
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.00f, 0.75f, 0.85f, 0.90f));
   }
-  if (drawIconButton("##loop", IconType::Loop, ImVec2(36, 28))) {
-    m_controller.setLoopEnabled(!loopEnabled);
+  if (drawIconButton("##loop", IconType::Loop, ImVec2(loopBtnWidth, 28))) {
+    toggleLoop();
   }
   if (loopEnabled) {
     ImGui::PopStyleColor();
   }
   if (ImGui::IsItemHovered()) {
-    ImGui::SetTooltip(loopEnabled ? "Loop: On" : "Loop: Off");
-  }
-  ImGui::SameLine(0.0f, 8.0f);
-
-  // Playback Speed button
-  float currentSpeed = m_controller.getPlaybackSpeed();
-  char speedBtnLabel[16];
-  if (std::fabs(currentSpeed - std::round(currentSpeed)) < 0.01f) {
-    std::snprintf(speedBtnLabel, sizeof(speedBtnLabel), "%.0fx##speed", currentSpeed);
-  } else {
-    std::snprintf(speedBtnLabel, sizeof(speedBtnLabel), "%.2fx##speed", currentSpeed);
+    ImGui::SetTooltip(loopEnabled ? "Loop: On (Repeat Continuous) - [L]" : "Loop: Off - [L]");
   }
 
-  bool isNonDefaultSpeed = (std::fabs(currentSpeed - 1.0f) > 0.01f);
-  if (isNonDefaultSpeed) {
-    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.53f, 0.90f, 0.75f));
-  }
-  if (ImGui::Button(speedBtnLabel, ImVec2(44, 28))) {
-    ImGui::OpenPopup("##speed_popup");
-  }
-  if (isNonDefaultSpeed) {
-    ImGui::PopStyleColor();
-  }
-  if (ImGui::IsItemHovered()) {
-    ImGui::SetTooltip("Playback Speed: %.2fx (Hotkeys: [ / ] or Backspace)", currentSpeed);
-  }
+  // Right Group: Resolution, Audio Speed, Audio Track, Subtitles, EQ, Mute and Volume
+  float minRightX = actualCenterX + centerButtonsGroupWidth + 10.0f;
+  float targetRightX = barWidth - rightGroupWidth - barRightPadding;
+  float actualRightX = std::max(minRightX, targetRightX);
+  ImGui::SameLine(actualRightX);
 
-  if (ImGui::BeginPopup("##speed_popup")) {
-    ImGui::TextColored(ImVec4(0.00f, 0.83f, 0.88f, 1.00f), "Playback Speed");
-    ImGui::Separator();
-    const float speeds[] = {0.25f, 0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 1.75f, 2.0f};
-    for (float s : speeds) {
-      char sLabel[32];
-      if (std::fabs(s - 1.0f) < 0.01f) {
-        std::snprintf(sLabel, sizeof(sLabel), "1.0x (Normal)%s", (std::fabs(currentSpeed - s) < 0.01f) ? "  [OK]" : "");
-      } else {
-        std::snprintf(sLabel, sizeof(sLabel), "%.2fx%s", s, (std::fabs(currentSpeed - s) < 0.01f) ? "  [OK]" : "");
-      }
-      if (ImGui::Selectable(sLabel, std::fabs(currentSpeed - s) < 0.01f)) {
-        m_controller.setPlaybackSpeed(s);
-      }
-    }
-    ImGui::EndPopup();
-  }
-
-  // Right Group: Resolution, Subtitles, EQ, Mute and Volume
-  const float groupItemSpacing = 8.0f;
-  const float resolutionGroupWidth = 100.0f;
-  const float subButtonWidth = 36.0f;
-  const float eqButtonWidth = 36.0f;
-  const float muteButtonWidth = 36.0f;
-  const float volumeSliderWidth = 90.0f;
-  const float barRightPadding = 20.0f;
-
-  float rightGroupWidth = resolutionGroupWidth + subButtonWidth + eqButtonWidth +
-                          muteButtonWidth + volumeSliderWidth +
-                          groupItemSpacing * 4.0f;
-  ImGui::SameLine(barWidth - rightGroupWidth - barRightPadding);
 
   // Resolution Dropdown
   const char* resolutionNames[] = {
@@ -1278,6 +1302,158 @@ void PlayerUI::drawControlsBar(int windowWidth, int windowHeight) {
   ImGui::PopItemWidth();
   if (ImGui::IsItemHovered()) {
       ImGui::SetTooltip("Select Output Playback Resolution");
+  }
+
+  ImGui::SameLine(0.0f, groupItemSpacing);
+
+  // Separate Audio / Playback Speed Icon Button (Speedometer)
+  float currentSpeed = m_controller.getPlaybackSpeed();
+  bool isNonDefaultSpeed = (std::fabs(currentSpeed - 1.0f) > 0.01f);
+  if (isNonDefaultSpeed) {
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.53f, 0.90f, 0.85f));
+  }
+  if (drawIconButton("##speed_btn", IconType::Speed, ImVec2(speedButtonWidth, 28))) {
+    ImGui::OpenPopup("##speed_popup");
+  }
+  if (isNonDefaultSpeed) {
+    ImGui::PopStyleColor();
+  }
+  if (ImGui::IsItemHovered()) {
+    char speedTip[64];
+    std::snprintf(speedTip, sizeof(speedTip), "Audio / Playback Speed: %.2fx (Hotkeys: [ / ] or Backspace)", currentSpeed);
+    ImGui::SetTooltip("%s", speedTip);
+  }
+
+  if (ImGui::BeginPopup("##speed_popup")) {
+    ImGui::TextColored(ImVec4(0.00f, 0.83f, 0.88f, 1.00f), "Playback & Audio Speed");
+    ImGui::Separator();
+
+    float editSpeed = currentSpeed;
+    ImGui::PushItemWidth(180.0f);
+    if (ImGui::SliderFloat("##popup_speed_slider", &editSpeed, 0.25f, 2.0f, "%.2fx")) {
+      m_controller.setPlaybackSpeed(std::round(editSpeed * 100.0f) / 100.0f);
+    }
+    ImGui::PopItemWidth();
+
+    ImGui::Spacing();
+    const float speeds[] = {0.25f, 0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 1.75f, 2.0f};
+    for (float s : speeds) {
+      char sLabel[32];
+      if (std::fabs(s - 1.0f) < 0.01f) {
+        std::snprintf(sLabel, sizeof(sLabel), "1.0x (Normal)%s", (std::fabs(currentSpeed - s) < 0.01f) ? "  [OK]" : "");
+      } else {
+        std::snprintf(sLabel, sizeof(sLabel), "%.2fx%s", s, (std::fabs(currentSpeed - s) < 0.01f) ? "  [OK]" : "");
+      }
+      if (ImGui::Selectable(sLabel, std::fabs(currentSpeed - s) < 0.01f)) {
+        m_controller.setPlaybackSpeed(s);
+      }
+    }
+
+    ImGui::Separator();
+    if (ImGui::SmallButton("-0.1x")) {
+      m_controller.setPlaybackSpeed(std::round((currentSpeed - 0.1f) * 100.0f) / 100.0f);
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Reset 1.0x")) {
+      m_controller.setPlaybackSpeed(1.0f);
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("+0.1x")) {
+      m_controller.setPlaybackSpeed(std::round((currentSpeed + 0.1f) * 100.0f) / 100.0f);
+    }
+    ImGui::EndPopup();
+  }
+
+  ImGui::SameLine(0.0f, groupItemSpacing);
+
+
+  // Audio Track selector button
+  int selAudioTrack = m_controller.getSelectedAudioTrack();
+  bool audioActive = (selAudioTrack != -1 && m_controller.hasAudio());
+  if (audioActive) {
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.53f, 0.90f, 0.80f));
+  }
+  if (drawIconButton("##audio_track_btn", IconType::AudioTrack, ImVec2(audioTrackButtonWidth, 28))) {
+    ImGui::OpenPopup("##audio_tracks_popup");
+  }
+  if (audioActive) {
+    ImGui::PopStyleColor();
+  }
+  if (ImGui::IsItemHovered()) {
+    std::string audioTip = "Audio Track: " + m_controller.getActiveAudioTrackName() + " - [B]";
+    ImGui::SetTooltip("%s", audioTip.c_str());
+  }
+
+  if (ImGui::BeginPopup("##audio_tracks_popup")) {
+    ImGui::TextColored(ImVec4(0.00f, 0.83f, 0.88f, 1.00f), "Audio Tracks");
+    ImGui::Separator();
+
+    auto aTracks = m_controller.getAudioTracks();
+    bool hasEmbeddedAudio = std::any_of(aTracks.begin(), aTracks.end(), [](const naikav::audio::AudioTrackInfo& t) {
+      return !t.isExternal;
+    });
+
+    if (hasEmbeddedAudio) {
+      ImGui::TextDisabled("Embedded Tracks:");
+      for (const auto& t : aTracks) {
+        if (!t.isExternal) {
+          bool isSelected = (selAudioTrack == t.id);
+          std::string label = "[" + t.language + "] " + t.title;
+          if (!t.codecName.empty() && t.codecName != "unknown") {
+            label += " (" + t.codecName;
+            if (!t.channelLayout.empty()) {
+              label += ", " + t.channelLayout;
+            }
+            if (t.sampleRate > 0) {
+              label += ", " + std::to_string(t.sampleRate / 1000) + "kHz";
+            }
+            label += ")";
+          }
+          if (ImGui::MenuItem(label.c_str(), nullptr, isSelected)) {
+            m_controller.selectAudioTrack(t.id);
+          }
+        }
+      }
+      ImGui::Spacing();
+    }
+
+    bool hasExternalAudio = m_controller.hasExternalAudio();
+    if (hasExternalAudio) {
+      ImGui::TextDisabled("External Audio:");
+      for (const auto& t : aTracks) {
+        if (t.isExternal) {
+          bool isSelected = (selAudioTrack == -2);
+          std::string label = "[ext] " + t.title;
+          if (!t.codecName.empty() && t.codecName != "unknown") {
+            label += " (" + t.codecName;
+            if (!t.channelLayout.empty()) {
+              label += ", " + t.channelLayout;
+            }
+            label += ")";
+          }
+          if (ImGui::MenuItem(label.c_str(), nullptr, isSelected)) {
+            m_controller.selectAudioTrack(-2);
+          }
+        }
+      }
+      if (ImGui::MenuItem("Remove External Audio")) {
+        m_controller.removeExternalAudio();
+      }
+      ImGui::Spacing();
+    }
+
+    if (ImGui::MenuItem("Load External Audio File (.m4a, .aac, .mp3, .wav)...")) {
+      openAudioFileDialog();
+    }
+
+    ImGui::Separator();
+    bool isAudioOff = (selAudioTrack == -1);
+    if (ImGui::MenuItem("Disable Audio (Mute Stream)", nullptr, isAudioOff)) {
+      m_controller.selectAudioTrack(isAudioOff ? (aTracks.empty() ? -1 : aTracks[0].id) : -1);
+    }
+
+
+    ImGui::EndPopup();
   }
 
   ImGui::SameLine(0.0f, groupItemSpacing);
@@ -1844,7 +2020,7 @@ void PlayerUI::drawAudioSettingsPanel(int windowWidth, int windowHeight) {
   ImGui::SetNextWindowPos(ImVec2(20.0f, 60.0f), ImGuiCond_FirstUseEver);
   ImGui::SetNextWindowSize(ImVec2(panelWidth, panelHeight), ImGuiCond_FirstUseEver);
 
-  if (!ImGui::Begin("Audio Processing", &m_showAudioSettings,
+  if (!ImGui::Begin("Audio & Playback Control Panel", &m_showAudioSettings,
                      ImGuiWindowFlags_NoSavedSettings)) {
     ImGui::End();
     return;
@@ -1865,6 +2041,8 @@ void PlayerUI::drawAudioSettingsPanel(int windowWidth, int windowHeight) {
 
   ImGui::TextColored(sectionColor, "Spectrum Analyzer");
   ImGui::Separator();
+
+
   changed |= ImGui::Checkbox("Enable Spectrum Analyzer", &s.spectrumAnalyzerEnabled);
   if (ImGui::IsItemHovered()) {
     ImGui::SetTooltip(
@@ -2062,7 +2240,66 @@ void PlayerUI::drawAudioSettingsPanel(int windowWidth, int windowHeight) {
   }
 
   ImGui::Spacing();
+  ImGui::TextColored(sectionColor, "Playback & Audio Speed");
+  ImGui::Separator();
+  {
+    float currentPlaybackSpeed = m_controller.getPlaybackSpeed();
+    float speedVal = currentPlaybackSpeed;
+    ImGui::PushItemWidth(240.0f);
+    if (ImGui::SliderFloat("##audio_speed_slider", &speedVal, 0.25f, 2.0f, "Speed: %.2fx")) {
+      m_controller.setPlaybackSpeed(std::round(speedVal * 100.0f) / 100.0f);
+    }
+    ImGui::PopItemWidth();
+    ImGui::SameLine();
+    char speedRatioBuf[32];
+    std::snprintf(speedRatioBuf, sizeof(speedRatioBuf), "(%.0f%%)", currentPlaybackSpeed * 100.0f);
+    ImGui::TextColored(ImVec4(0.00f, 0.83f, 0.88f, 1.00f), "%s", speedRatioBuf);
+
+    // Preset Speed Buttons
+    const float kAudioSpeeds[] = {0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 1.75f, 2.0f};
+    const float kAudioSpeedBtnWidth = 42.0f;
+    for (size_t i = 0; i < sizeof(kAudioSpeeds)/sizeof(kAudioSpeeds[0]); ++i) {
+      float sp = kAudioSpeeds[i];
+      char spBuf[16];
+      if (std::fabs(sp - 1.0f) < 0.01f) {
+        std::snprintf(spBuf, sizeof(spBuf), "1.0x");
+      } else {
+        std::snprintf(spBuf, sizeof(spBuf), "%.2fx", sp);
+      }
+      bool isCur = (std::fabs(currentPlaybackSpeed - sp) < 0.01f);
+      if (isCur) {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.53f, 0.90f, 0.85f));
+      }
+      if (ImGui::Button(spBuf, ImVec2(kAudioSpeedBtnWidth, 24))) {
+        m_controller.setPlaybackSpeed(sp);
+      }
+      if (isCur) {
+        ImGui::PopStyleColor();
+      }
+      if (i + 1 < sizeof(kAudioSpeeds)/sizeof(kAudioSpeeds[0])) {
+        ImGui::SameLine(0.0f, 4.0f);
+      }
+    }
+
+    // Fine adjustment row
+    if (ImGui::SmallButton("-0.05x##audiospeed")) {
+      m_controller.setPlaybackSpeed(std::round((currentPlaybackSpeed - 0.05f) * 100.0f) / 100.0f);
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Reset 1.0x##audiospeed")) {
+      m_controller.setPlaybackSpeed(1.0f);
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("+0.05x##audiospeed")) {
+      m_controller.setPlaybackSpeed(std::round((currentPlaybackSpeed + 0.05f) * 100.0f) / 100.0f);
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("[Hotkeys: [ / ] or Backspace]");
+  }
+
+  ImGui::Spacing();
   ImGui::TextColored(sectionColor, "Presets");
+
   ImGui::Separator();
   {
     struct PresetEntry {
@@ -2106,6 +2343,38 @@ void PlayerUI::drawAudioSettingsPanel(int windowWidth, int windowHeight) {
           "genre taxonomy -- falls back to leaving your current settings\n"
           "alone when nothing recognizable matches.");
     }
+  }
+
+  ImGui::Spacing();
+  ImGui::Spacing();
+
+  ImGui::TextColored(sectionColor, "Active Audio Track");
+  ImGui::Separator();
+  auto audioTracksList = m_controller.getAudioTracks();
+  int currentAudioTrack = m_controller.getSelectedAudioTrack();
+  std::string currentAudioName = m_controller.getActiveAudioTrackName();
+  if (ImGui::BeginCombo("##active_audio_track", currentAudioName.c_str())) {
+    bool isOffSelected = (currentAudioTrack == -1);
+    if (ImGui::Selectable("Off (Mute Stream)", isOffSelected)) {
+      m_controller.selectAudioTrack(-1);
+    }
+    for (const auto& t : audioTracksList) {
+      bool isSelected = (currentAudioTrack == t.id);
+      std::string label = (t.isExternal ? "[ext] " : ("[" + t.language + "] ")) + t.title;
+      if (!t.codecName.empty() && t.codecName != "unknown") {
+        label += " (" + t.codecName;
+        if (!t.channelLayout.empty()) label += ", " + t.channelLayout;
+        if (t.sampleRate > 0) label += ", " + std::to_string(t.sampleRate / 1000) + "kHz";
+        label += ")";
+      }
+      if (ImGui::Selectable(label.c_str(), isSelected)) {
+        m_controller.selectAudioTrack(t.id);
+      }
+    }
+    if (ImGui::Selectable("Load External Audio File...")) {
+      openAudioFileDialog();
+    }
+    ImGui::EndCombo();
   }
 
   ImGui::Spacing();
@@ -2666,5 +2935,68 @@ void PlayerUI::adjustSubtitleDelay(double deltaSeconds) {
   std::snprintf(buf, sizeof(buf), "Subtitle Delay: %+.0f ms", updated * 1000.0);
   showToast(buf, false, 2.0);
 }
+
+void PlayerUI::openAudioFileDialog() {
+  if (m_audioDialogCallback) {
+    std::string path = m_audioDialogCallback();
+    if (!path.empty()) {
+      if (m_controller.loadExternalAudio(path)) {
+        showToast("Loaded audio: " + m_controller.getActiveAudioTrackName(), false, 3.5);
+      } else {
+        showToast("Failed to load external audio file", true, 3.5);
+      }
+    }
+  }
+}
+
+void PlayerUI::cycleAudioTrack() {
+  auto tracks = m_controller.getAudioTracks();
+  if (tracks.empty()) {
+    showToast("No audio tracks available", false, 2.5);
+    return;
+  }
+
+  int current = m_controller.getSelectedAudioTrack();
+  int nextTrack = -1;
+
+  if (current == -1) {
+    nextTrack = tracks[0].id;
+  } else {
+    auto it = std::find_if(tracks.begin(), tracks.end(), [current](const naikav::audio::AudioTrackInfo& t) {
+      return (current == -2 && t.isExternal) || t.id == current;
+    });
+
+    if (it != tracks.end() && (it + 1) != tracks.end()) {
+      nextTrack = (it + 1)->isExternal ? -2 : (it + 1)->id;
+    } else {
+      nextTrack = tracks[0].id; // Loop back to first track
+    }
+  }
+
+  m_controller.selectAudioTrack(nextTrack);
+  showToast("Audio Track: " + m_controller.getActiveAudioTrackName(), false, 2.5);
+}
+
+void PlayerUI::adjustPlaybackSpeed(float delta) {
+  float current = m_controller.getPlaybackSpeed();
+  float updated = std::round((current + delta) * 100.0f) / 100.0f;
+  m_controller.setPlaybackSpeed(updated);
+  char buf[64];
+  std::snprintf(buf, sizeof(buf), "Audio Speed: %.2fx", m_controller.getPlaybackSpeed());
+  showToast(buf, false, 2.0);
+}
+
+void PlayerUI::resetPlaybackSpeed() {
+  m_controller.setPlaybackSpeed(1.0f);
+  showToast("Audio Speed: 1.0x (Normal)", false, 2.0);
+}
+
+void PlayerUI::toggleLoop() {
+  bool newLoop = !m_controller.isLoopEnabled();
+  m_controller.setLoopEnabled(newLoop);
+  showToast(newLoop ? "Loop: On (Repeat Continuous)" : "Loop: Off", false, 2.0);
+}
+
+
 
 

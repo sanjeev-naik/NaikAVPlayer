@@ -22,13 +22,18 @@ public:
         VolumeMute,
         VolumeHigh,
         Loop,
-        Subtitles
+        Subtitles,
+        AudioTrack,
+        Speed
     };
+
 
 private:
     PlayerController& m_controller;
     std::function<std::string()> m_fileDialogCallback;
     std::function<std::string()> m_subtitleDialogCallback;
+    std::function<std::string()> m_audioDialogCallback;
+
     
     // UI state variables
     float m_uiVolume;
@@ -106,6 +111,7 @@ private:
     // Modular drawing helpers
     void openMediaFileDialog();
     void openSubtitleFileDialog();
+    void openAudioFileDialog();
     void drawWelcomeHUD(int windowWidth, int windowHeight);
     void drawAudioVisualizer(int windowWidth, int windowHeight, double currentSystemTime);
     void drawSubtitleOverlay(int windowWidth, int windowHeight, double currentPts);
@@ -140,7 +146,19 @@ public:
     void cycleSubtitleTrack();
     void adjustSubtitleDelay(double deltaSeconds);
 
+    // Audio track cycling
+    void cycleAudioTrack();
+
+    // Audio / Playback speed helpers
+    void adjustPlaybackSpeed(float delta);
+    void resetPlaybackSpeed();
+
+    // Loop helper
+    void toggleLoop();
+
+
     // Volume and Mute helpers
+
     void toggleMute();
     void adjustVolume(float deltaPercent);
     void setVolumePercent(float percent);
@@ -158,6 +176,9 @@ public:
     void setSubtitleDialogCallback(std::function<std::string()> callback) {
         m_subtitleDialogCallback = callback;
     }
+    void setAudioDialogCallback(std::function<std::string()> callback) {
+        m_audioDialogCallback = callback;
+    }
     
     // Draw the UI overlays. Called once per frame in the render loop.
     void draw(int windowWidth, int windowHeight, double currentSystemTime);
@@ -168,5 +189,6 @@ public:
     // Get visibility state
     bool isControlsVisible() const { return m_controlsVisible; }
 };
+
 
 

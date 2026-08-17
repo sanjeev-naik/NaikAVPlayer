@@ -10,6 +10,7 @@
 #include "core/ThreadSafeQueue.hpp"
 #include "media/Demuxer.hpp"
 #include "audio/AudioDecoder.hpp"
+#include "audio/AudioTrack.hpp"
 #include "video/VideoDecoder.hpp"
 #include "subtitle/SubtitleTrack.hpp"
 #include "subtitle/SubtitleDecoder.hpp"
@@ -62,9 +63,19 @@ private:
     std::vector<naikav::subtitle::SubtitleTrackInfo> m_cachedSubtitleTracks;
     naikav::subtitle::SubtitleTrackInfo m_externalSubtitleTrack;
     bool m_hasExternalSubtitle = false;
+
+    // Audio track state
+    std::atomic<int> m_selectedAudioTrack{-1}; // -1 = Disabled/Off, >= 0 = embedded stream index, -2 = external
+    mutable std::mutex m_audioTrackMutex;
+    std::vector<naikav::audio::AudioTrackInfo> m_cachedAudioTracks;
+    naikav::audio::AudioTrackInfo m_externalAudioTrack;
+    bool m_hasExternalAudio = false;
+    std::unique_ptr<Demuxer> m_externalAudioDemuxer;
+    ThreadSafeQueue<AVPacket*> m_dummyVideoQueue{1};
     
     bool m_hasAudio;
     bool m_hasVideo;
+
 
     // Fallback clock for video-only files
     // Atomic: also written by the video thread when a seek catch-up finishes
@@ -366,6 +377,19 @@ public:
         return m_hasExternalSubtitle;
     }
     std::string getActiveSubtitleTrackName() const;
+
+    // Audio track management APIs
+    std::vector<naikav::audio::AudioTrackInfo> getAudioTracks() const;
+    int getSelectedAudioTrack() const { return m_selectedAudioTrack.load(); }
+    bool selectAudioTrack(int trackId);
+    bool loadExternalAudio(const std::string& filepath);
+    void removeExternalAudio();
+    bool hasExternalAudio() const {
+        std::lock_guard<std::mutex> lock(m_audioTrackMutex);
+        return m_hasExternalAudio;
+    }
+    std::string getActiveAudioTrackName() const;
+
 
     // Queue depths
     size_t getVideoPacketQueueSize() const { return m_videoQueue.size(); }
