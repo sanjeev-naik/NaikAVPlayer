@@ -1,5 +1,6 @@
 #define SDL_MAIN_HANDLED
 #include "player/PlayerController.hpp"
+#include "playlist/MediaFileFilter.hpp"
 #include "ui/PlayerUI.hpp"
 #include "video/FrameExporter.hpp"
 #include <SDL3/SDL.h>
@@ -9,6 +10,7 @@
 #include <imgui_impl_sdlrenderer3.h>
 #include <iostream>
 #include <string>
+#include <vector>
 
 // Cross-platform native file dialog via Native File Dialog Extended (NFD)
 #include <SDL3/SDL_properties.h>
@@ -194,6 +196,59 @@ std::string openNativeAudioDialog(SDL_Window *window) {
   return "";
 }
 
+// Multi-select "Add Files" dialog for the playlist panel. Filter extensions
+// come from MediaFileFilter so the dialog always agrees with what
+// classifyMediaKind()/isSupportedMediaFile() consider playable.
+std::vector<std::string> openNativeMultiFileDialog(SDL_Window *window) {
+  std::vector<std::string> paths;
+
+  std::string filterSpec = naikav::playlist::combinedExtensionFilterString();
+  nfdfilteritem_t filterItem[1] = {{"Video/Audio Files", filterSpec.c_str()}};
+
+  nfdopendialogu8args_t args = {};
+  args.filterList = filterItem;
+  args.filterCount = 1;
+  setNfdParentWindow(args.parentWindow, window);
+
+  const nfdpathset_t *rawPathSet = nullptr;
+  nfdresult_t result = NFD_OpenDialogMultipleU8_With(&rawPathSet, &args);
+  if (result == NFD_OKAY) {
+    NFD::UniquePathSet pathSet(rawPathSet);
+    nfdpathsetsize_t count = 0;
+    if (NFD_PathSet_GetCount(pathSet.get(), &count) == NFD_OKAY) {
+      for (nfdpathsetsize_t i = 0; i < count; ++i) {
+        nfdu8char_t *rawPath = nullptr;
+        if (NFD_PathSet_GetPathU8(pathSet.get(), i, &rawPath) == NFD_OKAY) {
+          NFD::UniquePathSetPathU8 path(rawPath);
+          paths.emplace_back(path.get());
+        }
+      }
+    }
+  } else if (result == NFD_ERROR) {
+    std::cerr << "Error: NFD_OpenDialogMultipleU8_With failed: "
+              << NFD_GetError() << std::endl;
+  }
+  return paths;
+}
+
+std::string openNativeFolderDialog(SDL_Window *window) {
+  NFD::UniquePathU8 outPath;
+  nfdpickfolderu8args_t args = {};
+  setNfdParentWindow(args.parentWindow, window);
+
+  nfdu8char_t *rawPath = nullptr;
+  nfdresult_t result = NFD_PickFolderU8_With(&rawPath, &args);
+  if (result == NFD_OKAY) {
+    outPath.reset(rawPath);
+    return std::string(outPath.get());
+  }
+  if (result == NFD_ERROR) {
+    std::cerr << "Error: NFD_PickFolderU8_With failed: " << NFD_GetError()
+              << std::endl;
+  }
+  return "";
+}
+
 
 static SDL_Colorspace getSDLColorspace(const AVFrame *frame) {
   if (!frame)
@@ -350,6 +405,10 @@ int main(int argc, char *argv[]) {
       [window]() { return openNativeSubtitleDialog(window); });
   playerUI.setAudioDialogCallback(
       [window]() { return openNativeAudioDialog(window); });
+  playerUI.setMultiFileDialogCallback(
+      [window]() { return openNativeMultiFileDialog(window); });
+  playerUI.setFolderDialogCallback(
+      [window]() { return openNativeFolderDialog(window); });
 
   // Enable drag and drop events
   SDL_SetEventEnabled(SDL_EVENT_DROP_FILE, true);
@@ -418,6 +477,12 @@ int main(int argc, char *argv[]) {
     try {
 
     // 1. Process Windows Events & Input Routing
+    // SDL3 delivers one SDL_EVENT_DROP_FILE per file for a multi-file OS
+    // drag, all within this same poll drain -- collected here so a
+    // multi-file drop can be routed into the playlist as one batch instead
+    // of each event's openFile() call tearing down and replacing the
+    // previous one (previously: only the last dropped file "won").
+    std::vector<std::string> droppedPaths;
     while (SDL_PollEvent(&event)) {
       ImGui_ImplSDL3_ProcessEvent(&event);
 
@@ -445,12 +510,9 @@ int main(int argc, char *argv[]) {
       } else if (event.type == SDL_EVENT_WINDOW_RESTORED) {
         windowMinimized = false;
       } else if (event.type == SDL_EVENT_DROP_FILE) {
-        // Drag & Drop media file loading
-        const char *droppedFilepath = event.drop.data;
-        std::cout << "Dropped file detected: " << droppedFilepath << std::endl;
-        if (controller.openFile(droppedFilepath)) {
-          controller.play();
-        }
+        // Drag & Drop media file loading -- see droppedPaths batching above.
+        std::cout << "Dropped file detected: " << event.drop.data << std::endl;
+        droppedPaths.emplace_back(event.drop.data);
       } else if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && !io.WantCaptureMouse) {
         // Double-click on video canvas toggles fullscreen
         if (event.button.button == SDL_BUTTON_LEFT && event.button.clicks == 2) {
@@ -553,10 +615,28 @@ int main(int argc, char *argv[]) {
         case SDLK_H:
           playerUI.adjustSubtitleDelay(0.05);
           break;
+        case SDLK_P:
+          playerUI.togglePlaylistPanel();
+          break;
         default:
           break;
         }
       }
+    }
+
+    // Route this frame's batched drops (see droppedPaths above): a single
+    // dropped file behaves exactly as before (opens it, replacing the
+    // playlist); more than one appends them all to the playlist and starts
+    // playback on the first newly-added item.
+    if (droppedPaths.size() == 1) {
+      if (controller.openFile(droppedPaths[0])) {
+        controller.play();
+      }
+    } else if (droppedPaths.size() > 1) {
+      size_t firstNewIndex = controller.getPlaylist().size();
+      controller.getPlaylist().addMany(droppedPaths);
+      controller.persistPlaylistState();
+      controller.playlistPlayIndex(static_cast<int>(firstNewIndex));
     }
 
     // Auto-hide mouse cursor after 2.5s of inactivity when not interacting with ImGui
@@ -571,6 +651,12 @@ int main(int argc, char *argv[]) {
     // (the decode-based path runs on a background thread specifically so
     // opening a new file above never blocks this event loop).
     controller.pollPendingLoudnessPrescan();
+
+    // Auto-advances to the playlist's next item once playback reaches
+    // PlayerState::ENDED (no-op while the per-file Loop toggle is on, since
+    // that already keeps playback from ever reaching ENDED -- see
+    // PlayerController::pollPlaylistAutoAdvance()).
+    controller.pollPlaylistAutoAdvance();
 
     // 2. Decode Video Frames & Synchronize to Master Clock
     if (controller.hasVideo()) {

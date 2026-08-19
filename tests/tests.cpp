@@ -335,6 +335,7 @@ inline bool mock_SDL_Init(SDL_InitFlags flags) {
 #include "audio/AudioDecoder.cpp"
 #include "subtitle/SubtitleDecoder.cpp"
 #include "video/FrameExporter.hpp"
+#include "playlist/Playlist.hpp"
 #undef private
 
 // Simple assert helper
@@ -1739,6 +1740,207 @@ int main(int argc, char* argv[]) {
         test_assert(false, "Intentionally failing assert to cover exit(1) path");
     } catch (const std::exception& e) {
         std::cout << "Successfully covered assert exit(1) path: " << e.what() << std::endl;
+    }
+
+    // -------------------------------------------------------------
+    // Playlist unit tests (naikav::playlist::Playlist / PlaylistIO /
+    // MediaFileFilter). Pure logic, no SDL/FFmpeg dependency and no real
+    // media file needed -- placed here (before the `!testFile.empty()`
+    // block below) rather than at the end of main(), since that block's
+    // real-media-decode tests can throw and abort the rest of main() when
+    // no real test video is available (this run has none), which would
+    // otherwise skip these entirely.
+    // -------------------------------------------------------------
+    {
+        using naikav::playlist::MediaKind;
+        using naikav::playlist::Playlist;
+        using naikav::playlist::RepeatMode;
+
+        std::cout << "Running Playlist unit tests..." << std::endl;
+
+        // Real (empty) temp files so Playlist::add()'s isValid check (which
+        // does a real std::filesystem::exists()) sees them as present.
+        std::filesystem::path tmpDir =
+            std::filesystem::temp_directory_path() / "naikav_playlist_test";
+        std::error_code mkEc;
+        std::filesystem::create_directories(tmpDir, mkEc);
+
+        auto makeTempFile = [&](const std::string& name) -> std::string {
+            std::filesystem::path p = tmpDir / name;
+            std::ofstream(p.string()).put('x');
+            return p.string();
+        };
+
+        std::string fileA = makeTempFile("a.mp4");
+        std::string fileB = makeTempFile("b.mp3");
+        std::string fileC = makeTempFile("c.mkv");
+        std::string missingFile = (tmpDir / "does_not_exist.mp4").string();
+
+        // --- classifyMediaKind ---
+        test_assert(naikav::playlist::classifyMediaKind("movie.MP4") == MediaKind::Video,
+                    "classifyMediaKind: uppercase .MP4 -> Video");
+        test_assert(naikav::playlist::classifyMediaKind("song.flac") == MediaKind::Audio,
+                    "classifyMediaKind: .flac -> Audio");
+        test_assert(naikav::playlist::classifyMediaKind("readme.txt") == MediaKind::Unknown,
+                    "classifyMediaKind: .txt -> Unknown");
+        test_assert(naikav::playlist::classifyMediaKind("no_extension") == MediaKind::Unknown,
+                    "classifyMediaKind: no extension -> Unknown");
+
+        // --- add / addMany / clear basics ---
+        {
+            Playlist pl;
+            test_assert(pl.empty(), "New playlist is empty");
+            auto item = pl.add(fileA);
+            test_assert(pl.size() == 1, "add(): size becomes 1");
+            test_assert(item.isValid, "add(): existing file is valid");
+            test_assert(item.kind == MediaKind::Video, "add(): fileA classified as Video");
+
+            pl.addMany({fileB, fileC});
+            test_assert(pl.size() == 3, "addMany(): size becomes 3");
+
+            pl.clear();
+            test_assert(pl.empty(), "clear(): playlist becomes empty");
+            test_assert(!pl.currentItem().has_value(), "clear(): currentItem() is nullopt");
+        }
+
+        // --- removeAt on current item: next remaining item becomes current ---
+        {
+            Playlist pl;
+            pl.addMany({fileA, fileB, fileC});
+            pl.setCurrentIndex(1); // fileB
+            uint64_t idOfC = pl.items()[2].id;
+
+            bool removed = pl.removeAt(1); // remove fileB (current)
+            test_assert(removed, "removeAt(current index) returns true");
+            test_assert(pl.size() == 2, "removeAt(): size decreases");
+            test_assert(pl.currentItem().has_value() && pl.currentItem()->id == idOfC,
+                        "removeAt(current): item that slid into the slot (fileC) becomes current");
+
+            // Removing the last remaining current item clears current.
+            pl.setCurrentIndex(1);
+            pl.removeAt(1);
+            pl.removeAt(0);
+            test_assert(pl.empty() && !pl.currentItem().has_value(),
+                        "removeAt(): removing the only item clears current");
+        }
+
+        // --- move() preserves current-item identity across reordering ---
+        {
+            Playlist pl;
+            pl.addMany({fileA, fileB, fileC});
+            pl.setCurrentIndex(0); // fileA
+            uint64_t currentId = pl.currentItem()->id;
+
+            bool moved = pl.move(0, 2); // move fileA to the end
+            test_assert(moved, "move() returns true");
+            test_assert(pl.items()[2].id == currentId, "move(): item physically relocated to new index");
+            test_assert(pl.currentItem().has_value() && pl.currentItem()->id == currentId,
+                        "move(): current item identity unchanged after reorder");
+            test_assert(pl.getCurrentIndex() == 2, "move(): getCurrentIndex() reflects the new position");
+        }
+
+        // --- next()/previous() wraparound per RepeatMode ---
+        {
+            Playlist pl;
+            pl.addMany({fileA, fileB, fileC});
+
+            // RepeatMode::Off: stops at the end, doesn't wrap.
+            pl.setRepeatMode(RepeatMode::Off);
+            pl.setCurrentIndex(0);
+            auto n1 = pl.next();
+            auto n2 = pl.next();
+            test_assert(n1.has_value() && n1->path == fileB, "Off: next() from 0 -> fileB");
+            test_assert(n2.has_value() && n2->path == fileC, "Off: next() from 1 -> fileC");
+            auto n3 = pl.next(); // past the end
+            test_assert(!n3.has_value(), "Off: next() past the last item returns nullopt");
+            test_assert(pl.getCurrentIndex() == 2, "Off: current index stays on the last item after a failed next()");
+
+            // RepeatMode::All: wraps around in both directions.
+            pl.setRepeatMode(RepeatMode::All);
+            pl.setCurrentIndex(2); // last item
+            auto wrapNext = pl.next();
+            test_assert(wrapNext.has_value() && wrapNext->path == fileA,
+                        "All: next() from last item wraps to first");
+            pl.setCurrentIndex(0);
+            auto wrapPrev = pl.previous();
+            test_assert(wrapPrev.has_value() && wrapPrev->path == fileC,
+                        "All: previous() from first item wraps to last");
+
+            // RepeatMode::One: replays the same item regardless of direction.
+            pl.setRepeatMode(RepeatMode::One);
+            pl.setCurrentIndex(1);
+            auto same1 = pl.next();
+            auto same2 = pl.previous();
+            test_assert(same1.has_value() && same1->path == fileB, "One: next() replays current item");
+            test_assert(same2.has_value() && same2->path == fileB, "One: previous() replays current item");
+        }
+
+        // --- next()/previous() skip invalid entries; all-invalid -> nullopt ---
+        {
+            Playlist pl;
+            pl.addMany({fileA, missingFile, fileC});
+            test_assert(!pl.items()[1].isValid, "addMany(): missing file is marked isValid=false");
+
+            pl.setRepeatMode(RepeatMode::Off);
+            pl.setCurrentIndex(0);
+            auto skipped = pl.next();
+            test_assert(skipped.has_value() && skipped->path == fileC,
+                        "next() skips over an invalid entry");
+
+            Playlist allInvalid;
+            allInvalid.addMany({missingFile});
+            allInvalid.setCurrentIndex(0);
+            auto none = allInvalid.next();
+            test_assert(!none.has_value(), "next() on an all-invalid list returns nullopt, not an infinite loop");
+        }
+
+        // --- shuffle produces a full permutation before repeating ---
+        {
+            Playlist pl;
+            pl.addMany({fileA, fileB, fileC});
+            pl.setRepeatMode(RepeatMode::All);
+            pl.setShuffle(true);
+            pl.setCurrentIndex(0);
+
+            std::vector<std::string> visited;
+            visited.push_back(pl.currentItem()->path);
+            for (int i = 0; i < 2; ++i) {
+                auto item = pl.next();
+                test_assert(item.has_value(), "shuffle: next() keeps producing items under RepeatMode::All");
+                visited.push_back(item->path);
+            }
+            std::sort(visited.begin(), visited.end());
+            std::vector<std::string> expected = {fileA, fileB, fileC};
+            std::sort(expected.begin(), expected.end());
+            test_assert(visited == expected,
+                        "shuffle: three next() calls visit all three items exactly once");
+        }
+
+        // --- M3U/M3U8 round-trip ---
+        {
+            Playlist pl;
+            pl.addMany({fileA, fileB, fileC});
+            std::string m3uPath = (tmpDir / "roundtrip.m3u8").string();
+            pl.saveM3U(m3uPath);
+
+            Playlist reloaded;
+            bool loaded = reloaded.loadM3U(m3uPath);
+            test_assert(loaded, "loadM3U(): successfully loads a saved playlist");
+            test_assert(reloaded.size() == 3, "loadM3U(): round-trip preserves item count");
+            test_assert(reloaded.items()[0].path == fileA &&
+                        reloaded.items()[1].path == fileB &&
+                        reloaded.items()[2].path == fileC,
+                        "loadM3U(): round-trip preserves paths and order");
+            for (const auto& it : reloaded.items()) {
+                test_assert(it.isValid, "loadM3U(): round-tripped entries for existing files are valid");
+            }
+        }
+
+        // Clean up temp files.
+        std::error_code rmEc;
+        std::filesystem::remove_all(tmpDir, rmEc);
+
+        std::cout << "Playlist unit tests PASSED!" << std::endl;
     }
 
     // 7. Run additional coverage tests to hit remaining uncovered branches!
