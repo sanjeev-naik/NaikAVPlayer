@@ -36,6 +36,7 @@ NaikAVPlayer is a native, multi-threaded C++17 media engine and video player bui
 - **Auto-Pause on File Selection:** Automatically pauses background audio and video playback whenever the native file explorer dialog is opened, preserving the exact playback position and keeping the audio silent while browsing.
 - **Software Volume Attenuation:** Scalable audio output level adjustments with memcpy/memset bypasses for 100% and 0% volume states.
 - **Loop Playback:** Wraparound seek to 0.0 upon reaching end-of-file for continuous playback, toggleable via the controls dock `[Loop]` icon button and `L` hotkey.
+- **Playlist:** Build a queue of local media files — multi-select "Add Files" dialog, non-recursive "Add Folder" directory scan, or dropping more than one file onto the window at once — with drag-to-reorder, per-row removal, and double-click-to-play, via the `[Playlist]` button in the controls dock or the `P` hotkey. `Off` / `All` / `One` repeat modes plus a Shuffle toggle govern auto-advance once playback naturally reaches end-of-file, independent of the per-file `[Loop]` button above (which always just repeats the current file and takes priority while it's on). Playlist contents and repeat/shuffle state persist across restarts as standard M3U8 (`playlist.m3u8`).
 - **Native File Picker:** Cross-platform native file picker integration using `nativefiledialog-extended` (NFD) on Win32 and GTK3/Portal backends.
 - **Pipeline Diagnostics & System Info HUD:** Real-time overlay (`--metrics` or `D` key) displaying active player states, media telemetry (native vs. playback resolution, pixel format, hardware vs. software decoder type), Color & HDR pipeline characteristics (Color Space, Primaries, TRC, Range, Chroma Subsampling, Bit Depth, HDR10/HDR10+/Dolby Vision/HLG standard), pipeline queue depth levels, decode/render frame pacing budgets, and rolling clock synchronization offsets.
 - **Audio Processing Panel:** Dedicated overlay (`A` key) for the full DSP chain (EQ, noise gate, compressor, multiband compressor, limiter, crossover, loudness, 3D surround, widener, balance), a live FFT spectrum visualizer, plus channel/output-device/bit-depth/resampler-quality selection, separate from the diagnostics HUD.
@@ -59,6 +60,7 @@ src/
 ├── core/      ThreadSafeQueue.hpp, MetricRing.hpp, PipelineMetrics.hpp
 ├── media/     Demuxer.{hpp,cpp} — packet reading, multi-stream track enumeration and routing
 ├── player/    PlayerController.{hpp,cpp} — state machine, track switching, seeking, settings persistence
+├── playlist/  header-only Playlist module (queue, repeat/shuffle, M3U8 I/O — see Playlist & Auto-Advance below)
 ├── subtitle/  SubtitleDecoder.{hpp,cpp}, SubtitleTrack.hpp — decoding, parsing, sync, sanitization
 ├── ui/        PlayerUI.{hpp,cpp} — ImGui controls dock, diagnostics HUD, audio panel, subtitle overlay
 └── video/     VideoDecoder.{hpp,cpp} — HW/SW decode, frame conversion
@@ -202,14 +204,24 @@ TPDF Dither → device-format truncation (16-bit int / 32-bit int / 32-bit float
 > [!NOTE]
 > **Not implemented (deliberately scoped out):**
 > - **HRTF/binaural rendering** — the existing "3D Surround"/Virtual Surround features are hand-rolled ambience/positional-cue synthesis, explicitly *not* real HRTF (no licensed decoder or measured head-related impulse response data involved, and this project doesn't vendor one). Real HRTF rendering needs an actual measured HRIR dataset (e.g. MIT KEMAR, SADIE, CIPIC) to convolve against, which is a data/licensing decision for a future contribution, not something fabricated here.
-> - **Gapless playback & crossfade** — both need a real playlist/track-queue engine, which doesn't exist yet (NaikAVPlayer is currently a single-file player). A meaningful gapless/crossfade implementation is a larger architectural addition (queue management, cross-instance `AudioDecoder` handoff, a crossfade DSP stage) than the rest of the DSP chain above and is left for a future iteration.
+> - **Gapless playback & crossfade** — a real playlist/track-queue engine now exists (see [Playlist & Auto-Advance](#playlist--auto-advance) below), but true sample-accurate gapless transitions and crossfade need cross-instance `AudioDecoder` handoff and a crossfade DSP stage on top of it, which is a larger architectural addition than the rest of the DSP chain above and is left for a future iteration. Today's playlist auto-advance opens and starts the next file the same way manually opening a new file does (brief re-init gap, no crossfade).
+
+### Playlist & Auto-Advance
+
+`PlayerController` owns a header-only `naikav::playlist::Playlist` (`src/playlist/`, no SDL/FFmpeg/ImGui dependency) tracking the queued items, `RepeatMode` (`Off`/`All`/`One`), and shuffle state. The current item is tracked by a stable id assigned on insert rather than a raw index, so it survives reordering and removal of other items without index-arithmetic bookkeeping.
+
+- **Auto-advance**: `PlayerController::pollPlaylistAutoAdvance()`, called once per frame from the main loop, checks for the `ENDED` state (see [State Machine Transitions](#state-machine-transitions) below) and, if reached, advances via `Playlist::next()` and opens/plays the result the same way any other file open does — never touching the packet queues directly. `next()`/`previous()` automatically skip entries marked invalid (e.g. a file referenced by a loaded M3U that's since been moved or deleted) instead of getting stuck on them.
+- **Loop interaction**: the per-file `[Loop]` toggle is unchanged and independent — playback never reaches `ENDED` while it's on (it wraps via `instantSeek(0.0)` first), so the playlist's own repeat mode only takes effect once `[Loop]` is off.
+- **Opening a file resets the playlist to just that file**: `openFile(path, resetPlaylist = true)` is the default for the CLI argument, a single drag-and-drop, and the "Open File" dialog, so what's "playing" and what's "in the playlist" never disagree. Playlist-driven navigation calls `openFile(path, false)` instead.
+- **Multi-file drag-and-drop**: SDL3 delivers one drop event per dropped file within the same poll batch; these are now collected and, if more than one, appended to the playlist as a batch (dropping exactly one file keeps the original single-file-open behavior).
+- **Persistence**: playlist contents save as `playlist.m3u8` (standard M3U8, so it also opens correctly in other players); the current index, repeat mode, and shuffle flag are three additional `key=value` lines in `player_settings.txt`, following that file's existing forward/backward-compatible format. Both save immediately on every playlist mutation, and load once at startup without auto-playing.
 
 ### State Machine Transitions
 * **`UNINITIALIZED`**: Initial state. Loading media starts background demuxing and transitions to `OPENED`.
 * **`OPENED`**: Media metadata loaded; decoders initialized; initial frame rendered. Triggering `play()` transitions to `PLAYING`.
 * **`PLAYING`**: Audio output unpaused; main loop syncs video frames to the master clock.
 * **`PAUSED`**: Audio device paused; current clock frozen.
-* **`ENDED`**: Demuxer hits EOF and packet queues drain. If **Loop Mode** is enabled, reaching EOF directly invokes `seek(0.0)` to restart playback continuously.
+* **`ENDED`**: Demuxer hits EOF and packet queues drain. If **Loop Mode** is enabled, reaching EOF directly invokes `seek(0.0)` to restart playback continuously; otherwise, if a playlist item follows (per its repeat/shuffle state), `pollPlaylistAutoAdvance()` opens and plays it on the next frame.
 * **`ERROR_STATE`**: Entered on demuxing/decoder failure, releasing resources safely.
 
 ---
@@ -242,7 +254,7 @@ NaikAVPlayer supports building natively from source across host operating system
 | **Fedora / RHEL** | GCC 9+ | CMake 3.16+ | `dnf` |
 | **Arch Linux** | GCC 13+ / Clang 16+ | CMake 3.16+ | `pacman` |
 | **Windows** | MSVC 2019+ or MinGW-w64 GCC | CMake 3.16+ | Visual Studio / MSYS2 |
-| **macOS** | Apple Clang 12+ / GCC | CMake 3.16+ | Homebrew |
+
 
 #### Dependency Installation
 
@@ -461,39 +473,12 @@ effect when launched by double-click, and ignored on Linux.
 | **`[`** / **`]`** | Decrease / Increase playback speed by 0.25x (0.25x – 2.0x) |
 | **`Backspace`** | Reset playback speed to normal (1.0x) |
 | **`L`** | Toggle Continuous Loop Mode |
+| **`P`** | Toggle Playlist Panel |
 | **`D`** | Toggle Diagnostics HUD & Telemetry Metrics |
 | **`A`** | Toggle Audio Processing Panel (EQ, Noise Gate, Compressor, Multiband, Limiter, Crossover, Loudness, Surround, Balance, Channel/Device/Format Selection) |
 | **`Escape`** | Exit Fullscreen (if in fullscreen) or Exit Application |
 
 
-
----
-
-## Troubleshooting
-
-### `Could not initialize SDL3: No available audio device` (Linux)
-
-This means SDL3 was compiled with only its `dummy`/`disk` audio drivers, because `libasound2-dev` / `libpipewire-0.3-dev` (or `libpulse-dev`) weren't present when the project was configured — see the [Dependency Installation](#dependency-installation) note above. CMake now catches this itself: configuring on Linux without any of those `pkg-config` modules available fails immediately with instructions, instead of producing a build that only breaks at runtime. If you hit this on an existing build tree, install the missing package(s) and reconfigure (`cmake -B build ...` again) so SDL3's own dependency detection re-runs; a plain `cmake --build` does not re-check `pkg-config`.
-
-### `h264_v4l2m2m unavailable` / falls back to software decode on Raspberry Pi 5
-
-This is expected on Raspberry Pi 5 and is not a bug. The Pi 5's SoC (BCM2712) only exposes a hardware **HEVC/H.265** decode block (`rpi-hevc-dec`, visible as `/dev/video19`); unlike the Pi 4 (BCM2711), it has **no hardware H.264 M2M decoder**. FFmpeg's `h264_v4l2m2m` decoder therefore can't find a matching V4L2 device, and `NaikAVPlayer`'s [Dynamic Hardware Decoder Fallback](#dynamic-hardware-decoder-fallback) correctly drops to software `h264` decoding, as logged. The Pi 5's Cortex-A76 cores decode 1080p H.264 in software without issue; only very high bitrate/resolution H.264 content may need to be transcoded to HEVC to make use of hardware decode.
-
-### Crackling / clicking audio during otherwise normal playback
-
-Fixed. `swr_convert()` returning **0** — the normal state while the resampler is still filling its internal buffer — was only handled for the `< 0` (genuine error) case. A zero-sample result fell through to setting the internal audio buffer size to zero, which the SDL audio callback cannot distinguish from a starved packet queue, so it wrote a full block of digital silence into a perfectly healthy stream. Each of those blocks is a hard discontinuity in the output: an audible click.
-
-Since libsoxr's internal latency grows with its precision setting, the severity scaled directly with **Resampler Quality**, and it only occurred when the source sample rate differed from the 48 kHz output — so 44.1 kHz content (most music) at the *Very High* tier was the worst case. Measured there: **17.25% of all audio callbacks** emitted silence while the audio packet queue sat at 149/150 the entire time. After the fix: **0.00%**, verified across mono, stereo and 5.1 sources. The always-on underrun counters (M10-M12) that quantify this are described in [help.md Section 8](help.md#8-pipeline-instrumentation--metrics-reference).
-
-### Audio sounds distorted, harsh, or pumping (not clicking)
-
-This is gain staging, not a pipeline defect. Parametric EQ bands overlap and stack — five bands at +6 dB each is roughly **+10 to +15 dB broadband**, not +6 dB — which pushes normal material well past full scale and leaves the limiters in continuous heavy gain reduction. Loudness normalization can apply up to a further +24 dB.
-
-Press **Flat** in the Audio Processing panel, or delete `player_settings.txt` and relaunch. Be aware that the master **Enable Audio Processing** checkbox is not enough on its own: loudness normalization, 3D surround, stereo widener, balance and the spectrum analyzer sit deliberately *outside* it (it gates only EQ / noise gate / compressor / multiband / limiter / crossover), so each has to be disabled separately.
-
-### Playback freezes / whole system appears to hang after rapid seeking or seeking while paused
-
-Fixed. This was caused by the demuxer thread — the single thread that reads both the video and audio streams — blocking indefinitely on a plain `push()` into the audio packet queue whenever nothing was draining it (audio is muted during a seek catch-up, and stays paused for as long as playback is paused). Once blocked there, it stopped calling `av_read_frame` entirely, so the video packet queue and decoded frame queue also drained to empty and playback appeared to hang. The only thing that used to "fix" it was issuing another seek, which happened to force a queue `clear()` that woke the blocked push. See [Stall-Proof Queue Backpressure](#stall-proof-queue-backpressure-deadlock-prevention) above for the fix — the pipeline now self-recovers from rapid seek storms and paused-seek sequences without any further nudge.
 
 ---
 

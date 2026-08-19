@@ -235,6 +235,13 @@ void PlayerUI::draw(int windowWidth, int windowHeight,
     drawAudioSettingsPanel(windowWidth, windowHeight);
   }
 
+  // 3c. Playlist Panel -- unlike the panels above, available even before a
+  // file is opened, since it's how a playlist gets built/started in the
+  // first place.
+  if (m_showPlaylistPanel) {
+    drawPlaylistPanel(windowWidth, windowHeight);
+  }
+
   // 4. Bottom Controls Bar Dock
   if (state != PlayerState::UNINITIALIZED && m_controlsVisible) {
     drawControlsBar(windowWidth, windowHeight);
@@ -502,6 +509,23 @@ bool PlayerUI::drawIconButton(const char *str_id, IconType icon, ImVec2 size) {
                       color, 1.2f);
     break;
   }
+  case IconType::Playlist: {
+    float r = sz * 0.5f;
+    float lineL = center.x - r * 0.9f;
+    float lineR = center.x + r * 0.45f;
+    const float lineY[3] = {center.y - r * 0.55f, center.y, center.y + r * 0.55f};
+    for (float y : lineY) {
+      drawList->AddLine(ImVec2(lineL, y), ImVec2(lineR, y), color, 1.6f);
+    }
+    // Small play marker to the right of the list lines
+    float triR = r * 0.32f;
+    ImVec2 tCenter(center.x + r * 0.72f, center.y);
+    ImVec2 p1(tCenter.x - triR * 0.5f, tCenter.y - triR * 0.75f);
+    ImVec2 p2(tCenter.x - triR * 0.5f, tCenter.y + triR * 0.75f);
+    ImVec2 p3(tCenter.x + triR * 0.75f, tCenter.y);
+    drawList->AddTriangleFilled(p1, p2, p3, color);
+    break;
+  }
   }
 
   ImGui::PopID();
@@ -510,16 +534,24 @@ bool PlayerUI::drawIconButton(const char *str_id, IconType icon, ImVec2 size) {
 
 void PlayerUI::drawWelcomeHUD(int windowWidth, int windowHeight) {
   // Centered modern onboarding panel
-  float cardWidth = 650.0f;
-  float cardHeight = 360.0f;
+  float cardWidth = 700.0f;
+  float cardHeight = 400.0f;
   ImGui::SetNextWindowPos(ImVec2((windowWidth - cardWidth) * 0.5f,
                                  (windowHeight - cardHeight) * 0.5f));
   ImGui::SetNextWindowSize(ImVec2(cardWidth, cardHeight));
 
+  // ImGuiWindowFlags_NoNav: this is the only window shown before a file is
+  // opened, and without opting out of keyboard nav it silently claims
+  // io.WantCaptureKeyboard (see ImGui's io.NavActive) as soon as it's
+  // focused -- which it always is, being the sole window -- blocking every
+  // hotkey in main.cpp's `!io.WantCaptureKeyboard`-gated switch, including
+  // the ones (like Playlist's `P`) that are meant to work before any media
+  // is loaded. The single "Open Media File" button still works fine via
+  // mouse click; only Tab-based keyboard navigation onto it is disabled.
   ImGui::Begin("Welcome HUD", nullptr,
                ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
                    ImGuiWindowFlags_NoResize |
-                   ImGuiWindowFlags_NoSavedSettings);
+                   ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav);
 
   // Draw vector icon (Play button inside a sleek glowing circle)
   ImDrawList *drawList = ImGui::GetWindowDrawList();
@@ -593,19 +625,31 @@ void PlayerUI::drawWelcomeHUD(int windowWidth, int windowHeight) {
     ImGui::SameLine(0.0f, 0.0f);
   };
 
-  // Centering the shortcut display
-  float rowWidth =
+  // Centering the shortcut display -- split across two rows so the full
+  // set fits within cardWidth instead of overflowing/clipping past the
+  // card's edges the way a single row of this many entries would.
+  float row1Width =
       ImGui::CalcTextSize(
-          " [Space] Play/Pause    [<- / ->] Seek 10s    [ [ / ] ] Speed    [B] Audio    [V] Subtitles    [G/H] Sub Delay    [F11] Fullscreen    [M] Mute    [Up/Down] Vol    [S] Screenshot    [L] Loop    [Esc] Exit")
+          " [Space] Play/Pause    [<- / ->] Seek 10s    [ [ / ] ] Speed    [B] Audio    [V] Subtitles    [P] Playlist    [G/H] Sub Delay")
           .x;
-  ImGui::SetCursorPosX((cardWidth - rowWidth) * 0.5f);
+  ImGui::SetCursorPosX((cardWidth - row1Width) * 0.5f);
 
   renderKey("Space", "Play/Pause");
   renderKey("<- / ->", "Seek 10s");
   renderKey("[ / ]", "Speed -/+");
   renderKey("B", "Audio");
   renderKey("V", "Subtitles");
+  renderKey("P", "Playlist");
   renderKey("G/H", "Sub Delay");
+
+  ImGui::NewLine(); // terminate the first row's SameLine chain
+
+  float row2Width =
+      ImGui::CalcTextSize(
+          " [F11] Fullscreen    [M] Mute    [Up/Down] Vol    [S] Screenshot    [L] Loop    [Esc] Exit")
+          .x;
+  ImGui::SetCursorPosX((cardWidth - row2Width) * 0.5f);
+
   renderKey("F11", "Fullscreen");
   renderKey("M", "Mute");
   renderKey("Up/Down", "Vol");
@@ -613,7 +657,7 @@ void PlayerUI::drawWelcomeHUD(int windowWidth, int windowHeight) {
   renderKey("L", "Loop");
   renderKey("Esc", "Exit");
 
-  ImGui::NewLine(); // terminate the SameLine loop
+  ImGui::NewLine(); // terminate the second row's SameLine chain
 
   if (m_hudFont)
     ImGui::PopFont();
@@ -1171,6 +1215,7 @@ void PlayerUI::drawControlsBar(int windowWidth, int windowHeight) {
   const float speedButtonWidth = 32.0f;
   const float audioTrackButtonWidth = 32.0f;
   const float subButtonWidth = 32.0f;
+  const float playlistButtonWidth = 32.0f;
   const float eqButtonWidth = 32.0f;
   const float muteButtonWidth = 32.0f;
   const float volumeSliderWidth = 70.0f;
@@ -1189,8 +1234,8 @@ void PlayerUI::drawControlsBar(int windowWidth, int windowHeight) {
                                   stopBtnWidth + groupItemSpacing + seekBtnWidth + groupItemSpacing + loopBtnWidth;
 
   float rightGroupWidth = resolutionGroupWidth + speedButtonWidth + audioTrackButtonWidth + subButtonWidth +
-                          eqButtonWidth + muteButtonWidth + volumeSliderWidth +
-                          groupItemSpacing * 6.0f;
+                          playlistButtonWidth + eqButtonWidth + muteButtonWidth + volumeSliderWidth +
+                          groupItemSpacing * 7.0f;
 
   float minCenterX = openButtonWidth + 16.0f;
   float maxCenterX = barWidth - rightGroupWidth - centerButtonsGroupWidth - barRightPadding - 10.0f;
@@ -1540,6 +1585,28 @@ void PlayerUI::drawControlsBar(int windowWidth, int windowHeight) {
     ImGui::TextColored(ImVec4(0.00f, 0.83f, 0.88f, 1.00f), "%s", delayBuf);
 
     ImGui::EndPopup();
+  }
+
+  ImGui::SameLine(0.0f, groupItemSpacing);
+
+  // Playlist button -- toggles the persistent playlist panel (same simple
+  // toggle idiom as the EQ button below, not a transient popup menu, since
+  // the panel's toolbar/reorderable list is too heavy for a dropdown).
+  // The highlight state is snapshotted before the click so a toggle inside
+  // this block can't unbalance the Push/Pop pair (matches the Loop button's
+  // loopEnabled snapshot above).
+  bool playlistButtonHighlighted = m_showPlaylistPanel;
+  if (playlistButtonHighlighted) {
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.53f, 0.90f, 0.80f));
+  }
+  if (drawIconButton("##playlist_btn", IconType::Playlist, ImVec2(playlistButtonWidth, 28))) {
+    togglePlaylistPanel();
+  }
+  if (playlistButtonHighlighted) {
+    ImGui::PopStyleColor();
+  }
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("Playlist - [P]");
   }
 
   ImGui::SameLine(0.0f, groupItemSpacing);
@@ -2502,6 +2569,196 @@ void PlayerUI::drawAudioSettingsPanel(int windowWidth, int windowHeight) {
     // it can't cause an audio dropout.
     m_controller.setAudioDspSettings(s);
     m_controller.persistAudioDspSettings();
+  }
+
+  if (m_hudFont)
+    ImGui::PopFont();
+
+  ImGui::End();
+}
+
+void PlayerUI::drawPlaylistPanel(int windowWidth, int windowHeight) {
+  if (!m_showPlaylistPanel)
+    return;
+
+  float panelWidth = 420.0f;
+  float panelHeight = windowHeight - 80.0f;
+  if (panelHeight < 320.0f) panelHeight = 320.0f;
+  if (panelHeight > 640.0f) panelHeight = 640.0f;
+
+  ImGui::SetNextWindowPos(ImVec2(windowWidth - panelWidth - 20.0f, 60.0f), ImGuiCond_FirstUseEver);
+  ImGui::SetNextWindowSize(ImVec2(panelWidth, panelHeight), ImGuiCond_FirstUseEver);
+
+  // ImGuiWindowFlags_NoNav: without this, having the panel focused (e.g.
+  // while browsing the list) claims io.WantCaptureKeyboard the same way the
+  // Welcome HUD does (see the comment there), blocking Space/seek/`P`/etc.
+  // globally while the panel is open. Mouse interaction with every widget
+  // here (buttons, combo, checkbox, row selection, drag-reorder) is
+  // unaffected -- only Tab-based keyboard navigation between them is
+  // disabled. IsKeyPressed(ImGuiKey_Delete) below reads raw key state
+  // directly, not through nav, so row deletion still works.
+  if (!ImGui::Begin("Playlist", &m_showPlaylistPanel,
+                     ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav)) {
+    ImGui::End();
+    return;
+  }
+
+  if (m_hudFont)
+    ImGui::PushFont(m_hudFont);
+
+  auto& playlist = m_controller.getPlaylist();
+
+  // --- Toolbar ---
+  if (ImGui::Button("Add Files...")) {
+    if (m_multiFileDialogCallback) {
+      std::vector<std::string> paths = m_multiFileDialogCallback();
+      if (!paths.empty()) {
+        playlist.addMany(paths);
+        m_controller.persistPlaylistState();
+      }
+    }
+  }
+  ImGui::SameLine();
+  if (ImGui::Button("Add Folder...")) {
+    if (m_folderDialogCallback) {
+      std::string dir = m_folderDialogCallback();
+      if (!dir.empty()) {
+        size_t added = playlist.addFolder(dir);
+        m_controller.persistPlaylistState();
+        if (added == 0) {
+          showToast("No supported media files found in that folder", true, 2.5);
+        }
+      }
+    }
+  }
+  ImGui::SameLine();
+  if (ImGui::Button("Clear")) {
+    playlist.clear();
+    m_playlistSelectedRow = -1;
+    m_controller.persistPlaylistState();
+  }
+
+  const char* repeatLabels[] = {"Repeat: Off", "Repeat: All", "Repeat: One"};
+  int repeatIdx = static_cast<int>(playlist.getRepeatMode());
+  ImGui::SetNextItemWidth(140.0f);
+  if (ImGui::Combo("##repeat_mode", &repeatIdx, repeatLabels, 3)) {
+    playlist.setRepeatMode(static_cast<naikav::playlist::RepeatMode>(repeatIdx));
+    m_controller.persistPlaylistState();
+  }
+  ImGui::SameLine();
+  bool shuffle = playlist.isShuffle();
+  if (ImGui::Checkbox("Shuffle", &shuffle)) {
+    playlist.setShuffle(shuffle);
+    m_controller.persistPlaylistState();
+  }
+
+  ImGui::Separator();
+
+  if (ImGui::Button("|< Prev")) {
+    m_controller.playlistPrevious();
+  }
+  ImGui::SameLine();
+  if (ImGui::Button("Next >|")) {
+    m_controller.playlistNext();
+  }
+  ImGui::SameLine();
+  ImGui::TextDisabled("%d item%s", static_cast<int>(playlist.size()),
+                      playlist.size() == 1 ? "" : "s");
+
+  ImGui::Separator();
+
+  // --- Reorderable list ---
+  int currentIndex = playlist.getCurrentIndex();
+  const auto& items = playlist.items();
+
+  ImGui::BeginChild("##playlist_items", ImVec2(0, 0), ImGuiChildFlags_Borders);
+  int removeIndex = -1;
+  int moveFrom = -1;
+  int moveTo = -1;
+  for (int i = 0; i < static_cast<int>(items.size()); ++i) {
+    const auto& item = items[static_cast<size_t>(i)];
+    ImGui::PushID(i);
+
+    bool isCurrent = (i == currentIndex);
+    bool isSelected = (i == m_playlistSelectedRow);
+
+    int colorsPushed = 0;
+    if (isCurrent) {
+      ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.00f, 0.83f, 0.88f, 1.00f));
+      ++colorsPushed;
+    } else if (!item.isValid) {
+      ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.9f, 0.3f, 0.3f, 1.0f));
+      ++colorsPushed;
+    }
+
+    const char* kindMark = (item.kind == naikav::playlist::MediaKind::Video)   ? "[V] "
+                            : (item.kind == naikav::playlist::MediaKind::Audio) ? "[A] "
+                                                                                 : "[?] ";
+    std::string label = std::string(kindMark) + item.displayName;
+    if (isCurrent) label += "  (playing)";
+    if (!item.isValid) label += "  (missing)";
+
+    float availWidth = ImGui::GetContentRegionAvail().x;
+    float removeBtnWidth = 22.0f;
+    if (ImGui::Selectable(label.c_str(), isSelected, 0,
+                          ImVec2(availWidth - removeBtnWidth - 4.0f, 0))) {
+      m_playlistSelectedRow = i;
+    }
+    if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+      m_controller.playlistPlayIndex(i);
+    }
+
+    // Drag-and-drop reordering: payload carries the source row index.
+    if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_None)) {
+      ImGui::SetDragDropPayload("NAIKAV_PLAYLIST_ROW", &i, sizeof(int));
+      ImGui::Text("%s", item.displayName.c_str());
+      ImGui::EndDragDropSource();
+    }
+    if (ImGui::BeginDragDropTarget()) {
+      if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("NAIKAV_PLAYLIST_ROW")) {
+        moveFrom = *static_cast<const int*>(payload->Data);
+        moveTo = i;
+      }
+      ImGui::EndDragDropTarget();
+    }
+
+    if (colorsPushed > 0) {
+      ImGui::PopStyleColor(colorsPushed);
+    }
+
+    ImGui::SameLine();
+    if (ImGui::SmallButton("x")) {
+      removeIndex = i;
+    }
+    if (ImGui::IsItemHovered()) {
+      ImGui::SetTooltip("Remove from playlist");
+    }
+
+    ImGui::PopID();
+  }
+
+  if (removeIndex >= 0) {
+    playlist.removeAt(removeIndex);
+    if (m_playlistSelectedRow == removeIndex) {
+      m_playlistSelectedRow = -1;
+    } else if (m_playlistSelectedRow > removeIndex) {
+      --m_playlistSelectedRow;
+    }
+    m_controller.persistPlaylistState();
+  } else if (moveFrom >= 0 && moveTo >= 0 && moveFrom != moveTo) {
+    playlist.move(moveFrom, moveTo);
+    m_controller.persistPlaylistState();
+  }
+
+  bool listFocused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
+  ImGui::EndChild();
+
+  if (listFocused && m_playlistSelectedRow >= 0 &&
+      static_cast<size_t>(m_playlistSelectedRow) < playlist.size() &&
+      ImGui::IsKeyPressed(ImGuiKey_Delete)) {
+    playlist.removeAt(m_playlistSelectedRow);
+    m_playlistSelectedRow = -1;
+    m_controller.persistPlaylistState();
   }
 
   if (m_hudFont)

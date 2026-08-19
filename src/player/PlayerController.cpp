@@ -43,6 +43,7 @@ PlayerController::PlayerController()
     m_subtitleQueue.attachDepthMirror(&m_metrics->m_subtitlePacketQueueDepth);
     m_decodedFrameQueue.attachDepthMirror(&m_metrics->m_decodedFrameQueueDepth);
     loadSettings();
+    loadPlaylistState();
 }
 
 PlayerController::~PlayerController() {
@@ -55,9 +56,16 @@ double PlayerController::getSystemTimeInSeconds() const {
     return std::chrono::duration<double>(duration).count();
 }
 
-bool PlayerController::openFile(const std::string& filename) {
+bool PlayerController::openFile(const std::string& filename, bool resetPlaylist) {
     // If a file is already loaded, close it first
     stop();
+
+    if (resetPlaylist) {
+        m_playlist.clear();
+        m_playlist.add(filename);
+        m_playlist.setCurrentIndex(0);
+        savePlaylistState();
+    }
 
     try {
         m_filename = filename;
@@ -176,6 +184,67 @@ bool PlayerController::openFile(const std::string& filename) {
         stop();
         m_state = PlayerState::ERROR_STATE;
         return false;
+    }
+}
+
+bool PlayerController::playlistPlayIndex(int index) {
+    if (index < 0 || static_cast<size_t>(index) >= m_playlist.size()) {
+        return false;
+    }
+    std::string path = m_playlist.items()[static_cast<size_t>(index)].path;
+    m_playlist.setCurrentIndex(index);
+    savePlaylistState();
+    bool opened = openFile(path, false);
+    if (opened) {
+        play();
+    }
+    return opened;
+}
+
+bool PlayerController::playlistNext() {
+    auto item = m_playlist.next();
+    savePlaylistState();
+    if (!item) return false;
+    bool opened = openFile(item->path, false);
+    if (opened) {
+        play();
+    }
+    return opened;
+}
+
+bool PlayerController::playlistPrevious() {
+    auto item = m_playlist.previous();
+    savePlaylistState();
+    if (!item) return false;
+    bool opened = openFile(item->path, false);
+    if (opened) {
+        play();
+    }
+    return opened;
+}
+
+void PlayerController::pollPlaylistAutoAdvance() {
+    if (m_state == PlayerState::UNINITIALIZED) {
+        return;
+    }
+    // Forces this frame's ENDED transition (see getCurrentTime()) to be
+    // evaluated before checking m_state below, so this method has no
+    // ordering dependency on whatever else calls getCurrentTime() this frame.
+    getCurrentTime();
+
+    if (m_state != PlayerState::ENDED) {
+        return;
+    }
+    // The existing per-file Loop toggle already keeps playback from ever
+    // reaching ENDED (see getCurrentTime()'s instantSeek(0.0) branch), so no
+    // explicit check is needed here -- reaching this point already means
+    // Loop is off (or there is no next item to loop to).
+    auto item = m_playlist.next();
+    if (!item) {
+        return; // end of list under RepeatMode::Off -- stay at ENDED, as today
+    }
+    if (openFile(item->path, false)) {
+        play();
     }
 }
 
@@ -1129,6 +1198,12 @@ void PlayerController::loadSettings() {
                 if (v >= 0 && v < static_cast<int>(ResamplerQuality::COUNT)) {
                     m_resamplerQuality = static_cast<ResamplerQuality>(v);
                 }
+            } else if (key == "playlist_current_index") {
+                m_pendingPlaylistCurrentIndex = std::stoi(value);
+            } else if (key == "playlist_repeat_mode") {
+                m_pendingPlaylistRepeatMode = std::stoi(value);
+            } else if (key == "playlist_shuffle") {
+                m_pendingPlaylistShuffle = (std::stoi(value) != 0);
             }
         } catch (const std::exception&) {
             // Malformed value for this key; skip it and keep going.
@@ -1191,7 +1266,30 @@ void PlayerController::saveSettings() {
     f << "output_bit_depth=" << static_cast<int>(m_outputBitDepth) << "\n";
     f << "output_device_name=" << m_outputDeviceName << "\n";
     f << "resampler_quality=" << static_cast<int>(m_resamplerQuality) << "\n";
+    f << "playlist_current_index=" << m_playlist.getCurrentIndex() << "\n";
+    f << "playlist_repeat_mode=" << static_cast<int>(m_playlist.getRepeatMode()) << "\n";
+    f << "playlist_shuffle=" << (m_playlist.isShuffle() ? 1 : 0) << "\n";
     std::cout << "Saved settings: ResolutionOption=" << static_cast<int>(m_resolutionOption.load()) << std::endl;
+}
+
+void PlayerController::loadPlaylistState() {
+    m_playlist.loadM3U("playlist.m3u8"); // no-op (leaves an empty playlist) if missing/empty
+
+    int repeatOrdinal = m_pendingPlaylistRepeatMode;
+    if (repeatOrdinal >= 0 && repeatOrdinal <= static_cast<int>(naikav::playlist::RepeatMode::One)) {
+        m_playlist.setRepeatMode(static_cast<naikav::playlist::RepeatMode>(repeatOrdinal));
+    }
+    m_playlist.setShuffle(m_pendingPlaylistShuffle);
+    if (m_pendingPlaylistCurrentIndex >= 0) {
+        m_playlist.setCurrentIndex(m_pendingPlaylistCurrentIndex);
+    }
+    // Deliberately does not auto-play -- matches today's "no CLI arg -> sit
+    // idle" behavior; the restored playlist just sits ready to resume from.
+}
+
+void PlayerController::savePlaylistState() {
+    m_playlist.saveM3U("playlist.m3u8");
+    saveSettings(); // also persists playlist_current_index/repeat_mode/shuffle
 }
 
 void PlayerController::setResolutionOption(ResolutionOption option) {

@@ -5,6 +5,7 @@
 #include <string>
 #include <functional>
 #include <deque>
+#include <vector>
 
 #include <imgui.h>
 
@@ -24,7 +25,8 @@ public:
         Loop,
         Subtitles,
         AudioTrack,
-        Speed
+        Speed,
+        Playlist
     };
 
 
@@ -33,8 +35,16 @@ private:
     std::function<std::string()> m_fileDialogCallback;
     std::function<std::string()> m_subtitleDialogCallback;
     std::function<std::string()> m_audioDialogCallback;
+    std::function<std::vector<std::string>()> m_multiFileDialogCallback;
+    std::function<std::string()> m_folderDialogCallback;
 
-    
+    // Playlist panel state. Row reordering itself is stateless (native
+    // ImGui drag-drop payload carries the source index) -- this just tracks
+    // which row is selected so Delete can remove it while the popup has
+    // focus.
+    int m_playlistSelectedRow = -1;
+
+
     // UI state variables
     float m_uiVolume;
     bool m_isMuted;
@@ -47,6 +57,7 @@ private:
     float m_savedVolume;
     bool m_showDiagnostics;
     bool m_showAudioSettings = false;
+    bool m_showPlaylistPanel = false;
 
     struct ClockOffsetSample {
         double timeStamp;
@@ -120,6 +131,11 @@ private:
     void drawDiagnosticsHUD(int windowWidth, int windowHeight);
     void drawAudioSettingsPanel(int windowWidth, int windowHeight);
     void drawToastNotification(int windowWidth, int windowHeight, double currentSystemTime);
+    // Persistent overlay panel (toolbar, reorderable list, per-row
+    // controls), gated by m_showPlaylistPanel -- same flag-gated idiom as
+    // drawAudioSettingsPanel/drawDiagnosticsHUD, toggled by the controls-bar
+    // Playlist button and the `P` hotkey (see togglePlaylistPanel()).
+    void drawPlaylistPanel(int windowWidth, int windowHeight);
 
     static bool drawIconButton(const char* str_id, IconType icon, ImVec2 size);
 
@@ -179,7 +195,15 @@ public:
     void setAudioDialogCallback(std::function<std::string()> callback) {
         m_audioDialogCallback = callback;
     }
-    
+    void setMultiFileDialogCallback(std::function<std::vector<std::string>()> callback) {
+        m_multiFileDialogCallback = callback;
+    }
+    void setFolderDialogCallback(std::function<std::string()> callback) {
+        m_folderDialogCallback = callback;
+    }
+
+    void togglePlaylistPanel() { m_showPlaylistPanel = !m_showPlaylistPanel; }
+
     // Draw the UI overlays. Called once per frame in the render loop.
     void draw(int windowWidth, int windowHeight, double currentSystemTime);
 

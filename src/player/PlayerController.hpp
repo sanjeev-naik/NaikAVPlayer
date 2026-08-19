@@ -15,6 +15,7 @@
 #include "subtitle/SubtitleTrack.hpp"
 #include "subtitle/SubtitleDecoder.hpp"
 #include "core/PipelineMetrics.hpp"
+#include "playlist/Playlist.hpp"
 #include <chrono>
 
 extern "C" {
@@ -138,8 +139,29 @@ private:
 
     std::atomic<ResolutionOption> m_resolutionOption;
 
+    naikav::playlist::Playlist m_playlist;
+
     void loadSettings();
     void saveSettings();
+
+    // Playlist persistence: contents saved as a sibling "playlist.m3u8"
+    // file (same flat-file-in-cwd convention as player_settings.txt --
+    // this codebase has no config-dir helper to hook into instead), plus
+    // repeat/shuffle/current-index as three extra keys appended to
+    // player_settings.txt via the existing key=value format. Called from
+    // every playlist-mutating wrapper below (add/remove/move/clear/repeat/
+    // shuffle/navigate), matching the "persist immediately" convention
+    // already used by setAudioChannelOption() etc.
+    void loadPlaylistState();
+    void savePlaylistState();
+
+    // Staging area for the three playlist_* keys loadSettings() reads out of
+    // player_settings.txt: at constructor time (loadSettings() runs first),
+    // m_playlist is still empty -- these are applied to m_playlist by
+    // loadPlaylistState() only after it has loaded playlist.m3u8's contents.
+    int m_pendingPlaylistCurrentIndex = -1;
+    int m_pendingPlaylistRepeatMode = 0;
+    bool m_pendingPlaylistShuffle = false;
 
     // Primes m_audioDecoder's loudness normalizer for the current file --
     // see LoudnessNormalizer's two-pass mode. Checks a ReplayGain/R128
@@ -204,7 +226,13 @@ public:
     PlayerController();
     ~PlayerController();
 
-    bool openFile(const std::string& filename);
+    // resetPlaylist=true (the default, used by the CLI arg / "Open File"
+    // dialog / single drag-drop) collapses the playlist to just this one
+    // file, matching how opening a file normally behaves outside of a
+    // playlist context. Playlist-driven navigation (playlistNext() /
+    // playlistPrevious() / playlistPlayIndex()) calls this with false so it
+    // doesn't clobber the list it's iterating.
+    bool openFile(const std::string& filename, bool resetPlaylist = true);
     void play();
     void pause();
     void seek(double seconds);
@@ -398,6 +426,35 @@ public:
         return m_hasExternalAudio;
     }
     std::string getActiveAudioTrackName() const;
+
+    // Playlist management APIs. UI-thread-only, single-writer/single-reader
+    // like the settings members above -- PlayerUI mutates the list directly
+    // through getPlaylist() (add/remove/move/repeat/shuffle are pure data
+    // operations with no playback side effect), then calls one of the
+    // playlistX() wrappers below when the mutation should also change what's
+    // playing. Every wrapper persists via savePlaylistState().
+    naikav::playlist::Playlist& getPlaylist() { return m_playlist; }
+    const naikav::playlist::Playlist& getPlaylist() const { return m_playlist; }
+
+    // Call after mutating getPlaylist() directly (add/remove/move/clear/
+    // setRepeatMode/setShuffle) so the change is persisted immediately,
+    // matching the rest of this class's "persist on every change" convention.
+    void persistPlaylistState() { savePlaylistState(); }
+
+    // Plays the item at the given display-order index: stop() + openFile(path,
+    // false) + play(), same sequencing as opening any other file -- never
+    // touches the packet queues directly.
+    bool playlistPlayIndex(int index);
+    bool playlistNext();
+    bool playlistPrevious();
+
+    // Called once per frame from the main loop. If playback has reached
+    // PlayerState::ENDED and the playlist has a next item (per its
+    // RepeatMode/shuffle state), advances to it automatically. No-op
+    // otherwise -- in particular, a no-op whenever the existing per-file
+    // Loop toggle (isLoopEnabled()) is on, since playback then never reaches
+    // ENDED in the first place (see getCurrentTime()).
+    void pollPlaylistAutoAdvance();
 
 
     // Queue depths
