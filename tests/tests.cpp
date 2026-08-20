@@ -6998,3 +6998,147 @@ int main(int argc, char* argv[]) {
                     // A. AudioTrackInfo struct tests
                     {
                         naikav::audio::AudioTrackInfo info;
+                        info.id = 0;
+                        info.title = "Main Audio";
+                        info.language = "eng";
+                        info.codecName = "aac";
+                        info.channels = 2;
+                        info.channelLayout = "stereo";
+                        info.sampleRate = 48000;
+                        info.bitRate = 128000;
+                        info.isDefault = true;
+                        info.isExternal = false;
+                        info.sourcePath = "";
+
+                        test_assert(info.id == 0, "AudioTrackInfo id set");
+                        test_assert(info.title == "Main Audio", "AudioTrackInfo title set");
+                        test_assert(info.language == "eng", "AudioTrackInfo language set");
+                        test_assert(info.codecName == "aac", "AudioTrackInfo codecName set");
+                        test_assert(info.channels == 2, "AudioTrackInfo channels set");
+                        test_assert(info.channelLayout == "stereo", "AudioTrackInfo channelLayout set");
+                        test_assert(info.sampleRate == 48000, "AudioTrackInfo sampleRate set");
+                        test_assert(info.bitRate == 128000, "AudioTrackInfo bitRate set");
+                        test_assert(info.isDefault, "AudioTrackInfo isDefault set");
+                        test_assert(!info.isExternal, "AudioTrackInfo isExternal false");
+                    }
+
+                    // B. PlayerController Audio Track APIs
+                    {
+                        PlayerController ctrl;
+                        test_assert(ctrl.getSelectedAudioTrack() == -1, "Initial audio track is -1");
+                        test_assert(ctrl.getAudioTracks().empty(), "Initial audio tracks list is empty");
+                        test_assert(!ctrl.hasExternalAudio(), "No external audio initially");
+                        test_assert(ctrl.getActiveAudioTrackName() == "Off", "Initial active audio track name is Off");
+
+                        // Select track when uninitialized
+                        bool selectOk = ctrl.selectAudioTrack(-1);
+                        test_assert(selectOk, "selectAudioTrack returns true when uninitialized to pre-set track");
+                        test_assert(ctrl.getSelectedAudioTrack() == -1, "Selected track is -1");
+
+                        // Load external audio with non-existent file
+                        bool extFail = ctrl.loadExternalAudio("non_existent_audio_file.mp3");
+                        test_assert(!extFail, "loadExternalAudio returns false for non-existent file");
+
+                        // Load real test audio
+                        std::string audioAsset = "assets/test_audio.mp3";
+                        if (!std::filesystem::exists(audioAsset)) {
+                            audioAsset = "../assets/test_audio.mp3";
+                        }
+                        if (!std::filesystem::exists(audioAsset)) {
+                            audioAsset = "../../assets/test_audio.mp3";
+                        }
+                        if (std::filesystem::exists(audioAsset)) {
+                            bool extOk = ctrl.loadExternalAudio(audioAsset);
+                            test_assert(extOk, "loadExternalAudio succeeds on valid audio file");
+                            test_assert(ctrl.hasExternalAudio(), "hasExternalAudio is true after load");
+                            test_assert(ctrl.getSelectedAudioTrack() == -2, "Selected audio track is -2 (external)");
+                            test_assert(!ctrl.getActiveAudioTrackName().empty(), "Active audio track name is not empty");
+                            test_assert(ctrl.getAudioTracks().size() >= 1, "getAudioTracks includes external track");
+
+                            // Switch to disabled (-1) and back to external (-2)
+                            ctrl.selectAudioTrack(-1);
+                            test_assert(ctrl.getSelectedAudioTrack() == -1, "Selected audio track is -1 (disabled)");
+                            test_assert(ctrl.getActiveAudioTrackName() == "Off", "Active audio track name is Off");
+
+                            ctrl.selectAudioTrack(-2);
+                            test_assert(ctrl.getSelectedAudioTrack() == -2, "Selected audio track is back to -2 (external)");
+
+                            // Remove external audio
+                            ctrl.removeExternalAudio();
+                            test_assert(!ctrl.hasExternalAudio(), "hasExternalAudio is false after remove");
+                            test_assert(ctrl.getSelectedAudioTrack() == -1, "Selected audio track reset to -1 after remove");
+                        }
+
+                        ctrl.stop();
+                        test_assert(!ctrl.hasExternalAudio(), "Stop clears external audio");
+                        test_assert(ctrl.getSelectedAudioTrack() == -1, "Stop resets selected audio track to -1");
+                    }
+
+                    // C. Audio Track Selection on Media with Embedded Audio
+                    if (!testFile.empty()) {
+                        PlayerController ctrl;
+                        if (ctrl.openFile(testFile)) {
+                            ctrl.play();
+                            auto tracks = ctrl.getAudioTracks();
+                            if (!tracks.empty()) {
+                                int defaultTrackId = ctrl.getSelectedAudioTrack();
+                                test_assert(defaultTrackId >= 0, "Selected audio track is non-negative for media with audio");
+                                test_assert(!ctrl.getActiveAudioTrackName().empty(), "Active audio track name is valid");
+
+                                // Select disabled (-1)
+                                ctrl.selectAudioTrack(-1);
+                                test_assert(ctrl.getSelectedAudioTrack() == -1, "Audio stream muted/disabled (-1)");
+                                test_assert(ctrl.getActiveAudioTrackName() == "Off", "Active track name is Off");
+
+                                // Re-select default track
+                                ctrl.selectAudioTrack(defaultTrackId);
+                                test_assert(ctrl.getSelectedAudioTrack() == defaultTrackId, "Re-selected default embedded audio track");
+                            }
+
+                            // Load external audio while video is playing
+                            std::string audioAsset = "assets/test_audio.mp3";
+                            if (!std::filesystem::exists(audioAsset)) {
+                                audioAsset = "../assets/test_audio.mp3";
+                            }
+                            if (!std::filesystem::exists(audioAsset)) {
+                                audioAsset = "../../assets/test_audio.mp3";
+                            }
+                            if (std::filesystem::exists(audioAsset)) {
+                                bool extOk = ctrl.loadExternalAudio(audioAsset);
+                                if (extOk) {
+                                    test_assert(ctrl.hasExternalAudio(), "External audio loaded during video playback");
+                                    test_assert(ctrl.getSelectedAudioTrack() == -2, "Active track switched to external audio");
+
+                                    // Switch back to embedded track
+                                    if (!tracks.empty()) {
+                                        ctrl.selectAudioTrack(tracks[0].id);
+                                        test_assert(ctrl.getSelectedAudioTrack() == tracks[0].id, "Switched back to embedded track from external");
+                                    }
+
+                                    // Remove external audio
+                                    ctrl.removeExternalAudio();
+                                    test_assert(!ctrl.hasExternalAudio(), "External audio removed successfully");
+                                }
+                            }
+                            ctrl.stop();
+                        }
+                    }
+
+                    std::cout << "Comprehensive Audio Track unit tests passed!" << std::endl;
+                }
+            } // Close Subtitle & Audio block at line 6547
+        } // Close block at line 6180
+    } // Close if (!testFile.empty()) at line 3179
+
+    std::cout << "Additional code coverage tests PASSED!" << std::endl;
+
+    // 6. Run the actual main test suite!
+    return real_main(argc, argv);
+} catch (const std::exception& e) {
+    std::cerr << "[EXPECTED] Exception occurred during tests: " << e.what() << std::endl;
+    return 1;
+} catch (...) {
+    std::cerr << "[EXPECTED] Unknown exception occurred during tests." << std::endl;
+    return 1;
+}
+}
