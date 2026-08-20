@@ -18,6 +18,8 @@ NaikAVPlayer is a native, multi-threaded C++17 media engine and video player bui
 - **Stall-Proof Pipeline Backpressure:** Producer threads never block indefinitely on a full queue — bounded-wait pushes fall back to dropping the oldest queued item once a timeout elapses, so a paused audio device, a stalled render loop, or a wedged decoder can never freeze the single demuxer thread that feeds both the video and audio queues.
 - **Dynamic Hardware Decoder Fallback:** Tries platform-specific hardware decoders (D3D11VA, DXVA2, QSV, CUVID on Windows; V4L2M2M, VAAPI, QSV, CUVID on Linux), falling back dynamically to software H.264 decoding if hardware context allocation fails or encounters runtime surface mapping errors.
 - **Sub-10ms Audio-Video Synchronization:** Reconstructs the audio clock sample-accurately from PCM sample offsets to maintain A/V drift under 10ms.
+- **Fullscreen, Cursor Auto-Hide & Usability Gestures:** Fullscreen mode toggling via `F11`, `Alt+Enter`, or double-clicking anywhere on the video canvas; automatic cursor and controls dock hiding after 2.5 seconds of playback inactivity; instant volume adjustment via `Up`/`Down` arrow keys (±5%), mouse wheel over video, or mute toggle (`M`); and auto-pausing background playback during native file explorer dialogs.
+- **Lossless Video Frame Screenshot Export:** Capture and export the current video frame as a full-resolution PNG image (`S` hotkey) saved directly to the `screenshots/` directory with automatic timestamps (`NaikAVPlayer_<basename>_<YYYYMMDD_HHMMSS>_<time>.png`) using FFmpeg's native PNG encoder and `sws_scale` RGB24 conversion, accompanied by animated on-screen Toast feedback.
 - **Multiple Audio Track Switching & External Audio Support:** Full multi-stream container discovery for MP4/MKV files containing multiple embedded audio tracks (e.g. multi-language English/Japanese/Hindi, Director's commentary, stereo vs 5.1/7.1 surround). Supports seamless runtime audio track switching via the dedicated `[Audio]` headphone button or `B` hotkey without stalling video playback. Includes loading external standalone audio files (`.m4a`, `.aac`, `.ac3`, `.mp3`, `.wav`, `.flac`, `.ogg`, `.opus`, `.wma`, `.mka`) with automatic demuxer clock synchronization, switching back and forth between external and embedded tracks, and stream muting/disabling.
 - **Complete Subtitle Support (Internal & External):** Detects, decodes, and renders both embedded container subtitles (SRT, ASS, SSA, WebVTT, MOV Text) and external subtitle files (`.srt`, `.vtt`, `.ass`, `.ssa`, `.sub`). Features auto-detection of matching subtitle files adjacent to media, interactive track selection menu (`[CC]` button in controls dock), on-the-fly subtitle cycling (`V`), millisecond-accurate sync timing delay offset adjustments (`G` / `H`), and clean on-screen rendering with dark backdrop contrast overlays.
 - **Multichannel Audio Preservation:** Reads the source stream's real channel layout and drives 2.1/5.1/5.1(back)/7.1 straight through to a matching SDL3 multichannel device instead of always downmixing to stereo, with a device-native-channel check that flags when the OS is silently downmixing anyway, and a manual Auto / Force Stereo / Virtual Surround override.
@@ -36,7 +38,7 @@ NaikAVPlayer is a native, multi-threaded C++17 media engine and video player bui
 - **Auto-Pause on File Selection:** Automatically pauses background audio and video playback whenever the native file explorer dialog is opened, preserving the exact playback position and keeping the audio silent while browsing.
 - **Software Volume Attenuation:** Scalable audio output level adjustments with memcpy/memset bypasses for 100% and 0% volume states.
 - **Loop Playback:** Wraparound seek to 0.0 upon reaching end-of-file for continuous playback, toggleable via the controls dock `[Loop]` icon button and `L` hotkey.
-- **Playlist:** Build a queue of local media files — multi-select "Add Files" dialog, non-recursive "Add Folder" directory scan, or dropping more than one file onto the window at once — with drag-to-reorder, per-row removal, and double-click-to-play, via the `[Playlist]` button in the controls dock or the `P` hotkey. `Off` / `All` / `One` repeat modes plus a Shuffle toggle govern auto-advance once playback naturally reaches end-of-file, independent of the per-file `[Loop]` button above (which always just repeats the current file and takes priority while it's on). Playlist contents and repeat/shuffle state persist across restarts as standard M3U8 (`playlist.m3u8`).
+- **Playlist & Auto-Advance:** Build a queue of local media files — multi-select "Add Files" dialog, non-recursive "Add Folder" directory scan, or dropping more than one file onto the window at once — with drag-to-reorder, per-row removal, and double-click-to-play, via the `[Playlist]` button in the controls dock or the `P` hotkey. `Off` / `All` / `One` repeat modes plus a Shuffle toggle govern auto-advance once playback naturally reaches end-of-file, independent of the per-file `[Loop]` button above (which always just repeats the current file and takes priority while it's on). Playlist contents and repeat/shuffle state persist across restarts as standard M3U8 (`playlist.m3u8`).
 - **Native File Picker:** Cross-platform native file picker integration using `nativefiledialog-extended` (NFD) on Win32 and GTK3/Portal backends.
 - **Pipeline Diagnostics & System Info HUD:** Real-time overlay (`--metrics` or `D` key) displaying active player states, media telemetry (native vs. playback resolution, pixel format, hardware vs. software decoder type), Color & HDR pipeline characteristics (Color Space, Primaries, TRC, Range, Chroma Subsampling, Bit Depth, HDR10/HDR10+/Dolby Vision/HLG standard), pipeline queue depth levels, decode/render frame pacing budgets, and rolling clock synchronization offsets.
 - **Audio Processing Panel:** Dedicated overlay (`A` key) for the full DSP chain (EQ, noise gate, compressor, multiband compressor, limiter, crossover, loudness, 3D surround, widener, balance), a live FFT spectrum visualizer, plus channel/output-device/bit-depth/resampler-quality selection, separate from the diagnostics HUD.
@@ -63,7 +65,7 @@ src/
 ├── playlist/  header-only Playlist module (queue, repeat/shuffle, M3U8 I/O — see Playlist & Auto-Advance below)
 ├── subtitle/  SubtitleDecoder.{hpp,cpp}, SubtitleTrack.hpp — decoding, parsing, sync, sanitization
 ├── ui/        PlayerUI.{hpp,cpp} — ImGui controls dock, diagnostics HUD, audio panel, subtitle overlay
-└── video/     VideoDecoder.{hpp,cpp} — HW/SW decode, frame conversion
+└── video/     VideoDecoder.{hpp,cpp}, FrameExporter.hpp — HW/SW decode, frame conversion, PNG screenshot export
 ```
 
 
@@ -205,6 +207,32 @@ TPDF Dither → device-format truncation (16-bit int / 32-bit int / 32-bit float
 > **Not implemented (deliberately scoped out):**
 > - **HRTF/binaural rendering** — the existing "3D Surround"/Virtual Surround features are hand-rolled ambience/positional-cue synthesis, explicitly *not* real HRTF (no licensed decoder or measured head-related impulse response data involved, and this project doesn't vendor one). Real HRTF rendering needs an actual measured HRIR dataset (e.g. MIT KEMAR, SADIE, CIPIC) to convolve against, which is a data/licensing decision for a future contribution, not something fabricated here.
 > - **Gapless playback & crossfade** — a real playlist/track-queue engine now exists (see [Playlist & Auto-Advance](#playlist--auto-advance) below), but true sample-accurate gapless transitions and crossfade need cross-instance `AudioDecoder` handoff and a crossfade DSP stage on top of it, which is a larger architectural addition than the rest of the DSP chain above and is left for a future iteration. Today's playlist auto-advance opens and starts the next file the same way manually opening a new file does (brief re-init gap, no crossfade).
+
+### Dedicated Audio-Only Playback & Real-Time Visualizer
+
+NaikAVPlayer provides a dedicated audio-only playback mode that activates automatically whenever a media file contains audio streams without a motion video stream (including MP3, AAC, FLAC, OGG, WAV):
+- **Cover Art Filtering (`AV_DISPOSITION_ATTACHED_PIC`)**: Embedded album artwork (ID3 APIC / attached pictures) is filtered out from video stream indexing so audio-only files immediately engage the visualizer rather than stalling the video decoder pipeline.
+- **Timebase-Accurate Audio Clock**: Directly converts decoded audio frame timestamps from the stream timebase (`m_timeBase`) into seconds for sample-accurate clock progression.
+- **Hardware-Accelerated Reactive Visualizer**: Renders 4 distinct visualization styles (Neon Equalizer Bars with falling peak physics and reflections, Smooth Flowing Waveform, Radial Audio Disc, Mirrored Stereo Spectrum) across 4 color palettes (Cyberpunk, Sunset Fire, Mint Emerald, Electric Violet) using Dear ImGui `ImDrawList` primitives.
+
+### Subtitle Pipeline (Internal & External)
+
+- **Embedded Subtitle Detection**: Demuxes container-embedded subtitle streams (SRT, ASS/SSA, WebVTT, MOV Text) into bounded queues synchronized to video presentation timestamps.
+- **External Sidecar Loading**: Supports loading standalone subtitle files (`.srt`, `.vtt`, `.ass`, `.ssa`, `.sub`) with automatic adjacent-file discovery and instant random seeking via in-memory event caching.
+- **Text Sanitization & Contrast Rendering**: Strips raw ASS override styling tags and dialogue headers while rendering clean, centered text over a translucent dark rounded backdrop box (`rgba(5, 5, 8, 0.78)`).
+- **Millisecond-Accurate Sync Offset**: Real-time delay adjustment in 50ms increments via `G` / `H` hotkeys or the `[CC]` controls menu.
+
+### Multiple Audio Track Switching & External Audio
+
+- **Multi-Stream Audio Discovery**: Discovers all embedded audio streams in MP4/MKV containers, exposing language tags, titles, codecs, channel layouts, and sample rates.
+- **Runtime Track Switching**: Hot-swaps the active audio stream via `B` or the `[Audio]` menu without dropping video frames or interrupting video playback.
+- **External Audio Demuxing**: Concurrently demuxes external audio files (`.m4a`, `.aac`, `.ac3`, `.mp3`, `.wav`, `.flac`, `.ogg`, `.opus`, `.wma`, `.mka`) via a dedicated secondary demuxer thread synchronized with the master video timeline.
+
+### Frame Screenshot Export & Usability Pipeline
+
+- **PNG Screenshot Capture (`FrameExporter`)**: Extracts the current presentation `AVFrame`, converts it to RGB24 via `sws_scale`, and encodes it to a PNG image using FFmpeg's native PNG encoder. Output files are saved into `screenshots/NaikAVPlayer_<basename>_<YYYYMMDD_HHMMSS>_<time>.png`.
+- **Toast Notifications**: Floating on-screen feedback toasts at the bottom/top of the screen for track changes, delay adjustments, screenshot exports, loop toggling, and errors.
+- **Auto-Hide Controls & Cursor**: Controls dock and mouse cursor fade out after 2.5 seconds of inactivity during video playback and restore upon any mouse or keyboard input.
 
 ### Playlist & Auto-Advance
 
@@ -464,8 +492,8 @@ effect when launched by double-click, and ignored on Linux.
 | **`Double-Click`** (on video) | Toggle Fullscreen Mode |
 | **`M`** | Toggle Audio Mute / Unmute |
 | **`Up Arrow`** / **`Down Arrow`** | Increase / Decrease Volume (±5%) |
-| **`Mouse Wheel`** (over video) | Adjust Volume Up / Down |
-| **`S`** | Capture Screenshot / Export Video Frame as PNG |
+| **`Mouse Wheel`** (over video) | Adjust Volume Up / Down (±5%) |
+| **`S`** | Capture Screenshot / Export Current Video Frame as PNG |
 | **`B`** | Cycle Audio Tracks (Off -> Embedded -> External -> Off) |
 | **`V`** | Cycle Subtitle Tracks (Off -> Embedded -> External -> Off) |
 | **`G`** / **`H`** | Adjust Subtitle Synchronization Delay (-50ms / +50ms) |
@@ -474,6 +502,7 @@ effect when launched by double-click, and ignored on Linux.
 | **`Backspace`** | Reset playback speed to normal (1.0x) |
 | **`L`** | Toggle Continuous Loop Mode |
 | **`P`** | Toggle Playlist Panel |
+| **`Delete`** (in Playlist panel) | Remove selected item from playlist |
 | **`D`** | Toggle Diagnostics HUD & Telemetry Metrics |
 | **`A`** | Toggle Audio Processing Panel (EQ, Noise Gate, Compressor, Multiband, Limiter, Crossover, Loudness, Surround, Balance, Channel/Device/Format Selection) |
 | **`Escape`** | Exit Fullscreen (if in fullscreen) or Exit Application |
