@@ -7193,18 +7193,31 @@ int main(int argc, char* argv[]) {
                     {
                         ThreadSafeQueue<AVPacket*> vq, aq;
                         Demuxer dummyDemuxer("non_existent_dummy.xyz", vq, aq);
+                        // cppcheck-suppress knownConditionTrueFalse
                         test_assert(!dummyDemuxer.open(), "Demuxer dummy open fails");
+                        // cppcheck-suppress knownConditionTrueFalse
                         test_assert(dummyDemuxer.getAudioCodecParams(-1) == nullptr, "Demuxer::getAudioCodecParams(-1) is null");
+                        // cppcheck-suppress knownConditionTrueFalse
                         test_assert(dummyDemuxer.getAudioCodecParams(9999) == nullptr, "Demuxer::getAudioCodecParams(9999) is null");
+                        // cppcheck-suppress knownConditionTrueFalse
                         test_assert(dummyDemuxer.getAudioTimeBase(-1).num == 0, "Demuxer::getAudioTimeBase(-1) num is 0");
+                        // cppcheck-suppress knownConditionTrueFalse
                         test_assert(dummyDemuxer.getAudioStartTime(-1) == 0, "Demuxer::getAudioStartTime(-1) is 0");
+                        // cppcheck-suppress knownConditionTrueFalse
                         test_assert(dummyDemuxer.getSubtitleCodecParams(-1) == nullptr, "Demuxer::getSubtitleCodecParams(-1) is null");
+                        // cppcheck-suppress knownConditionTrueFalse
                         test_assert(dummyDemuxer.getSubtitleCodecParams(9999) == nullptr, "Demuxer::getSubtitleCodecParams(9999) is null");
+                        // cppcheck-suppress knownConditionTrueFalse
                         test_assert(dummyDemuxer.getSubtitleTimeBase(-1).num == 0, "Demuxer::getSubtitleTimeBase(-1) num is 0");
+                        // cppcheck-suppress knownConditionTrueFalse
                         test_assert(dummyDemuxer.getSubtitleTimeBase(9999).num == 0, "Demuxer::getSubtitleTimeBase(9999) num is 0");
+                        // cppcheck-suppress knownConditionTrueFalse
                         test_assert(dummyDemuxer.getSubtitleStartTime(-1) == 0, "Demuxer::getSubtitleStartTime(-1) is 0");
+                        // cppcheck-suppress knownConditionTrueFalse
                         test_assert(dummyDemuxer.getSubtitleStartTime(9999) == 0, "Demuxer::getSubtitleStartTime(9999) is 0");
+                        // cppcheck-suppress knownConditionTrueFalse
                         test_assert(dummyDemuxer.getAudioStreamMetadata() == nullptr, "Demuxer::getAudioStreamMetadata() is null when unopened");
+                        // cppcheck-suppress knownConditionTrueFalse
                         test_assert(dummyDemuxer.getGenreTag().empty(), "Demuxer::getGenreTag() is empty when unopened");
                     }
 
