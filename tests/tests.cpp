@@ -124,12 +124,20 @@ static std::atomic<int> force_synthetic_subtitle_rect{0};
 static std::atomic<bool> force_pts_to_dts_only{false};
 static std::atomic<bool> force_send_frame_fail{false};
 static std::atomic<bool> force_receive_packet_fail{false};
-static std::atomic<int> force_frame_alloc_fail_on_second_call{-1};
+// Thread-local on purpose: this is a *counter*, not a switch. Armed on
+// the test thread, a process-wide counter can be consumed by any other
+// thread that happens to call av_frame_alloc() in between -- the loudness
+// prescan thread a live PlayerController spawns does exactly that, which
+// silently disarmed the mock and made the test see a *successful* call.
+static thread_local int force_frame_alloc_fail_on_second_call = -1;
 static std::atomic<bool> force_send_packet_eagain{false};
 // -1 = disabled, 1 = let the next avcodec_receive_frame() call return EAGAIN
 // then arm for the call after (set to 0), 0 = return a hard (non-EAGAIN,
 // non-EOF) error on that call then disable (-1).
-static std::atomic<int> force_receive_frame_eagain_then_fail{-1};
+// thread_local for the same reason as force_frame_alloc_fail_on_second_call
+// above: armed on the test thread, and the prescan thread's own
+// avcodec_receive_frame() calls would otherwise consume the arming.
+static thread_local int force_receive_frame_eagain_then_fail = -1;
 static std::atomic<bool> force_soxr_fail{false};
 static std::atomic<bool> force_swr_alloc_fail{false};
 // -1 = disabled, 1 = let the next swr_init() call succeed then arm for the
@@ -137,7 +145,9 @@ static std::atomic<bool> force_swr_alloc_fail{false};
 // fail specifically the *second* initResampler() call (the stereo-fallback
 // retry after the device rejects a surround stream) without also failing
 // the first, always-successful call that precedes it.
-static std::atomic<int> force_swr_init_fail_on_retry{-1};
+// thread_local: armed on the test thread, and the prescan thread calls
+// swr_init() too, which would otherwise consume the arming.
+static thread_local int force_swr_init_fail_on_retry = -1;
 static std::atomic<bool> force_no_pts_no_dts{false};
 static std::atomic<int> force_fake_playback_devices{0};
 static std::atomic<int> force_queued_bytes{-1};
@@ -216,13 +226,13 @@ inline AVFrame* mock_av_frame_alloc() {
     // 0), 0 = fail this call then disable (-1). Lets a test fail specifically
     // the *second* av_frame_alloc() call in a function without also failing
     // an earlier, unrelated one in the same call.
-    int state = force_frame_alloc_fail_on_second_call.load();
+    int state = force_frame_alloc_fail_on_second_call;
     if (state == 1) {
-        force_frame_alloc_fail_on_second_call.store(0);
+        force_frame_alloc_fail_on_second_call = 0;
         return av_frame_alloc();
     }
     if (state == 0) {
-        force_frame_alloc_fail_on_second_call.store(-1);
+        force_frame_alloc_fail_on_second_call = -1;
         return nullptr;
     }
     return av_frame_alloc();
@@ -254,13 +264,13 @@ inline int mock_av_image_fill_arrays(uint8_t* dst_data[4], int dst_linesize[4], 
 
 inline int mock_swr_init(struct SwrContext* s) {
     if (force_swr_init_fail) return -1;
-    int retryState = force_swr_init_fail_on_retry.load();
+    int retryState = force_swr_init_fail_on_retry;
     if (retryState == 1) {
-        force_swr_init_fail_on_retry.store(0);
+        force_swr_init_fail_on_retry = 0;
         return swr_init(s);
     }
     if (retryState == 0) {
-        force_swr_init_fail_on_retry.store(-1);
+        force_swr_init_fail_on_retry = -1;
         return -1;
     }
     return swr_init(s);
@@ -443,13 +453,13 @@ inline int mock_avcodec_receive_frame(AVCodecContext* avctx, AVFrame* frame) {
         }
         return AVERROR_EOF;
     }
-    int eagainThenFailState = force_receive_frame_eagain_then_fail.load();
+    int eagainThenFailState = force_receive_frame_eagain_then_fail;
     if (eagainThenFailState == 1) {
-        force_receive_frame_eagain_then_fail.store(0);
+        force_receive_frame_eagain_then_fail = 0;
         return AVERROR(EAGAIN);
     }
     if (eagainThenFailState == 0) {
-        force_receive_frame_eagain_then_fail.store(-1);
+        force_receive_frame_eagain_then_fail = -1;
         return -5;
     }
 
@@ -790,6 +800,15 @@ int real_main(int argc, char* argv[]) {
 
     std::cout << "Testing with file: " << testFile << std::endl;
 
+    // SDL_Quit() at the end of this function frees every SDL audio
+    // stream that is still open. Any PlayerController alive past that
+    // point then destroys its own stream a second time from
+    // ~PlayerController() -> stop() -> AudioDecoder::stop() -- the
+    // heap-use-after-free ASan flagged here. Scoping every controller
+    // in this function (this one and all of the try block's) so they
+    // are torn down before SDL_Quit() keeps the shutdown order right.
+    int realMainResult = 0;
+    {
     PlayerController controller;
 
     try {
@@ -2676,11 +2695,14 @@ int real_main(int argc, char* argv[]) {
 
     } catch (const std::exception& e) {
         std::cerr << "[EXPECTED] Exception occurred during tests: " << e.what() << std::endl;
-        SDL_Quit();
-        return 1;
+        realMainResult = 1;
     }
+    } // scope end: every PlayerController above is destroyed here
 
     SDL_Quit();
+    if (realMainResult != 0) {
+        return realMainResult;
+    }
     std::cout << "All integration tests PASSED successfully!" << std::endl;
     return 0;
 }
@@ -6806,6 +6828,16 @@ int main(int argc, char* argv[]) {
                                       embSrt3 + "\" -c:v mpeg4 -c:s srt \"" + embFile3 + "\"";
                     if (std::system(cmd.c_str()) == 0) {
                         ThreadSafeQueue<AVPacket*> vq, aq;
+                        // subQ must outlive `demuxer`: attachSubtitleQueue()
+                        // hands the Demuxer a raw pointer to it, and
+                        // ~Demuxer() -> stop() calls m_subtitleQueue->abort()
+                        // unconditionally. Declared in the inner
+                        // `if (!subTracks.empty())` scope it died first, and
+                        // the destructor then wrote through the dangling
+                        // pointer -- a stack-use-after-scope ASan flagged
+                        // here. Declaring it before the Demuxer makes the
+                        // reverse destruction order tear them down safely.
+                        ThreadSafeQueue<AVPacket*> subQ(16);
                         MetricRing<256> ring;
                         std::atomic<bool> prof{false};
                         Demuxer demuxer(embFile3, vq, aq, ring, prof);
@@ -6813,7 +6845,6 @@ int main(int argc, char* argv[]) {
                         auto subTracks = demuxer.getSubtitleTracks();
                         if (!subTracks.empty()) {
                             int subId = subTracks[0].id;
-                            ThreadSafeQueue<AVPacket*> subQ(16);
                             demuxer.attachSubtitleQueue(&subQ);
                             demuxer.setSubtitleStreamIndex(subId);
 
