@@ -35,7 +35,8 @@ jobs:
             libxss-dev \
             ccache \
             cppcheck \
-            lcov
+            lcov \
+            ffmpeg
 
       - name: Verify Documentation & License Repository Integrity
         run: |
