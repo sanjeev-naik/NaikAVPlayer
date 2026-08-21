@@ -109,7 +109,7 @@ private:
     // Background video decoding thread
     std::thread m_videoThread;
     std::atomic<bool> m_videoThreadRunning;
-    bool m_videoThreadEnabled;
+    std::atomic<bool> m_videoThreadEnabled;
     // mutable: also taken by const getters (getVideoWidth/Height,
     // isVideoHardware) that read m_videoDecoder's codec context, which the
     // video thread can free and reopen with a fresh session when recovering

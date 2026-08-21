@@ -117,7 +117,7 @@ static bool parseTimestamp(const std::string& str, double& outSeconds) {
     }
 }
 
-bool SubtitleDecoder::init(AVCodecParameters* codecParams, AVRational timeBase, int64_t startTime) {
+bool SubtitleDecoder::init(const AVCodecParameters* codecParams, AVRational timeBase, int64_t startTime) {
     reset();
 
     if (!codecParams) return false;
@@ -308,7 +308,7 @@ bool SubtitleDecoder::loadExternalFile(const std::string& filepath) {
         }
 
         if (streamIdx >= 0) {
-            AVCodecParameters* codecParams = fmtCtx->streams[streamIdx]->codecpar;
+            const AVCodecParameters* codecParams = fmtCtx->streams[streamIdx]->codecpar;
             const AVCodec* decoder = avcodec_find_decoder(codecParams->codec_id);
             if (decoder) {
                 AVCodecContext* codecCtx = avcodec_alloc_context3(decoder);
@@ -350,16 +350,22 @@ bool SubtitleDecoder::loadExternalFile(const std::string& filepath) {
                                         combinedText += piece;
                                     }
                                 }
+                                // cppcheck-suppress variableScope
+                                // Narrowing this into the `if (!combinedText.empty())`
+                                // block below would move it after
+                                // avsubtitle_free(&sub), which zeroes
+                                // sub.start_display_time -- it must be read
+                                // out here first.
+                                double startPts = basePts + (sub.start_display_time / 1000.0);
+                                double dur = 3.5;
+                                if (sub.end_display_time > 0 && sub.end_display_time != UINT32_MAX) {
+                                    dur = sub.end_display_time / 1000.0;
+                                } else if (pkt->duration > 0) {
+                                    dur = pkt->duration * av_q2d(tb);
+                                }
                                 avsubtitle_free(&sub);
 
                                 if (!combinedText.empty()) {
-                                    double startPts = basePts + (sub.start_display_time / 1000.0);
-                                    double dur = 3.5;
-                                    if (sub.end_display_time > 0 && sub.end_display_time != UINT32_MAX) {
-                                        dur = sub.end_display_time / 1000.0;
-                                    } else if (pkt->duration > 0) {
-                                        dur = pkt->duration * av_q2d(tb);
-                                    }
                                     double endPts = startPts + dur;
                                     SubtitleEvent ev;
                                     ev.startPts = startPts;

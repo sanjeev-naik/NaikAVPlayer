@@ -123,36 +123,50 @@ bool PlayerController::openFile(const std::string& filename, bool resetPlaylist)
 
         // Initialize Audio Decoder if audio stream is available
         if (m_demuxer->getAudioStreamIndex() >= 0) {
-            std::lock_guard<std::mutex> audioLock(m_audioDecoderMutex);
-            m_audioDecoder = std::make_unique<AudioDecoder>(
-                m_demuxer->getAudioCodecParams(),
-                m_demuxer->getAudioTimeBase(),
-                m_demuxer->getAudioStartTime(),
-                m_audioQueue,
-                &m_audioDecodeTimeUs
-            );
-            m_audioDecoder->setChannelOption(m_channelOption);
-            m_audioDecoder->setOutputBitDepth(m_outputBitDepth);
-            m_audioDecoder->setOutputDeviceName(m_outputDeviceName);
-            m_audioDecoder->setResamplerQuality(m_resamplerQuality);
-            m_hasAudio = m_audioDecoder->init();
+            {
+                std::lock_guard<std::mutex> audioLock(m_audioDecoderMutex);
+                m_audioDecoder = std::make_unique<AudioDecoder>(
+                    m_demuxer->getAudioCodecParams(),
+                    m_demuxer->getAudioTimeBase(),
+                    m_demuxer->getAudioStartTime(),
+                    m_audioQueue,
+                    &m_audioDecodeTimeUs
+                );
+                m_audioDecoder->setChannelOption(m_channelOption);
+                m_audioDecoder->setOutputBitDepth(m_outputBitDepth);
+                m_audioDecoder->setOutputDeviceName(m_outputDeviceName);
+                m_audioDecoder->setResamplerQuality(m_resamplerQuality);
+                m_hasAudio = m_audioDecoder->init();
+                if (m_hasAudio) {
+                    m_audioDecoder->setVolume(m_volume);
+                    m_audioDecoder->setPlaybackSpeed(m_playbackSpeed.load());
+                    m_audioDecoder->applyDspSettings(m_audioDspSettings);
+                }
+            }
             if (m_hasAudio) {
-                m_audioDecoder->setVolume(m_volume);
-                m_audioDecoder->setPlaybackSpeed(m_playbackSpeed.load());
-                m_audioDecoder->applyDspSettings(m_audioDspSettings);
+                // Released m_audioDecoderMutex above before these two calls:
+                // applyGenrePresetIfEnabled() can re-enter via
+                // setAudioDspSettings(), and the loudness prescan's tagged-tag
+                // fast path re-enters directly -- both take
+                // m_audioDecoderMutex themselves, which would self-deadlock
+                // on this same (non-recursive) mutex if it were still held.
+                //
                 // Before the loudness prescan below: a genre-based preset swap
                 // can change loudnessEnabled/loudnessTargetLufs, and the
                 // prescan should reflect whatever settings actually end up
                 // active for this file, not whatever was active before it.
                 applyGenrePresetIfEnabled();
                 if (m_audioDspSettings.loudnessEnabled) {
-                    // Blocking, but this runs before m_demuxer->start() below --
-                    // no packets are flowing yet, so there's no audio playing
-                    // for the user to notice the delay in.
+                    // Only blocks when a tagged loudness value short-circuits
+                    // the scan (cheap dictionary lookups); otherwise this
+                    // kicks off the real decode-based prescan on its own
+                    // background thread and returns immediately -- see
+                    // prescanLoudnessForCurrentFile()'s own comment.
                     prescanLoudnessForCurrentFile();
                 }
                 // Must happen before m_demuxer->start(): the read loop is not
                 // synchronized with this pointer assignment.
+                std::lock_guard<std::mutex> audioLock(m_audioDecoderMutex);
                 m_demuxer->attachAudioPausedFlag(&m_audioDecoder->pausedFlag());
                 m_audioDecoder->attachSeekGeneration(m_demuxer->seekGenerationPtr());
             }
@@ -923,7 +937,7 @@ void PlayerController::videoThreadLoop() {
 
         bool decoded = false;
         bool converted = false;
-        AVFrame* srcFrame = nullptr;
+        const AVFrame* srcFrame = nullptr;
         double framePts = 0.0;
         int frameWidth = 0;
         int frameHeight = 0;
@@ -946,11 +960,13 @@ void PlayerController::videoThreadLoop() {
                             // Use the frame's own dimensions: hardware decoders
                             // (e.g. v4l2m2m) may output sizes that differ from
                             // the codec context, and the SDL texture must match
-                            // the plane data exactly.
-                            frameWidth = srcFrame->width > 0 ? srcFrame->width
-                                                             : m_videoDecoder->getWidth();
-                            frameHeight = srcFrame->height > 0 ? srcFrame->height
-                                                               : m_videoDecoder->getHeight();
+                            // the plane data exactly. convertFrame() never
+                            // produces a frame with width/height <= 0 on
+                            // success (both its native-passthrough and
+                            // rescale paths guarantee positive dimensions),
+                            // so there's no fallback to the codec context here.
+                            frameWidth = srcFrame->width;
+                            frameHeight = srcFrame->height;
                         }
                     }
                 }
@@ -1636,14 +1652,20 @@ bool PlayerController::selectAudioTrack(int trackId) {
                 m_audioDecoder->setVolume(m_volume);
                 m_audioDecoder->setPlaybackSpeed(m_playbackSpeed.load());
                 m_audioDecoder->applyDspSettings(m_audioDspSettings);
-                applyGenrePresetIfEnabled();
-                if (m_audioDspSettings.loudnessEnabled) {
-                    prescanLoudnessForCurrentFile();
-                }
-                m_demuxer->attachAudioPausedFlag(&m_audioDecoder->pausedFlag());
-                m_audioDecoder->attachSeekGeneration(m_demuxer->seekGenerationPtr());
-                m_audioDecoder->setClock(currentPos);
             }
+        }
+        if (m_hasAudio) {
+            // Released m_audioDecoderMutex above before these two calls, for
+            // the same self-deadlock reason as in openFile() (see its
+            // comment): both can re-enter and re-acquire the mutex.
+            applyGenrePresetIfEnabled();
+            if (m_audioDspSettings.loudnessEnabled) {
+                prescanLoudnessForCurrentFile();
+            }
+            std::lock_guard<std::mutex> audioLock(m_audioDecoderMutex);
+            m_demuxer->attachAudioPausedFlag(&m_audioDecoder->pausedFlag());
+            m_audioDecoder->attachSeekGeneration(m_demuxer->seekGenerationPtr());
+            m_audioDecoder->setClock(currentPos);
         }
 
         m_selectedAudioTrack.store(trackId);
@@ -1694,12 +1716,12 @@ bool PlayerController::loadExternalAudio(const std::string& filepath) {
         }
         m_externalAudioDemuxer = std::move(extDemuxer);
 
+        // getAudioStreamIndex() >= 0 was already validated above, and
+        // Demuxer::open() only ever sets a non-negative audio stream index
+        // via selectAudioStream(), which it only calls when m_audioTracks is
+        // non-empty -- so extTracks is guaranteed non-empty here.
         auto extTracks = m_externalAudioDemuxer->getAudioTracks();
-        if (!extTracks.empty()) {
-            m_externalAudioTrack = extTracks[0];
-        } else {
-            m_externalAudioTrack = naikav::audio::AudioTrackInfo{};
-        }
+        m_externalAudioTrack = extTracks[0];
         m_externalAudioTrack.id = -2;
         m_externalAudioTrack.isExternal = true;
         m_externalAudioTrack.sourcePath = filepath;

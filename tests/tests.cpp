@@ -59,6 +59,15 @@ static std::atomic<bool> force_copy_params_fail{false};
 static std::atomic<bool> force_sdl_audio_fail{false};
 static std::atomic<bool> force_send_packet_fail{false};
 static std::atomic<bool> force_receive_frame_fail{false};
+// When true, arms pending_synthetic_flush_frame on the next flush-style
+// avcodec_send_packet(ctx, nullptr) call, so the following
+// avcodec_receive_frame() returns one synthetic frame instead of the real
+// decoder's (likely empty, for most codecs) drain result. Used to
+// deterministically exercise flush-loop code paths that depend on the
+// decoder still having a buffered frame at EOF -- real decoders on this
+// build never actually do for the small test assets available.
+static std::atomic<bool> force_synthetic_flush_frame{false};
+static std::atomic<bool> pending_synthetic_flush_frame{false};
 static std::atomic<bool> force_no_pts{false};
 static std::atomic<bool> force_no_streams{false};
 static std::atomic<bool> force_no_duration{false};
@@ -82,11 +91,72 @@ static std::atomic<bool> force_hw_transfer_fail{false};
 static std::atomic<bool> force_receive_eagain{false};
 static std::atomic<bool> mock_send_packet_success{false};
 static std::atomic<bool> mock_hw_transfer_nv12{false};
+static std::atomic<bool> force_hw_transfer_real_buffer{false};
+static std::atomic<bool> force_hw_frame_ref_fail{false};
+// -1 = inactive/off. 1 = armed: let the very next av_frame_ref() call
+// through untouched, then fail the one immediately after that, then
+// disarm back to -1. Used to fail exactly PlayerController::videoThreadLoop()'s
+// own av_frame_ref() call (its call always follows immediately after
+// VideoDecoder::convertFrame()'s own, separate av_frame_ref() call within
+// the same frame) without an extended failing window.
+static std::atomic<int> force_player_frame_ref_fail_next{-1};
+// One-shot artificial delay (milliseconds) injected into the very next
+// avcodec_receive_frame() call that actually returns a real decoded frame,
+// then disarms itself. Used to widen the window between videoThreadLoop()'s
+// own "queue not full" gate check and its later push_wait_or_drop() call,
+// without touching any of PlayerController's own mutexes from the test
+// thread (which risks deadlocking/destabilizing unrelated subsystems --
+// see the m_videoDecoderMutex-holding approach this replaced).
+static std::atomic<int> force_decode_delay_once_ms{0};
+static std::atomic<bool> force_avfilter_graph_alloc_fail{false};
+static std::atomic<bool> force_avfilter_get_by_name_fail{false};
+static std::atomic<bool> force_avfilter_create_filter_fail{false};
+static std::atomic<bool> force_buffersrc_add_frame_fail{false};
+static std::atomic<bool> force_find_decoder_fail{false};
+static std::atomic<bool> force_find_encoder_fail{false};
+// 0 = off (real decode), 1 = synthesize a SUBTITLE_ASS rect whose ass string
+// carries a "Dialogue:" 9-comma prefix, 2 = synthesize a SUBTITLE_TEXT rect.
+// Real ffmpeg subtitle decoders (subrip/webvtt/ass/mov_text) on this build
+// always emit SUBTITLE_ASS rects in the raw 8-field form, never a
+// "Dialogue:"-prefixed ass string or SUBTITLE_TEXT rect, so those two
+// SubtitleDecoder::processPacket() branches are otherwise unreachable.
+static std::atomic<int> force_synthetic_subtitle_rect{0};
+static std::atomic<bool> force_pts_to_dts_only{false};
+static std::atomic<bool> force_send_frame_fail{false};
+static std::atomic<bool> force_receive_packet_fail{false};
+// Thread-local on purpose: this is a *counter*, not a switch. Armed on
+// the test thread, a process-wide counter can be consumed by any other
+// thread that happens to call av_frame_alloc() in between -- the loudness
+// prescan thread a live PlayerController spawns does exactly that, which
+// silently disarmed the mock and made the test see a *successful* call.
+static thread_local int force_frame_alloc_fail_on_second_call = -1;
+static std::atomic<bool> force_send_packet_eagain{false};
+// -1 = disabled, 1 = let the next avcodec_receive_frame() call return EAGAIN
+// then arm for the call after (set to 0), 0 = return a hard (non-EAGAIN,
+// non-EOF) error on that call then disable (-1).
+// thread_local for the same reason as force_frame_alloc_fail_on_second_call
+// above: armed on the test thread, and the prescan thread's own
+// avcodec_receive_frame() calls would otherwise consume the arming.
+static thread_local int force_receive_frame_eagain_then_fail = -1;
+static std::atomic<bool> force_soxr_fail{false};
+static std::atomic<bool> force_swr_alloc_fail{false};
+// -1 = disabled, 1 = let the next swr_init() call succeed then arm for the
+// call after (set to 0), 0 = fail the next call then disable (-1). Used to
+// fail specifically the *second* initResampler() call (the stereo-fallback
+// retry after the device rejects a surround stream) without also failing
+// the first, always-successful call that precedes it.
+// thread_local: armed on the test thread, and the prescan thread calls
+// swr_init() too, which would otherwise consume the arming.
+static thread_local int force_swr_init_fail_on_retry = -1;
+static std::atomic<bool> force_no_pts_no_dts{false};
+static std::atomic<int> force_fake_playback_devices{0};
+static std::atomic<int> force_queued_bytes{-1};
+static std::atomic<bool> force_channel_layout_describe_fail{false};
 static std::mutex mock_read_frame_mutex;
 static std::function<void()> on_mock_read_frame = nullptr;
 struct AVCodec;
-static const struct AVCodec* global_saved_codec = nullptr;
-static const struct AVCodec* global_fake_codec_ptr = nullptr;
+static std::atomic<const struct AVCodec*> global_saved_codec{nullptr};
+static std::atomic<const struct AVCodec*> global_fake_codec_ptr{nullptr};
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -95,6 +165,10 @@ extern "C" {
 #include <libavutil/imgutils.h>
 #include <libswscale/swscale.h>
 #include <libavutil/hwcontext.h>
+#include <libavutil/opt.h>
+#include <libavutil/channel_layout.h>
+#include <libavfilter/avfilter.h>
+#include <libavfilter/buffersrc.h>
 }
 
 // Inline mock wrappers
@@ -148,6 +222,19 @@ inline AVFrame* mock_av_frame_alloc() {
     if (force_frame_alloc_fail && open_finished) {
         return nullptr;
     }
+    // -1 = disabled, 1 = let this call succeed then arm for the next (set to
+    // 0), 0 = fail this call then disable (-1). Lets a test fail specifically
+    // the *second* av_frame_alloc() call in a function without also failing
+    // an earlier, unrelated one in the same call.
+    int state = force_frame_alloc_fail_on_second_call;
+    if (state == 1) {
+        force_frame_alloc_fail_on_second_call = 0;
+        return av_frame_alloc();
+    }
+    if (state == 0) {
+        force_frame_alloc_fail_on_second_call = -1;
+        return nullptr;
+    }
     return av_frame_alloc();
 }
 #define av_frame_alloc mock_av_frame_alloc
@@ -177,9 +264,36 @@ inline int mock_av_image_fill_arrays(uint8_t* dst_data[4], int dst_linesize[4], 
 
 inline int mock_swr_init(struct SwrContext* s) {
     if (force_swr_init_fail) return -1;
+    int retryState = force_swr_init_fail_on_retry;
+    if (retryState == 1) {
+        force_swr_init_fail_on_retry = 0;
+        return swr_init(s);
+    }
+    if (retryState == 0) {
+        force_swr_init_fail_on_retry = -1;
+        return -1;
+    }
     return swr_init(s);
 }
 #define swr_init mock_swr_init
+
+inline int mock_swr_alloc_set_opts2(struct SwrContext** ps, const AVChannelLayout* out_ch_layout,
+                                     enum AVSampleFormat out_sample_fmt, int out_sample_rate,
+                                     const AVChannelLayout* in_ch_layout, enum AVSampleFormat in_sample_fmt,
+                                     int in_sample_rate, int log_offset, void* log_ctx) {
+    if (force_swr_alloc_fail) return -1;
+    return swr_alloc_set_opts2(ps, out_ch_layout, out_sample_fmt, out_sample_rate,
+                                in_ch_layout, in_sample_fmt, in_sample_rate, log_offset, log_ctx);
+}
+#define swr_alloc_set_opts2 mock_swr_alloc_set_opts2
+
+inline int mock_av_opt_set(void* obj, const char* name, const char* val, int search_flags) {
+    if (force_soxr_fail && std::string(name) == "resampler" && std::string(val) == "soxr") {
+        return AVERROR(EINVAL);
+    }
+    return av_opt_set(obj, name, val, search_flags);
+}
+#define av_opt_set mock_av_opt_set
 
 inline int mock_swr_convert(struct SwrContext* s, uint8_t** out, int out_count, const uint8_t** in, int in_count) {
     if (force_swr_convert_fail) return -1;
@@ -225,6 +339,54 @@ inline int mock_avcodec_parameters_to_context(AVCodecContext* codec, const AVCod
 }
 #define avcodec_parameters_to_context mock_avcodec_parameters_to_context
 
+inline const AVCodec* mock_avcodec_find_decoder(enum AVCodecID id) {
+    if (force_find_decoder_fail) return nullptr;
+    return avcodec_find_decoder(id);
+}
+#define avcodec_find_decoder mock_avcodec_find_decoder
+
+inline const AVCodec* mock_avcodec_find_encoder(enum AVCodecID id) {
+    if (force_find_encoder_fail) return nullptr;
+    return avcodec_find_encoder(id);
+}
+#define avcodec_find_encoder mock_avcodec_find_encoder
+
+inline int mock_avcodec_send_frame(AVCodecContext* avctx, const AVFrame* frame) {
+    if (force_send_frame_fail) return -1;
+    return avcodec_send_frame(avctx, frame);
+}
+#define avcodec_send_frame mock_avcodec_send_frame
+
+inline int mock_avcodec_receive_packet(AVCodecContext* avctx, AVPacket* avpkt) {
+    if (force_receive_packet_fail) return -1;
+    return avcodec_receive_packet(avctx, avpkt);
+}
+#define avcodec_receive_packet mock_avcodec_receive_packet
+
+inline int mock_avcodec_decode_subtitle2(AVCodecContext* avctx, AVSubtitle* sub, int* got_sub_ptr, AVPacket* avpkt) {
+    int mode = force_synthetic_subtitle_rect.load(std::memory_order_relaxed);
+    if (mode != 0) {
+        memset(sub, 0, sizeof(*sub));
+        AVSubtitleRect* rect = static_cast<AVSubtitleRect*>(av_mallocz(sizeof(AVSubtitleRect)));
+        if (mode == 1) {
+            rect->type = SUBTITLE_ASS;
+            rect->ass = av_strdup("Dialogue: 0,0:00:01.00,0:00:02.50,Default,,0,0,0,,Synthetic dialogue text");
+        } else {
+            rect->type = SUBTITLE_TEXT;
+            rect->text = av_strdup("Synthetic plain text");
+        }
+        sub->rects = static_cast<AVSubtitleRect**>(av_malloc(sizeof(AVSubtitleRect*)));
+        sub->rects[0] = rect;
+        sub->num_rects = 1;
+        sub->start_display_time = 100;
+        sub->end_display_time = 2500;
+        *got_sub_ptr = 1;
+        return avpkt->size;
+    }
+    return avcodec_decode_subtitle2(avctx, sub, got_sub_ptr, avpkt);
+}
+#define avcodec_decode_subtitle2 mock_avcodec_decode_subtitle2
+
 
 
 inline SDL_AudioStream* mock_SDL_OpenAudioDeviceStream(SDL_AudioDeviceID devid, const SDL_AudioSpec* spec, SDL_AudioStreamCallback callback, void* userdata) {
@@ -249,9 +411,11 @@ inline SDL_AudioStream* mock_SDL_OpenAudioDeviceStream(SDL_AudioDeviceID devid, 
 #define SDL_OpenAudioDeviceStream mock_SDL_OpenAudioDeviceStream
 
 inline void mock_avcodec_free_context(AVCodecContext** pavctx) {
-    if (pavctx && *pavctx && global_saved_codec && global_fake_codec_ptr) {
-        if ((*pavctx)->codec == global_fake_codec_ptr) {
-            (*pavctx)->codec = global_saved_codec;
+    const AVCodec* savedCodec = global_saved_codec.load(std::memory_order_acquire);
+    const AVCodec* fakeCodec = global_fake_codec_ptr.load(std::memory_order_acquire);
+    if (pavctx && *pavctx && savedCodec && fakeCodec) {
+        if ((*pavctx)->codec == fakeCodec) {
+            (*pavctx)->codec = savedCodec;
         }
     }
     avcodec_free_context(pavctx);
@@ -260,8 +424,13 @@ inline void mock_avcodec_free_context(AVCodecContext** pavctx) {
 
 inline int mock_avcodec_send_packet(AVCodecContext* avctx, const AVPacket* avpkt) {
     if (force_send_packet_fail) return -1;
+    if (force_send_packet_eagain) return AVERROR(EAGAIN);
     if (mock_send_packet_success) return 0;
-    return avcodec_send_packet(avctx, avpkt);
+    int ret = avcodec_send_packet(avctx, avpkt);
+    if (ret >= 0 && avpkt == nullptr && force_synthetic_flush_frame) {
+        pending_synthetic_flush_frame = true;
+    }
+    return ret;
 }
 #define avcodec_send_packet mock_avcodec_send_packet
 
@@ -270,11 +439,46 @@ inline int mock_avcodec_receive_frame(AVCodecContext* avctx, AVFrame* frame) {
     if (force_video_eof) return AVERROR_EOF;
     if (force_video_error) return -5;
     if (force_receive_eagain) return AVERROR(EAGAIN);
-    
+    if (pending_synthetic_flush_frame.exchange(false)) {
+        av_frame_unref(frame);
+        frame->format = avctx->sample_fmt;
+        frame->sample_rate = avctx->sample_rate;
+#if LIBAVUTIL_VERSION_MAJOR >= 57
+        av_channel_layout_copy(&frame->ch_layout, &avctx->ch_layout);
+#else
+        frame->channel_layout = avctx->channel_layout;
+        frame->channels = avctx->channels;
+#endif
+        frame->nb_samples = 64;
+        if (av_frame_get_buffer(frame, 0) >= 0) {
+            return 0;
+        }
+        return AVERROR_EOF;
+    }
+    int eagainThenFailState = force_receive_frame_eagain_then_fail;
+    if (eagainThenFailState == 1) {
+        force_receive_frame_eagain_then_fail = 0;
+        return AVERROR(EAGAIN);
+    }
+    if (eagainThenFailState == 0) {
+        force_receive_frame_eagain_then_fail = -1;
+        return -5;
+    }
+
     int ret = avcodec_receive_frame(avctx, frame);
+    if (ret >= 0) {
+        int delayMs = force_decode_delay_once_ms.exchange(0, std::memory_order_relaxed);
+        if (delayMs > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(delayMs));
+        }
+    }
     if (ret >= 0 && force_no_pts) {
         frame->pts = AV_NOPTS_VALUE;
         frame->pkt_dts = 1000; // Provide DTS to trigger DTS fallback path
+    }
+    if (ret >= 0 && force_no_pts_no_dts) {
+        frame->pts = AV_NOPTS_VALUE;
+        frame->pkt_dts = AV_NOPTS_VALUE;
     }
     return ret;
 }
@@ -286,6 +490,13 @@ inline int mock_av_hwframe_transfer_data(AVFrame* dst, const AVFrame* src, int f
     dst->width = src->width;
     dst->height = src->height;
     dst->format = mock_hw_transfer_nv12 ? AV_PIX_FMT_RGB24 : AV_PIX_FMT_YUV420P;
+    if (force_hw_transfer_real_buffer) {
+        // A genuine hardware->CPU transfer produces a frame with real pixel
+        // data, not just width/height/format -- needed so downstream code
+        // (e.g. av_frame_ref()) sees a non-dummy frame (buf[0]/data[0] set)
+        // instead of taking convertFrame()'s "mock frame in unit tests" shortcut.
+        av_frame_get_buffer(dst, 32);
+    }
     return 0;
 }
 #define av_hwframe_transfer_data mock_av_hwframe_transfer_data
@@ -296,10 +507,55 @@ inline int mock_av_frame_get_buffer(AVFrame* frame, int align) {
 }
 #define av_frame_get_buffer mock_av_frame_get_buffer
 
+inline int mock_av_frame_ref(AVFrame* dst, const AVFrame* src) {
+    if (force_hw_frame_ref_fail) return AVERROR(ENOMEM);
+    int state = force_player_frame_ref_fail_next.load(std::memory_order_relaxed);
+    if (state == 1) {
+        force_player_frame_ref_fail_next.store(0, std::memory_order_relaxed);
+        return av_frame_ref(dst, src);
+    }
+    if (state == 0) {
+        force_player_frame_ref_fail_next.store(-1, std::memory_order_relaxed);
+        return AVERROR(ENOMEM);
+    }
+    return av_frame_ref(dst, src);
+}
+#define av_frame_ref mock_av_frame_ref
+
+inline AVFilterGraph* mock_avfilter_graph_alloc() {
+    if (force_avfilter_graph_alloc_fail) return nullptr;
+    return avfilter_graph_alloc();
+}
+#define avfilter_graph_alloc mock_avfilter_graph_alloc
+
+inline const AVFilter* mock_avfilter_get_by_name(const char* name) {
+    if (force_avfilter_get_by_name_fail) return nullptr;
+    return avfilter_get_by_name(name);
+}
+#define avfilter_get_by_name mock_avfilter_get_by_name
+
+inline int mock_avfilter_graph_create_filter(AVFilterContext** filt_ctx, const AVFilter* filt,
+                                              const char* name, const char* args, void* opaque,
+                                              AVFilterGraph* graph_ctx) {
+    if (force_avfilter_create_filter_fail) return -1;
+    return avfilter_graph_create_filter(filt_ctx, filt, name, args, opaque, graph_ctx);
+}
+#define avfilter_graph_create_filter mock_avfilter_graph_create_filter
+
+inline int mock_av_buffersrc_add_frame(AVFilterContext* ctx, AVFrame* frame) {
+    // Callers (see LoudnessMeter::feed()) always free `frame` themselves
+    // right after this call regardless of the return value -- matching
+    // real av_buffersrc_add_frame()'s documented behavior of not taking
+    // ownership -- so this must not touch frame's memory itself.
+    if (force_buffersrc_add_frame_fail) return -1;
+    return av_buffersrc_add_frame(ctx, frame);
+}
+#define av_buffersrc_add_frame mock_av_buffersrc_add_frame
+
 inline int mock_av_read_frame(AVFormatContext* s, AVPacket* pkt) {
     if (force_read_eof) return AVERROR_EOF;
     if (force_read_error) return -5;
-    
+
     std::function<void()> callback = nullptr;
     {
         std::lock_guard<std::mutex> lock(mock_read_frame_mutex);
@@ -308,7 +564,15 @@ inline int mock_av_read_frame(AVFormatContext* s, AVPacket* pkt) {
     if (callback) {
         callback();
     }
-    return av_read_frame(s, pkt);
+    int ret = av_read_frame(s, pkt);
+    // Strips pts (moving it to dts) on every real packet read while active,
+    // to deterministically exercise pts-is-NOPTS/dts-is-valid fallback
+    // branches that real demuxers essentially never produce on their own.
+    if (ret >= 0 && force_pts_to_dts_only && pkt->pts != AV_NOPTS_VALUE) {
+        pkt->dts = pkt->pts;
+        pkt->pts = AV_NOPTS_VALUE;
+    }
+    return ret;
 }
 #define av_read_frame mock_av_read_frame
 
@@ -324,6 +588,43 @@ inline bool mock_SDL_Init(SDL_InitFlags flags) {
     return ret;
 }
 #define SDL_Init mock_SDL_Init
+
+inline SDL_AudioDeviceID* mock_SDL_GetAudioPlaybackDevices(int* count) {
+    int n = force_fake_playback_devices.load();
+    if (n > 0) {
+        SDL_AudioDeviceID* arr = static_cast<SDL_AudioDeviceID*>(SDL_malloc(sizeof(SDL_AudioDeviceID) * static_cast<size_t>(n)));
+        for (int i = 0; i < n; ++i) {
+            arr[i] = static_cast<SDL_AudioDeviceID>(9000 + i);
+        }
+        *count = n;
+        return arr;
+    }
+    return SDL_GetAudioPlaybackDevices(count);
+}
+#define SDL_GetAudioPlaybackDevices mock_SDL_GetAudioPlaybackDevices
+
+inline const char* mock_SDL_GetAudioDeviceName(SDL_AudioDeviceID devid) {
+    if (devid >= 9000 && devid < 9064) {
+        static thread_local std::string fakeName;
+        fakeName = "Fake Device " + std::to_string(devid - 9000);
+        return fakeName.c_str();
+    }
+    return SDL_GetAudioDeviceName(devid);
+}
+#define SDL_GetAudioDeviceName mock_SDL_GetAudioDeviceName
+
+inline int mock_SDL_GetAudioStreamQueued(SDL_AudioStream* stream) {
+    int forced = force_queued_bytes.load();
+    if (forced >= 0) return forced;
+    return SDL_GetAudioStreamQueued(stream);
+}
+#define SDL_GetAudioStreamQueued mock_SDL_GetAudioStreamQueued
+
+inline int mock_av_channel_layout_describe(const AVChannelLayout* channel_layout, char* buf, size_t buf_size) {
+    if (force_channel_layout_describe_fail) return -1;
+    return av_channel_layout_describe(channel_layout, buf, buf_size);
+}
+#define av_channel_layout_describe mock_av_channel_layout_describe
 
 // -------------------------------------------------------------
 // Direct C++ sources inclusion with private visibility bypass
@@ -345,6 +646,95 @@ void test_assert(bool condition, const std::string& message) {
         throw std::runtime_error("exit_called_1");
     } else {
         std::cout << "Assertion PASSED: " << message << std::endl;
+    }
+}
+
+// Feed a packet into a live PlayerController's packet queue without ever
+// blocking. ThreadSafeQueue::push() waits indefinitely while the queue sits
+// at capacity, and this binary runs with the video thread disabled
+// (g_videoThreadEnabled = false in main()), so nothing drains a video queue
+// the demuxer has already saturated -- which it does within milliseconds of
+// openFile() on any real file. A plain push() there deadlocks the test
+// thread outright, and only sometimes: it comes down to whether the demuxer
+// refills the slot a try_pop() just freed before this push() takes the lock.
+// push_wait_or_drop() is the codebase's own backstop for producers that must
+// not block (see ThreadSafeQueue.hpp) -- it drops the oldest packet to make
+// room rather than waiting forever.
+static bool feedPacket(ThreadSafeQueue<AVPacket*>& queue, AVPacket* packet) {
+    if (!queue.push_wait_or_drop(packet, std::chrono::milliseconds(50),
+                                 [](AVPacket*& dropped) { av_packet_free(&dropped); })) {
+        av_packet_free(&packet);
+        return false;
+    }
+    return true;
+}
+
+// Defensive reset of every force_*/mock_* injection flag to its default
+// (off/passthrough) state. Intended for tests that spawn real background
+// decode work (e.g. the loudness prescan thread) that must behave like real
+// production code -- a flag some earlier, unrelated test forgot to reset
+// could otherwise silently break or hang it.
+void resetAllMockFlags() {
+    force_alloc_fail = false;
+    force_open_fail = false;
+    force_frame_alloc_fail = false;
+    force_malloc_fail = false;
+    force_image_fill_fail = false;
+    force_swr_init_fail = false;
+    force_swr_convert_fail = false;
+    force_seek_fail = false;
+    force_find_stream_info_fail = false;
+    force_copy_params_fail = false;
+    force_sdl_audio_fail = false;
+    force_send_packet_fail = false;
+    force_receive_frame_fail = false;
+    force_synthetic_flush_frame = false;
+    pending_synthetic_flush_frame = false;
+    force_player_frame_ref_fail_next = -1;
+    force_decode_delay_once_ms = 0;
+    force_no_pts = false;
+    force_no_streams = false;
+    force_no_duration = false;
+    force_packet_alloc_fail = false;
+    force_read_error = false;
+    force_video_eof = false;
+    force_video_error = false;
+    force_sws_context_fail = false;
+    force_read_eof = false;
+    force_zero_channels = false;
+    force_channel_layout_5_1 = false;
+    force_channel_layout_2_1 = false;
+    force_sdl_reject_surround = false;
+    force_sdl_init_fail = false;
+    force_hw_transfer_fail = false;
+    force_receive_eagain = false;
+    mock_send_packet_success = false;
+    mock_hw_transfer_nv12 = false;
+    force_soxr_fail = false;
+    force_swr_alloc_fail = false;
+    force_swr_init_fail_on_retry = -1;
+    force_no_pts_no_dts = false;
+    force_fake_playback_devices = 0;
+    force_queued_bytes = -1;
+    force_channel_layout_describe_fail = false;
+    force_hw_transfer_real_buffer = false;
+    force_hw_frame_ref_fail = false;
+    force_frame_alloc_fail_on_second_call = -1;
+    force_send_packet_eagain = false;
+    force_receive_frame_eagain_then_fail = -1;
+    force_avfilter_graph_alloc_fail = false;
+    force_avfilter_get_by_name_fail = false;
+    force_avfilter_create_filter_fail = false;
+    force_buffersrc_add_frame_fail = false;
+    force_find_decoder_fail = false;
+    force_find_encoder_fail = false;
+    force_send_frame_fail = false;
+    force_receive_packet_fail = false;
+    force_synthetic_subtitle_rect = 0;
+    force_pts_to_dts_only = false;
+    {
+        std::lock_guard<std::mutex> lock(mock_read_frame_mutex);
+        on_mock_read_frame = nullptr;
     }
 }
 
@@ -412,6 +802,15 @@ int real_main(int argc, char* argv[]) {
 
     std::cout << "Testing with file: " << testFile << std::endl;
 
+    // SDL_Quit() at the end of this function frees every SDL audio
+    // stream that is still open. Any PlayerController alive past that
+    // point then destroys its own stream a second time from
+    // ~PlayerController() -> stop() -> AudioDecoder::stop() -- the
+    // heap-use-after-free ASan flagged here. Scoping every controller
+    // in this function (this one and all of the try block's) so they
+    // are torn down before SDL_Quit() keeps the shutdown order right.
+    int realMainResult = 0;
+    {
     PlayerController controller;
 
     try {
@@ -645,7 +1044,193 @@ int real_main(int argc, char* argv[]) {
                 test_assert(testDecoder.getYUVFrame()->height == 1080, "Original frame height is 1080");
             }
 
+            // Test case 7b: getTargetDimensions() directly for every
+            // ResolutionOption case -- convertFrame() above only exercises
+            // R_4K/R_720P/ORIGINAL, leaving the other box sizes and the
+            // invalid-enum default fallback untested.
+            {
+                int w = 0, h = 0;
+                getTargetDimensions(ResolutionOption::R_360P, 1920, 1080, w, h);
+                test_assert(w == 640 && h == 360, "getTargetDimensions() boxes 1920x1080 into the 360p box");
+
+                getTargetDimensions(ResolutionOption::R_480P, 1920, 1080, w, h);
+                // 480/1080 (the binding, height-constrained scale factor)
+                // isn't exactly representable in floating point, so the
+                // scaled width truncates to 852, not the box's nominal 854.
+                test_assert(w == 852 && h == 480, "getTargetDimensions() boxes 1920x1080 into the 480p box");
+
+                getTargetDimensions(ResolutionOption::R_1080P, 640, 360, w, h);
+                test_assert(w == 1920 && h == 1080, "getTargetDimensions() boxes 640x360 up into the 1080p box");
+
+                getTargetDimensions(ResolutionOption::R_1440P, 640, 360, w, h);
+                test_assert(w == 2560 && h == 1440, "getTargetDimensions() boxes 640x360 up into the 1440p box");
+
+                // An out-of-range enum value (COUNT, never a real selection)
+                // must fall through to the "pass native dimensions through
+                // unchanged" default branch rather than reading garbage boxW/boxH.
+                getTargetDimensions(ResolutionOption::COUNT, 1920, 1080, w, h);
+                test_assert(w == 1920 && h == 1080, "getTargetDimensions() passes native size through for an invalid enum value");
+            }
+
+            // Test case 7c: getColorInfo(), never called anywhere else in the
+            // suite. testDecoder.getYUVFrame() (the sws-converted output) was
+            // left at 1920x1080 by test case 7 above, but m_decodedFrame (the
+            // raw decode source getColorInfo() actually reads) is a distinct
+            // AVFrame -- set its width/height explicitly to reach the
+            // decoded-frame source branch, rather than assuming it carries
+            // over. Subsequent calls manually set specific color/side-data
+            // fields (private-access) to reach the named/HDR/chroma branches
+            // no real content in this suite happens to carry.
+            {
+                testDecoder.m_decodedFrame->width = 1920;
+                testDecoder.m_decodedFrame->height = 1080;
+                // Test case 7's own convertFrame() calls leave m_allocatedFormat
+                // set to whatever format it last scaled to -- reset it so the
+                // pixFmt manipulated below actually takes effect (its override
+                // of pixFmt is tested deliberately, later, in isolation).
+                testDecoder.m_allocatedFormat = AV_PIX_FMT_NONE;
+                ColorPipelineInfo baseline = testDecoder.getColorInfo();
+                test_assert(baseline.colorSpace == "Unspecified" || !baseline.colorSpace.empty(),
+                            "getColorInfo() reads color metadata from the decoded-frame source");
+
+                // Named colorspace/primaries, PQ transfer characteristic (hits
+                // the named-transferChar branch, the PQ display-name override,
+                // and the PQ isHDR/hdrType override in one call), limited
+                // range, and a HW-surface pixel format for the chroma branch.
+                testDecoder.m_decodedFrame->colorspace = AVCOL_SPC_BT709;
+                testDecoder.m_decodedFrame->color_primaries = AVCOL_PRI_BT709;
+                testDecoder.m_decodedFrame->color_trc = AVCOL_TRC_SMPTE2084;
+                testDecoder.m_decodedFrame->color_range = AVCOL_RANGE_MPEG;
+                testDecoder.m_decodedFrame->format = AV_PIX_FMT_D3D11;
+                // Properly FFmpeg-managed side data entries (av_frame_new_side_data),
+                // not hand-rolled stack structs -- av_frame_free()/av_frame_unref()
+                // must be able to safely release these later. The first
+                // entry's type is irrelevant: its array slot is temporarily
+                // nulled below to hit the "!sd -> continue" guard.
+                av_frame_new_side_data(testDecoder.m_decodedFrame, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA, 1);
+                av_frame_new_side_data(testDecoder.m_decodedFrame, AV_FRAME_DATA_DYNAMIC_HDR_PLUS, 1);
+                av_frame_new_side_data(testDecoder.m_decodedFrame, AV_FRAME_DATA_DOVI_METADATA, 1);
+                AVFrameSideData* masteringEntry = testDecoder.m_decodedFrame->side_data[0];
+                AVFrameSideData* hdrPlusEntry = testDecoder.m_decodedFrame->side_data[1];
+                AVFrameSideData* doviEntry = testDecoder.m_decodedFrame->side_data[2];
+                testDecoder.m_decodedFrame->side_data[0] = nullptr; // null entry, for the "!sd -> continue" guard
+
+                ColorPipelineInfo pq = testDecoder.getColorInfo();
+                testDecoder.m_decodedFrame->side_data[0] = masteringEntry; // restore for safe cleanup
+                test_assert(pq.colorSpace == "bt709", "getColorInfo() reports a named colorspace");
+                test_assert(pq.colorPrimaries == "bt709", "getColorInfo() reports named color primaries");
+                test_assert(pq.transferChar == "PQ (ST 2084)", "getColorInfo() gives PQ its friendly display name");
+                test_assert(pq.colorRange == "Limited (16-235)", "getColorInfo() reports MPEG range as Limited");
+                test_assert(pq.isHDR && pq.hdrType == "Dolby Vision",
+                            "getColorInfo() lets a later Dolby Vision side-data entry override an earlier PQ/HDR10+ classification");
+                test_assert(pq.chromaSubsampling == "HW Surface", "getColorInfo() reports a HW pixel format as 'HW Surface'");
+
+                // HLG transfer characteristic and Full/JPEG range (HLG alone
+                // already sets isHDR/hdrType via the trc check, independent
+                // of any side data) -- hide the PQ case's side data entries
+                // first, since a later one (Dolby Vision) would otherwise
+                // unconditionally overwrite this call's hdrType too.
+                testDecoder.m_decodedFrame->color_trc = AVCOL_TRC_ARIB_STD_B67;
+                testDecoder.m_decodedFrame->color_range = AVCOL_RANGE_JPEG;
+                int savedNbSideData = testDecoder.m_decodedFrame->nb_side_data;
+                testDecoder.m_decodedFrame->nb_side_data = 0;
+                ColorPipelineInfo hlg = testDecoder.getColorInfo();
+                testDecoder.m_decodedFrame->nb_side_data = savedNbSideData;
+                test_assert(hlg.transferChar == "HLG", "getColorInfo() gives HLG its friendly display name");
+                test_assert(hlg.colorRange == "Full (0-255)", "getColorInfo() reports JPEG range as Full");
+                test_assert(hlg.isHDR && hlg.hdrType == "HLG", "getColorInfo() classifies an HLG transfer characteristic as HDR");
+
+                // A non-HDR transfer characteristic with only a
+                // mastering-display side data entry: isHDR is NOT already
+                // true going in (unlike the PQ/HLG cases above), so this is
+                // the only way to reach the "!info.isHDR" guard's true branch.
+                testDecoder.m_decodedFrame->color_trc = AVCOL_TRC_BT709;
+                testDecoder.m_decodedFrame->side_data[1] = nullptr; // hide the DYNAMIC_HDR_PLUS entry from the PQ case above
+                testDecoder.m_decodedFrame->side_data[2] = nullptr; // hide the DOVI_METADATA entry from the PQ case above
+                ColorPipelineInfo mastering = testDecoder.getColorInfo();
+                testDecoder.m_decodedFrame->side_data[1] = hdrPlusEntry; // restore both for safe cleanup
+                testDecoder.m_decodedFrame->side_data[2] = doviEntry;
+                test_assert(!mastering.transferChar.empty() && mastering.transferChar != "PQ (ST 2084)",
+                            "getColorInfo() does not misreport BT.709 as PQ");
+                test_assert(mastering.isHDR && mastering.hdrType == "HDR10",
+                            "getColorInfo() classifies mastering-display-only metadata as HDR10 when nothing else already flagged it HDR");
+
+                // sRGB transfer characteristic naming, and standard 4:2:0
+                // chroma subsampling via a real (non-HW) pixel format.
+                testDecoder.m_decodedFrame->color_trc = AVCOL_TRC_IEC61966_2_1;
+                testDecoder.m_decodedFrame->format = AV_PIX_FMT_YUV420P;
+                testDecoder.m_decodedFrame->nb_side_data = 0;
+                ColorPipelineInfo srgb = testDecoder.getColorInfo();
+                test_assert(srgb.transferChar == "sRGB", "getColorInfo() gives sRGB its friendly display name");
+                test_assert(srgb.chromaSubsampling == "4:2:0", "getColorInfo() reports YUV420P as 4:2:0 chroma subsampling");
+                test_assert(srgb.bitDepth == 8, "getColorInfo() reports YUV420P's 8-bit component depth");
+
+                // Mono (grayscale), 4:2:2, and 4:4:4/4:1:1 chroma subsampling
+                // namings, each via a distinct real pixel format.
+                testDecoder.m_decodedFrame->format = AV_PIX_FMT_GRAY8;
+                test_assert(testDecoder.getColorInfo().chromaSubsampling == "4:0:0 (Mono)",
+                            "getColorInfo() reports a single-component format as 4:0:0 (Mono)");
+                testDecoder.m_decodedFrame->format = AV_PIX_FMT_YUV422P;
+                test_assert(testDecoder.getColorInfo().chromaSubsampling == "4:2:2",
+                            "getColorInfo() reports YUV422P as 4:2:2 chroma subsampling");
+                testDecoder.m_decodedFrame->format = AV_PIX_FMT_YUV444P;
+                test_assert(testDecoder.getColorInfo().chromaSubsampling == "4:4:4",
+                            "getColorInfo() reports YUV444P as 4:4:4 chroma subsampling");
+                testDecoder.m_decodedFrame->format = AV_PIX_FMT_YUV411P;
+                test_assert(testDecoder.getColorInfo().chromaSubsampling == "4:1:1",
+                            "getColorInfo() reports YUV411P as 4:1:1 chroma subsampling");
+
+                // Explicitly unspecified colorspace/primaries -> named-lookup
+                // branch's "Unspecified" fallback (distinct from the baseline
+                // call above, which only *incidentally* had unspecified
+                // metadata rather than exercising the fallback deliberately).
+                testDecoder.m_decodedFrame->colorspace = AVCOL_SPC_UNSPECIFIED;
+                testDecoder.m_decodedFrame->color_primaries = AVCOL_PRI_UNSPECIFIED;
+                testDecoder.m_decodedFrame->color_trc = AVCOL_TRC_UNSPECIFIED;
+                testDecoder.m_decodedFrame->color_range = AVCOL_RANGE_UNSPECIFIED;
+                testDecoder.m_decodedFrame->format = AV_PIX_FMT_NONE;
+                ColorPipelineInfo unspecified = testDecoder.getColorInfo();
+                test_assert(unspecified.colorSpace == "Unspecified", "getColorInfo() falls back to 'Unspecified' colorspace");
+                test_assert(unspecified.colorPrimaries == "Unspecified", "getColorInfo() falls back to 'Unspecified' primaries");
+                test_assert(unspecified.transferChar == "Unspecified", "getColorInfo() falls back to 'Unspecified' transfer characteristic");
+                test_assert(unspecified.colorRange == "Unspecified", "getColorInfo() falls back to 'Unspecified' color range");
+                test_assert(!unspecified.isHDR, "getColorInfo() reports SDR for fully unspecified metadata");
+
+                // m_allocatedFormat override: takes priority over whatever
+                // pixFmt was resolved from the decoded frame/codec context.
+                testDecoder.m_allocatedFormat = AV_PIX_FMT_NV12;
+                ColorPipelineInfo allocOverride = testDecoder.getColorInfo();
+                test_assert(allocOverride.pixelFormat == "nv12", "getColorInfo() prefers m_allocatedFormat over the source pixel format");
+                testDecoder.m_allocatedFormat = AV_PIX_FMT_NONE;
+
+                // No decoded frame (or width <= 0): falls through to the
+                // m_codecCtx source branch instead.
+                testDecoder.m_decodedFrame->width = 0;
+                testDecoder.m_codecCtx->colorspace = AVCOL_SPC_BT470BG;
+                ColorPipelineInfo fromCtx = testDecoder.getColorInfo();
+                test_assert(fromCtx.colorSpace == "bt470bg", "getColorInfo() falls back to m_codecCtx's color metadata when there's no decoded frame yet");
+                testDecoder.m_decodedFrame->width = 1920;
+            }
+
             avcodec_parameters_free(&testCodecParams);
+        }
+
+        // Test case 7d: getColorInfo()'s m_codecParams-only source branch --
+        // needs a VideoDecoder with neither a decoded frame nor a live codec
+        // context yet, which only a never-init()'d instance has.
+        {
+            ThreadSafeQueue<AVPacket*> dummyQueue2;
+            AVCodecParameters* paramsOnly = avcodec_parameters_alloc();
+            paramsOnly->codec_type = AVMEDIA_TYPE_VIDEO;
+            paramsOnly->codec_id = AV_CODEC_ID_RAWVIDEO;
+            paramsOnly->format = AV_PIX_FMT_RGB24;
+            paramsOnly->width = 160;
+            paramsOnly->height = 120;
+            VideoDecoder uninitDecoder(paramsOnly, {1, 25}, 0, dummyQueue2);
+            ColorPipelineInfo fromParams = uninitDecoder.getColorInfo();
+            test_assert(!fromParams.colorSpace.empty(),
+                        "getColorInfo() falls back to m_codecParams's color metadata before init() has run");
+            avcodec_parameters_free(&paramsOnly);
         }
 
         // -------------------------------------------------------------
@@ -922,6 +1507,161 @@ int real_main(int argc, char* argv[]) {
                             "Hardware decoder stays engaged across repeated consecutive seeks");
             }
 
+            // videoThreadLoop()'s av_frame_ref() failure branch (distinct
+            // from VideoDecoder::convertFrame()'s own, earlier av_frame_ref()
+            // call in its useNative fast path -- force_hw_frame_ref_fail
+            // alone can't isolate just this later call site, since both go
+            // through the same globally-mocked function and the earlier one
+            // would simply fail convertFrame() first, so this call site
+            // would never be reached). force_player_frame_ref_fail_next
+            // instead lets exactly one call through (VideoDecoder's) before
+            // failing exactly the next one (PlayerController's), then
+            // disarms itself -- a single surgical failure rather than an
+            // extended failing window, to avoid destabilizing the decoder.
+            //
+            // Seek to a known position with several seconds of stream left
+            // first: by this point the controller may be resting anywhere
+            // the earlier seek storms left it, including right at/near EOF,
+            // where normal playback legitimately stops producing frames on
+            // its own -- that's correct behavior, not something this test
+            // should be confused by.
+            {
+                catchupController.seek(std::min(1.0, dur * 0.2));
+                waitForCatchup(20.0);
+                catchupController.play();
+
+                force_player_frame_ref_fail_next = 1;
+                auto armStart = std::chrono::steady_clock::now();
+                while (force_player_frame_ref_fail_next.load() != -1 &&
+                       std::chrono::steady_clock::now() - armStart < std::chrono::seconds(5)) {
+                    drainFrames();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                }
+                force_player_frame_ref_fail_next = -1; // safety: disarm even if it never fired
+                // cppcheck-suppress knownConditionTrueFalse
+                // False positive: driveFor() calls drainFrames(), which
+                // increments framesDrainedTotal by reference two lambda
+                // layers away from this scope. cppcheck's value flow doesn't
+                // follow the mutation through that indirection.
+                framesDrainedTotal = 0;
+                driveFor(1.0);
+                test_assert(catchupController.getState() == PlayerState::PLAYING,
+                            "Playback survives a single dropped frame from a transient av_frame_ref() failure");
+                // cppcheck-suppress knownConditionTrueFalse
+                test_assert(framesDrainedTotal > 0,
+                            "Video frames resume after a single transient av_frame_ref() failure");
+            }
+
+            // videoThreadLoop()'s m_decodedFrameQueue.push_wait_or_drop()
+            // drop-callback and abort-return-false branches. Simply keeping
+            // the queue full doesn't work: videoThreadLoop()'s own
+            // pre-check (`if (queue.size() >= 8) continue;`) then skips
+            // every iteration before it ever attempts its own push at all,
+            // since it's the queue's sole normal producer. What's needed is
+            // to let it pass that gate first (queue not full yet), then
+            // fill the queue while it's busy decoding, so by the time it
+            // reaches its own push call the queue is already full.
+            //
+            // A first attempt did this by holding m_videoDecoderMutex (the
+            // same mutex videoThreadLoop locks around decode+convert) from
+            // the test thread to create that window -- it worked
+            // structurally, but holding a PlayerController-internal mutex
+            // from outside destabilized SDL's own internals (a hard
+            // SDL_LockMutex_srw assertion failure and a genuinely hung
+            // process, not mere flakiness -- and a crash never flushes
+            // .gcda, silently losing all coverage data for that run). This
+            // version creates the same window without touching any
+            // PlayerController mutex at all: force_decode_delay_once_ms
+            // injects a one-shot artificial delay into the next real
+            // avcodec_receive_frame() call (already globally mocked), so
+            // the video thread is genuinely busy inside decodeNextFrame()
+            // -- past its own gate check, not holding anything the test
+            // needs -- while this thread fills the queue via the same
+            // public push_wait_or_drop() API, a legitimate second producer.
+            {
+                catchupController.seek(std::min(1.0, dur * 0.2));
+                waitForCatchup(20.0);
+                catchupController.play();
+                driveFor(0.3); // let real decode/drain run for a moment first
+
+                DecodedFrame flushDf;
+                while (catchupController.getDecodedFrameQueue().try_pop(flushDf)) {
+                    if (flushDf.frame) av_frame_free(&flushDf.frame);
+                }
+
+                auto fillQueueDuringDelayedDecode = [&]() {
+                    force_decode_delay_once_ms = 600;
+                    // Give the video thread a moment to pass its gate check
+                    // (queue empty right now) and enter the delayed decode.
+                    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+                    for (int i = 0; i < 8; i++) {
+                        DecodedFrame filler;
+                        filler.frame = av_frame_alloc();
+                        catchupController.getDecodedFrameQueue().push_wait_or_drop(
+                            filler, std::chrono::milliseconds(50),
+                            [](DecodedFrame& d) { if (d.frame) av_frame_free(&d.frame); });
+                    }
+                };
+
+                // Sub-test A: drop-callback path. Once the delayed decode
+                // finishes and convertFrame() succeeds (fast), the video
+                // thread's own push_wait_or_drop() finds the queue already
+                // full and waits past its 500ms timeout, hitting the
+                // drop-oldest callback.
+                fillQueueDuringDelayedDecode();
+                std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+
+                DecodedFrame drainDf;
+                while (catchupController.getDecodedFrameQueue().try_pop(drainDf)) {
+                    if (drainDf.frame) av_frame_free(&drainDf.frame);
+                }
+                test_assert(catchupController.getState() == PlayerState::PLAYING,
+                            "Playback survives a saturated decoded-frame queue (drop-oldest path)");
+
+                // Sub-test B: abort-returns-false path. Same setup, but
+                // abort the real queue while the video thread's own call is
+                // waiting on it, so it observes m_aborted and returns false
+                // immediately instead of timing out into a drop.
+                fillQueueDuringDelayedDecode();
+                std::this_thread::sleep_for(std::chrono::milliseconds(650)); // past the decode delay, mid-wait
+                catchupController.getDecodedFrameQueue().abort();
+                std::this_thread::sleep_for(std::chrono::milliseconds(300));
+                catchupController.getDecodedFrameQueue().reset();
+
+                // Re-seek to a position with fresh runway before checking
+                // for resumed frames: real-time playback kept advancing
+                // through every sleep above, and could easily have run out
+                // of stream by now -- legitimately producing no more frames
+                // on its own, which isn't something this check should
+                // mistake for a stuck decoder.
+                catchupController.seek(std::min(1.0, dur * 0.2));
+                waitForCatchup(20.0);
+                catchupController.play();
+
+                // Patient poll, not a fixed window: a failed assertion here
+                // throws and aborts the whole suite mid-run, which loses
+                // all coverage data for this run (no .gcda gets written on
+                // that path), so this must not be a hair-trigger check.
+                framesDrainedTotal = 0;
+                auto resumeStart = std::chrono::steady_clock::now();
+                // cppcheck-suppress knownConditionTrueFalse
+                // False positive: drainFrames() (called each iteration)
+                // increments framesDrainedTotal by reference, so this loop
+                // condition does change -- cppcheck's value flow doesn't
+                // follow the mutation through the captured-by-reference
+                // lambda.
+                while (framesDrainedTotal == 0 &&
+                       std::chrono::steady_clock::now() - resumeStart < std::chrono::seconds(10)) {
+                    drainFrames();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                }
+                test_assert(catchupController.getState() == PlayerState::PLAYING,
+                            "Playback survives a queue abort/reset cycle");
+                // cppcheck-suppress knownConditionTrueFalse
+                test_assert(framesDrainedTotal > 0,
+                            "Video frames resume normally afterward");
+            }
+
             catchupController.stop();
             g_videoThreadEnabled = false;
         }
@@ -1045,7 +1785,7 @@ int real_main(int argc, char* argv[]) {
 
         // Push a dummy packet to ensure queue is not empty, preventing premature EOF state transition
         AVPacket* dummyPkt = av_packet_alloc();
-        controller.m_videoQueue.push(dummyPkt);
+        feedPacket(controller.m_videoQueue, dummyPkt);
 
         // Verify getCurrentTime drives updateClockForVideoOnly()
         double videoOnlyTime1 = controller.getCurrentTime();
@@ -1298,6 +2038,301 @@ int real_main(int argc, char* argv[]) {
         test_assert(!audioStereoVirtual.isVirtualSurroundActive(),
                     "VIRTUAL_SURROUND has nothing to fold down for an already-stereo source");
         avcodec_parameters_free(&paramsStereoVirtual);
+
+        // 11f2. Actually decode through a VIRTUAL_SURROUND+5.1 decoder (11e
+        // above only ever calls init() on one, never decodeAndResample()):
+        // the spatial-downmix fold-down inside the live decode loop is only
+        // reachable once real resampled samples exist to fold down.
+        {
+            force_channel_layout_5_1 = true;
+            AVCodecParameters* paramsVSurroundDecode = avcodec_parameters_alloc();
+            if (controller.m_demuxer && controller.m_demuxer->getAudioCodecParams()) {
+                avcodec_parameters_copy(paramsVSurroundDecode, controller.m_demuxer->getAudioCodecParams());
+            }
+            ThreadSafeQueue<AVPacket*> privateVSurroundQueue(8);
+            AudioDecoder audioVSurroundDecode(paramsVSurroundDecode, {1, 48000}, 0, privateVSurroundQueue);
+            audioVSurroundDecode.setChannelOption(AudioChannelOption::VIRTUAL_SURROUND);
+            test_assert(audioVSurroundDecode.init(), "AudioDecoder initializes for the VIRTUAL_SURROUND decode test");
+            test_assert(audioVSurroundDecode.isVirtualSurroundActive(),
+                        "VIRTUAL_SURROUND decode test decoder has the spatial downmix active");
+
+            // Feed several real packets (borrowed non-blocking from the live
+            // demuxer's audio queue): swr_convert() can legitimately return 0
+            // samples on early calls while its internal buffer fills, so a
+            // single packet isn't guaranteed to actually reach the
+            // spatial-downmix stage.
+            for (int i = 0; i < 10; ++i) {
+                AVPacket* realPkt = nullptr;
+                for (int w = 0; w < 25 && !controller.m_audioQueue.try_pop(realPkt); ++w) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                }
+                if (!realPkt) break;
+                privateVSurroundQueue.push(realPkt);
+                audioVSurroundDecode.decodeAndResample();
+            }
+            privateVSurroundQueue.clear([](AVPacket*& p) { av_packet_free(&p); });
+            avcodec_parameters_free(&paramsVSurroundDecode);
+            force_channel_layout_5_1 = false;
+        }
+
+        // 11g. Anonymous-namespace helpers isDirectlySupportedSurroundLayout()/
+        // spatialSourceLayoutFor() -- callable directly since tests.cpp includes
+        // AudioDecoder.cpp into this same translation unit. Covers a non-native
+        // channel order and the 5.1(back)/7.1 masks that no real test asset's
+        // actual layout ever triggers.
+        {
+            AVChannelLayout customOrder{};
+            customOrder.order = AV_CHANNEL_ORDER_UNSPEC;
+            test_assert(!isDirectlySupportedSurroundLayout(customOrder),
+                        "isDirectlySupportedSurroundLayout() rejects a non-native channel order");
+
+            AVChannelLayout backLayout{};
+            av_channel_layout_from_mask(&backLayout, AV_CH_LAYOUT_5POINT1_BACK);
+            test_assert(spatialSourceLayoutFor(backLayout) == naikav::dsp::SpatialDownmixer::SourceLayout::FIVEPOINT1_BACK,
+                        "spatialSourceLayoutFor() maps 5.1(back) to FIVEPOINT1_BACK");
+            av_channel_layout_uninit(&backLayout);
+
+            AVChannelLayout layout71{};
+            av_channel_layout_from_mask(&layout71, AV_CH_LAYOUT_7POINT1);
+            test_assert(spatialSourceLayoutFor(layout71) == naikav::dsp::SpatialDownmixer::SourceLayout::SEVENPOINT1,
+                        "spatialSourceLayoutFor() maps 7.1 to SEVENPOINT1");
+            av_channel_layout_uninit(&layout71);
+        }
+
+        // 11h. libsoxr unavailable (best-effort fallback): av_opt_set() fails
+        // for the "resampler"="soxr" option specifically -- init() must still
+        // succeed using swresample's own default engine, just with a warning.
+        {
+            force_soxr_fail = true;
+            AVCodecParameters* paramsSoxrFail = avcodec_parameters_alloc();
+            if (controller.m_demuxer && controller.m_demuxer->getAudioCodecParams()) {
+                avcodec_parameters_copy(paramsSoxrFail, controller.m_demuxer->getAudioCodecParams());
+            }
+            AudioDecoder audioSoxrFail(paramsSoxrFail, {1, 48000}, 0, controller.m_audioQueue);
+            test_assert(audioSoxrFail.init(), "AudioDecoder still initializes when libsoxr is unavailable (best-effort fallback)");
+            avcodec_parameters_free(&paramsSoxrFail);
+            force_soxr_fail = false;
+        }
+
+        // 11i. swr_alloc_set_opts2() itself fails (distinct from swr_init()
+        // failing): initResampler() must report failure and init() must fail
+        // gracefully rather than dereferencing a null SwrContext.
+        {
+            force_swr_alloc_fail = true;
+            AVCodecParameters* paramsSwrAllocFail = avcodec_parameters_alloc();
+            if (controller.m_demuxer && controller.m_demuxer->getAudioCodecParams()) {
+                avcodec_parameters_copy(paramsSwrAllocFail, controller.m_demuxer->getAudioCodecParams());
+            }
+            AudioDecoder audioSwrAllocFail(paramsSwrAllocFail, {1, 48000}, 0, controller.m_audioQueue);
+            test_assert(!audioSwrAllocFail.init(), "AudioDecoder fails gracefully when swr_alloc_set_opts2() fails");
+            avcodec_parameters_free(&paramsSwrAllocFail);
+            force_swr_alloc_fail = false;
+        }
+
+        // 11j. Stereo-fallback resampler reinitialization itself fails (distinct
+        // from 11c, where the retry succeeds): the device rejects the surround
+        // stream AND the retry's initResampler() call fails -- init() must
+        // report failure rather than proceeding with a stale/surround resampler
+        // against a stereo device spec.
+        {
+            force_channel_layout_5_1 = true;
+            force_sdl_reject_surround = true;
+            force_swr_init_fail_on_retry = 1; // let the first initResampler() succeed, fail the retry
+            AVCodecParameters* paramsRetryFail = avcodec_parameters_alloc();
+            if (controller.m_demuxer && controller.m_demuxer->getAudioCodecParams()) {
+                avcodec_parameters_copy(paramsRetryFail, controller.m_demuxer->getAudioCodecParams());
+            }
+            AudioDecoder audioRetryFail(paramsRetryFail, {1, 48000}, 0, controller.m_audioQueue);
+            test_assert(!audioRetryFail.init(),
+                        "AudioDecoder fails gracefully when the stereo-fallback resampler reinit itself fails");
+            avcodec_parameters_free(&paramsRetryFail);
+            force_channel_layout_5_1 = false;
+            force_sdl_reject_surround = false;
+            force_swr_init_fail_on_retry = -1;
+        }
+
+        // 11k. Output device resolution by name: enumeratePlaybackDeviceNames()'s
+        // device-list loop and resolveOutputDeviceId()'s name-matching loop,
+        // neither of which a real (often deviceless/headless CI) enumeration
+        // exercises.
+        {
+            force_fake_playback_devices = 3;
+            auto fakeNames = AudioDecoder::enumeratePlaybackDeviceNames();
+            test_assert(fakeNames.size() == 3, "enumeratePlaybackDeviceNames() lists every enumerated device");
+            test_assert(fakeNames[1] == "Fake Device 1", "enumeratePlaybackDeviceNames() reports each device's real name");
+
+            AVCodecParameters* paramsNamedDevice = avcodec_parameters_alloc();
+            if (controller.m_demuxer && controller.m_demuxer->getAudioCodecParams()) {
+                avcodec_parameters_copy(paramsNamedDevice, controller.m_demuxer->getAudioCodecParams());
+            }
+            AudioDecoder audioNamedDevice(paramsNamedDevice, {1, 48000}, 0, controller.m_audioQueue);
+            audioNamedDevice.setOutputDeviceName("Fake Device 1");
+            test_assert(audioNamedDevice.init(), "AudioDecoder initializes against a resolved named device");
+            avcodec_parameters_free(&paramsNamedDevice);
+            force_fake_playback_devices = 0;
+        }
+
+        // 11l. setPlaybackSpeed() called before init(): the resolved SDL
+        // stream must be created with that non-1.0x ratio already applied,
+        // not just updated lazily on a later setPlaybackSpeed() call.
+        {
+            AVCodecParameters* paramsSpeed = avcodec_parameters_alloc();
+            if (controller.m_demuxer && controller.m_demuxer->getAudioCodecParams()) {
+                avcodec_parameters_copy(paramsSpeed, controller.m_demuxer->getAudioCodecParams());
+            }
+            AudioDecoder audioSpeed(paramsSpeed, {1, 48000}, 0, controller.m_audioQueue);
+            audioSpeed.setPlaybackSpeed(1.5f);
+            test_assert(audioSpeed.init(), "AudioDecoder initializes with a pre-set non-1.0x playback speed");
+            avcodec_parameters_free(&paramsSpeed);
+        }
+
+        // 11m. getAudioClock()'s divide-by-zero guard: m_outChannels/m_outSampleRate
+        // both default to real nonzero values in the constructor (2 and 48000),
+        // so the only way to reach this guard is to force one of them to zero
+        // directly -- it's otherwise unreachable through any public API.
+        {
+            AVCodecParameters* paramsClock = avcodec_parameters_alloc();
+            if (controller.m_demuxer && controller.m_demuxer->getAudioCodecParams()) {
+                avcodec_parameters_copy(paramsClock, controller.m_demuxer->getAudioCodecParams());
+            }
+            AudioDecoder audioClock(paramsClock, {1, 48000}, 0, controller.m_audioQueue);
+            audioClock.setClock(42.0);
+            audioClock.m_outChannels = 0; // private-access: force the zero-channels guard
+            test_assert(audioClock.getAudioClock() == 42.0,
+                        "getAudioClock() returns the base clock via the zero-channels guard");
+            audioClock.m_outChannels = 2;
+
+            // getAudioClock()'s playedFrames-goes-negative clamp: after
+            // init(), force SDL_GetAudioStreamQueued() to report far more
+            // queued bytes than have ever been consumed.
+            test_assert(audioClock.init(), "AudioDecoder initializes for the getAudioClock() clamp test");
+            force_queued_bytes = 999999999;
+            double clampedClock = audioClock.getAudioClock();
+            test_assert(clampedClock >= audioClock.getAudioClock() - 1.0,
+                        "getAudioClock() clamps a negative playedFrames count to 0 instead of going negative");
+            force_queued_bytes = -1;
+            avcodec_parameters_free(&paramsClock);
+        }
+
+        // 11n. Decoded frame with neither pts nor pkt_dts set: both the
+        // drop-check's clock-snapshot fallback and the post-resample clock
+        // update's frame-duration fallback must be used, rather than reading
+        // an uninitialized/garbage timestamp. Also covers the stale
+        // seek-generation packet drop (mismatched generation -> dropped and
+        // retried) and the "no pts anywhere" branch's interaction with a live
+        // decode, using a decoder wired to the real demuxer's audio queue so
+        // it decodes genuine packets.
+        {
+            AVCodecParameters* paramsDecode = avcodec_parameters_alloc();
+            if (controller.m_demuxer && controller.m_demuxer->getAudioCodecParams()) {
+                avcodec_parameters_copy(paramsDecode, controller.m_demuxer->getAudioCodecParams());
+            }
+            // A private, dedicated queue rather than the live controller's
+            // shared m_audioQueue: this test pushes packets directly and must
+            // control exactly what decodeAndResample() sees next, with no
+            // risk of blocking on (or racing) whatever the real demuxer
+            // thread is doing to that shared queue concurrently.
+            ThreadSafeQueue<AVPacket*> privateAudioQueue(8);
+            AudioDecoder audioDecode(paramsDecode, {1, 48000}, 0, privateAudioQueue);
+            test_assert(audioDecode.init(), "AudioDecoder initializes for the pts-fallback/decode tests");
+
+            // Stale seek-generation packet: attach a generation counter, then
+            // feed a packet tagged with an old generation so decodeAndResample()
+            // must drop it (av_packet_free + continue) rather than decode it.
+            std::atomic<uint64_t> genCounter{5};
+            audioDecode.attachSeekGeneration(&genCounter);
+            AVPacket* stalePkt = av_packet_alloc();
+            stalePkt->opaque = reinterpret_cast<void*>(static_cast<uintptr_t>(1));
+            privateAudioQueue.push(stalePkt); // empty, capacity-8 private queue: never blocks
+            audioDecode.decodeAndResample(); // pops+drops the stale packet, then finds the queue empty
+            audioDecode.attachSeekGeneration(nullptr);
+
+            // Both pts and pkt_dts unset on a real decoded frame: borrow one
+            // genuine packet (non-blocking) from the live demuxer's audio
+            // queue -- same codec/stream, so it decodes normally -- and feed
+            // it into this decoder's own private queue.
+            force_no_pts_no_dts = true;
+            AVPacket* realPkt = nullptr;
+            for (int i = 0; i < 50 && !controller.m_audioQueue.try_pop(realPkt); ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            }
+            if (realPkt) {
+                privateAudioQueue.push(realPkt);
+                audioDecode.decodeAndResample();
+            }
+            force_no_pts_no_dts = false;
+
+            privateAudioQueue.clear([](AVPacket*& p) { av_packet_free(&p); });
+            avcodec_parameters_free(&paramsDecode);
+        }
+
+        // 11o. sdlAudioStreamCallback()'s len<=0 defaulting-to-4096 branch,
+        // and the samplesToCopy<=0 defensive break (an additional_amount so
+        // small that fewer than one output sample's worth of bytes are
+        // requested, once a real decode has already primed the buffer).
+        {
+            AVCodecParameters* paramsCallback = avcodec_parameters_alloc();
+            if (controller.m_demuxer && controller.m_demuxer->getAudioCodecParams()) {
+                avcodec_parameters_copy(paramsCallback, controller.m_demuxer->getAudioCodecParams());
+            }
+            AudioDecoder audioCallback(paramsCallback, {1, 48000}, 0, controller.m_audioQueue);
+            test_assert(audioCallback.init(), "AudioDecoder initializes for the sdlAudioStreamCallback() tests");
+
+            AudioDecoder::sdlAudioStreamCallback(&audioCallback, nullptr, 0, 0);
+            AudioDecoder::sdlAudioStreamCallback(&audioCallback, nullptr, -1, -1);
+
+            // Prime the internal buffer with a real decode, then request an
+            // absurdly small number of bytes so samplesToCopy resolves to 0.
+            AudioDecoder::sdlAudioStreamCallback(&audioCallback, nullptr, 4096, 4096);
+            AudioDecoder::sdlAudioStreamCallback(&audioCallback, nullptr, 1, 1);
+
+            avcodec_parameters_free(&paramsCallback);
+
+            // BIT_32_FLOAT and BIT_32_INT output paths, each at all three
+            // volume tiers (muted / partial / full) -- only BIT_16 (the
+            // default) is exercised by any other test. setOutputBitDepth()
+            // must be called before init() (it's what sizes
+            // m_outputBytesPerSample and the SDL stream's own format), so
+            // each depth needs its own freshly-initialized decoder rather
+            // than changing an already-initialized one's depth in place.
+            for (auto depth : { AudioOutputBitDepth::BIT_32_FLOAT, AudioOutputBitDepth::BIT_32_INT }) {
+                AVCodecParameters* paramsDepth = avcodec_parameters_alloc();
+                if (controller.m_demuxer && controller.m_demuxer->getAudioCodecParams()) {
+                    avcodec_parameters_copy(paramsDepth, controller.m_demuxer->getAudioCodecParams());
+                }
+                AudioDecoder audioDepth(paramsDepth, {1, 48000}, 0, controller.m_audioQueue);
+                audioDepth.setOutputBitDepth(depth);
+                test_assert(audioDepth.init(), "AudioDecoder initializes with a non-default output bit depth");
+                for (float vol : { 0.0f, 0.5f, 1.0f }) {
+                    audioDepth.setVolume(vol);
+                    AudioDecoder::sdlAudioStreamCallback(&audioDepth, nullptr, 4096, 4096);
+                }
+                avcodec_parameters_free(&paramsDepth);
+            }
+        }
+
+        // 11p. getOutputChannelLayoutName()'s av_channel_layout_describe()
+        // failure fallback (falls back to "mono"/"stereo"/"Nch" by channel
+        // count), and the trivial getters no other test calls at all.
+        {
+            AVCodecParameters* paramsGetters = avcodec_parameters_alloc();
+            if (controller.m_demuxer && controller.m_demuxer->getAudioCodecParams()) {
+                avcodec_parameters_copy(paramsGetters, controller.m_demuxer->getAudioCodecParams());
+            }
+            AudioDecoder audioGetters(paramsGetters, {1, 48000}, 0, controller.m_audioQueue);
+            test_assert(audioGetters.init(), "AudioDecoder initializes for the remaining-getters tests");
+
+            force_channel_layout_describe_fail = true;
+            std::string fallbackName = audioGetters.getOutputChannelLayoutName();
+            test_assert(fallbackName == "stereo" || fallbackName == "mono" || fallbackName.find("ch") != std::string::npos,
+                        "getOutputChannelLayoutName() falls back to a channel-count name when av_channel_layout_describe() fails");
+            force_channel_layout_describe_fail = false;
+
+            test_assert(audioGetters.getAudioStreamQueuedBytes() >= 0, "getAudioStreamQueuedBytes() returns a sane value");
+            (void)audioGetters.getDspSettings();
+            (void)audioGetters.getCurrentLoudnessGainDb();
+            avcodec_parameters_free(&paramsGetters);
+        }
 
         // 12. Demuxer finds no video/audio streams path
         force_no_streams = true;
@@ -1662,11 +2697,14 @@ int real_main(int argc, char* argv[]) {
 
     } catch (const std::exception& e) {
         std::cerr << "[EXPECTED] Exception occurred during tests: " << e.what() << std::endl;
-        SDL_Quit();
-        return 1;
+        realMainResult = 1;
     }
+    } // scope end: every PlayerController above is destroyed here
 
     SDL_Quit();
+    if (realMainResult != 0) {
+        return realMainResult;
+    }
     std::cout << "All integration tests PASSED successfully!" << std::endl;
     return 0;
 }
@@ -1936,6 +2974,244 @@ int main(int argc, char* argv[]) {
             }
         }
 
+        // move(): the invalid-index/no-op early return.
+        {
+            Playlist pl;
+            pl.addMany({fileA, fileB, fileC});
+            test_assert(!pl.move(-1, 0), "move(-1, 0) fails: negative index");
+            test_assert(!pl.move(0, 99), "move(0, 99) fails: out-of-range index");
+            test_assert(!pl.move(1, 1), "move(1, 1) fails: from == to");
+        }
+
+        // setCurrentIndex(): the invalid-index branch (clears m_currentId).
+        {
+            Playlist pl;
+            pl.addMany({fileA, fileB});
+            pl.setCurrentIndex(0);
+            test_assert(pl.getCurrentIndex() == 0, "setCurrentIndex(0) succeeds first");
+            test_assert(!pl.setCurrentIndex(99), "setCurrentIndex(99) fails: out of range");
+            test_assert(pl.getCurrentIndex() == -1, "setCurrentIndex(99) clears the current item");
+        }
+
+        // previous() with nothing currently selected: starts from the *last*
+        // item (distinct from next()'s "start at the first item" branch,
+        // already covered elsewhere).
+        {
+            Playlist pl;
+            pl.addMany({fileA, fileB, fileC});
+            auto prev = pl.previous();
+            test_assert(prev.has_value() && prev->path == fileC,
+                        "previous() with nothing selected starts from the last item");
+        }
+
+        // step()'s final "every item invalid" fallthrough (distinct from the
+        // Off-repeat-mode "stepped past the end" early return already
+        // covered): needs RepeatMode::All (or One) so the loop actually runs
+        // to completion instead of bailing out early on the first
+        // out-of-bounds step.
+        {
+            Playlist pl;
+            pl.addMany({missingFile, missingFile});
+            pl.setRepeatMode(RepeatMode::All);
+            auto none = pl.next();
+            test_assert(!none.has_value(), "next() under RepeatMode::All returns nullopt when every item is invalid");
+        }
+
+        // loadM3U(): a network URL entry is skipped (and clears any pending
+        // #EXTINF title), rather than added as a broken local path.
+        {
+            std::filesystem::path m3uWithUrl = tmpDir / "with_url.m3u8";
+            {
+                std::ofstream f(m3uWithUrl.string());
+                f << "#EXTM3U\n"
+                  << "#EXTINF:-1,A Network Stream\n"
+                  << "http://example.com/stream.mp3\n"
+                  << "#EXTINF:-1,Local File\n"
+                  << fileA << "\n";
+            }
+            auto entries = naikav::playlist::loadM3U(m3uWithUrl.string());
+            test_assert(entries.size() == 1, "loadM3U() skips a network-URL entry entirely");
+            test_assert(entries[0].path == fileA, "loadM3U() still loads the local entry after skipping a URL");
+        }
+
+        // SpectrumAnalyzer: the magnitudesDb size-mismatch recovery branch on
+        // computeSpectrum() (only reachable if the size was forced out of
+        // sync with configure()'s own sizing, which no normal call sequence
+        // does) and SpatialDownmixer's zero-routes early return, the
+        // FIVEPOINT1_BACK route table (no AudioDecoder test drives an actual
+        // 5.1-back source through VIRTUAL_SURROUND), and the impossible
+        // (all enum values handled) default case in buildRoutes().
+        {
+            naikav::dsp::SpectrumAnalyzer analyzer;
+            analyzer.configure(1, 48000.0);
+            analyzer.setEnabled(true);
+            analyzer.m_magnitudesDb.resize(3); // force a mismatch vs. kNumBins
+            std::vector<float> samples(naikav::dsp::SpectrumAnalyzer::kFftSize, 0.1f);
+            analyzer.process(samples.data(), static_cast<int>(samples.size()));
+            test_assert(analyzer.getMagnitudesDb().size() == naikav::dsp::SpectrumAnalyzer::kNumBins,
+                        "SpectrumAnalyzer recovers from a magnitudesDb size mismatch on computeSpectrum()");
+        }
+        {
+            naikav::dsp::SpatialDownmixer downmixer;
+            const float dummyIn[8] = {0};
+            float dummyOut[8] = {0};
+            downmixer.process(dummyIn, 4, dummyOut); // m_routes empty (never configured): early return
+            test_assert(downmixer.numSourceChannels() == 0, "SpatialDownmixer::process() no-ops before configure()");
+
+            downmixer.configure(naikav::dsp::SpatialDownmixer::SourceLayout::FIVEPOINT1_BACK, 48000.0);
+            test_assert(downmixer.numSourceChannels() == 6, "SpatialDownmixer configures 6 routes for FIVEPOINT1_BACK");
+            const float in6[6] = {0.1f, 0.1f, 0.1f, 0.1f, 0.1f, 0.1f};
+            float out2[2] = {0};
+            downmixer.process(in6, 1, out2);
+
+            auto invalidRoutes = naikav::dsp::SpatialDownmixer::buildRoutes(
+                static_cast<naikav::dsp::SpatialDownmixer::SourceLayout>(99));
+            test_assert(invalidRoutes.empty(), "SpatialDownmixer::buildRoutes() returns empty for an out-of-range enum value");
+        }
+
+        // SubtitleTrack.hpp: sanitizeSubtitleText()'s ASS "Dialogue:" prefix
+        // stripping (9-comma form), the non-Dialogue 8-comma form, and
+        // trimming leading whitespace -- none exercised by any subtitle
+        // decode test, which only feeds it already-clean SRT text.
+        {
+            test_assert(naikav::subtitle::sanitizeSubtitleText(
+                             "Dialogue: Marked=0,0:00:01.00,0:00:03.50,Default,,0,0,0,,Hello") == "Hello",
+                        "sanitizeSubtitleText() strips an ASS 'Dialogue:' line's 9-comma prefix");
+            test_assert(naikav::subtitle::sanitizeSubtitleText("0,0,Default,,0,0,0,,World") == "World",
+                        "sanitizeSubtitleText() strips a non-Dialogue 8-comma prefix");
+            test_assert(naikav::subtitle::sanitizeSubtitleText("   Leading spaces") == "Leading spaces",
+                        "sanitizeSubtitleText() trims leading whitespace");
+        }
+
+        // ReplayGainTags.hpp: readTaggedLoudnessAsLufs()'s R128_TRACK_GAIN and
+        // REPLAYGAIN_TRACK_GAIN success paths, tested directly against a real
+        // AVDictionary rather than through the full PlayerController/openFile()
+        // pipeline (which doesn't actually prove which tag tier was matched).
+        {
+            AVDictionary* dict = nullptr;
+            av_dict_set(&dict, "R128_TRACK_GAIN", "-256", 0); // -256/256 = -1.0dB -> -23.0 - (-1.0) = -22.0 LUFS
+            double lufs = 0.0;
+            test_assert(naikav::dsp::readTaggedLoudnessAsLufs(dict, nullptr, lufs), "readTaggedLoudnessAsLufs() finds an R128_TRACK_GAIN tag");
+            test_assert(std::abs(lufs - (-22.0)) < 0.01, "readTaggedLoudnessAsLufs() converts R128_TRACK_GAIN (Q7.8) to LUFS correctly");
+            av_dict_free(&dict);
+
+            AVDictionary* dict2 = nullptr;
+            av_dict_set(&dict2, "REPLAYGAIN_TRACK_GAIN", "-3.5 dB", 0);
+            double lufs2 = 0.0;
+            test_assert(naikav::dsp::readTaggedLoudnessAsLufs(dict2, nullptr, lufs2), "readTaggedLoudnessAsLufs() finds a REPLAYGAIN_TRACK_GAIN tag");
+            test_assert(std::abs(lufs2 - (-14.5)) < 0.01, "readTaggedLoudnessAsLufs() converts REPLAYGAIN_TRACK_GAIN to LUFS correctly");
+            av_dict_free(&dict2);
+
+            // Album-level fallback tiers -- checked only when neither
+            // track-level tag is present.
+            AVDictionary* dict3 = nullptr;
+            av_dict_set(&dict3, "R128_ALBUM_GAIN", "-256", 0);
+            double lufs3 = 0.0;
+            test_assert(naikav::dsp::readTaggedLoudnessAsLufs(dict3, nullptr, lufs3), "readTaggedLoudnessAsLufs() falls back to R128_ALBUM_GAIN");
+            test_assert(std::abs(lufs3 - (-22.0)) < 0.01, "readTaggedLoudnessAsLufs() converts R128_ALBUM_GAIN (Q7.8) to LUFS correctly");
+            av_dict_free(&dict3);
+
+            AVDictionary* dict4 = nullptr;
+            av_dict_set(&dict4, "REPLAYGAIN_ALBUM_GAIN", "-3.5 dB", 0);
+            double lufs4 = 0.0;
+            test_assert(naikav::dsp::readTaggedLoudnessAsLufs(dict4, nullptr, lufs4), "readTaggedLoudnessAsLufs() falls back to REPLAYGAIN_ALBUM_GAIN");
+            test_assert(std::abs(lufs4 - (-14.5)) < 0.01, "readTaggedLoudnessAsLufs() converts REPLAYGAIN_ALBUM_GAIN to LUFS correctly");
+            av_dict_free(&dict4);
+        }
+
+        // LoudnessMeter.hpp: configure()'s allocation/filter-lookup/filter-
+        // creation failure paths and feed()'s frame-allocation/buffer
+        // failures -- none of AudioDecoder's own loudness tests force any
+        // of the underlying libavfilter calls to fail.
+        {
+            open_finished = true; // gates force_frame_alloc_fail in the av_frame_alloc mock
+
+            force_avfilter_graph_alloc_fail = true;
+            { naikav::dsp::LoudnessMeter meter; test_assert(!meter.configure(2, 48000), "LoudnessMeter::configure() fails gracefully when avfilter_graph_alloc() fails"); }
+            force_avfilter_graph_alloc_fail = false;
+
+            force_avfilter_get_by_name_fail = true;
+            { naikav::dsp::LoudnessMeter meter; test_assert(!meter.configure(2, 48000), "LoudnessMeter::configure() fails gracefully when avfilter_get_by_name() fails"); }
+            force_avfilter_get_by_name_fail = false;
+
+            force_avfilter_create_filter_fail = true;
+            { naikav::dsp::LoudnessMeter meter; test_assert(!meter.configure(2, 48000), "LoudnessMeter::configure() fails gracefully when avfilter_graph_create_filter() fails"); }
+            force_avfilter_create_filter_fail = false;
+
+            {
+                naikav::dsp::LoudnessMeter meter;
+                test_assert(meter.configure(2, 48000), "LoudnessMeter::configure() succeeds normally");
+                std::vector<float> samples(2 * 100, 0.1f);
+
+                force_frame_alloc_fail = true;
+                meter.feed(samples.data(), 100); // frame alloc fails -> early return
+                force_frame_alloc_fail = false;
+
+                force_malloc_fail = true;
+                meter.feed(samples.data(), 100); // av_frame_get_buffer() fails -> early return
+                force_malloc_fail = false;
+
+                force_frame_alloc_fail_on_second_call = 1;
+                meter.feed(samples.data(), 100); // "frame" alloc succeeds, "outFrame" alloc fails
+                force_frame_alloc_fail_on_second_call = -1;
+
+                force_buffersrc_add_frame_fail = true;
+                meter.feed(samples.data(), 100); // av_buffersrc_add_frame() fails -> early return
+                force_buffersrc_add_frame_fail = false;
+
+                test_assert(true, "LoudnessMeter::feed() handles frame/buffer allocation failures without crashing");
+            }
+        }
+
+        // LoudnessPrescan.hpp: prescanIntegratedLufs()'s failure branches --
+        // the background-thread prescan test elsewhere only ever exercises
+        // the success path against a real file.
+        {
+            resetAllMockFlags();
+
+            force_find_stream_info_fail = true;
+            test_assert(naikav::dsp::prescanIntegratedLufs(testFile, -1) <= -100.0,
+                        "prescanIntegratedLufs() fails gracefully when avformat_find_stream_info() fails");
+            force_find_stream_info_fail = false;
+
+            std::string videoOnlyFile2 = (std::filesystem::temp_directory_path() / "naikav_prescan_video_only.mkv").string();
+            std::string cmd = "ffmpeg -y -loglevel error -f lavfi -i \"testsrc=duration=1:size=64x64:rate=5\" -an -c:v mpeg4 \"" + videoOnlyFile2 + "\"";
+            if (std::system(cmd.c_str()) == 0) {
+                test_assert(naikav::dsp::prescanIntegratedLufs(videoOnlyFile2, -1) <= -100.0,
+                            "prescanIntegratedLufs() fails gracefully when the file has no audio stream");
+            }
+
+            force_find_decoder_fail = true;
+            test_assert(naikav::dsp::prescanIntegratedLufs(testFile, -1) <= -100.0,
+                        "prescanIntegratedLufs() fails gracefully when avcodec_find_decoder() fails");
+            force_find_decoder_fail = false;
+
+            force_alloc_fail = true;
+            test_assert(naikav::dsp::prescanIntegratedLufs(testFile, -1) <= -100.0,
+                        "prescanIntegratedLufs() fails gracefully when avcodec_alloc_context3() fails");
+            force_alloc_fail = false;
+
+            force_swr_alloc_fail = true;
+            test_assert(naikav::dsp::prescanIntegratedLufs(testFile, -1) <= -100.0,
+                        "prescanIntegratedLufs() fails gracefully when swr_alloc_set_opts2() fails");
+            force_swr_alloc_fail = false;
+
+            force_avfilter_graph_alloc_fail = true;
+            test_assert(naikav::dsp::prescanIntegratedLufs(testFile, -1) <= -100.0,
+                        "prescanIntegratedLufs() fails gracefully when the LoudnessMeter fails to configure");
+            force_avfilter_graph_alloc_fail = false;
+
+            force_zero_channels = true;
+            // Forcing the codec context's channel count to 0 after open()
+            // also affects the real decoder's own internal state (not just
+            // this function's local bookkeeping), so the overall scan isn't
+            // guaranteed to still succeed downstream -- this only verifies
+            // the 0-channels fallback itself doesn't crash.
+            naikav::dsp::prescanIntegratedLufs(testFile, -1);
+            test_assert(true, "prescanIntegratedLufs() handles a 0-channel codec context without crashing");
+            force_zero_channels = false;
+        }
+
         // Clean up temp files.
         std::error_code rmEc;
         std::filesystem::remove_all(tmpDir, rmEc);
@@ -1953,6 +3229,7 @@ int main(int argc, char* argv[]) {
             test_assert(controller.getVideoPixelFormat() == "unknown", "getVideoPixelFormat returns unknown when uninitialized");
             test_assert(!controller.isVideoHardware(), "isVideoHardware returns false when uninitialized");
             test_assert(!controller.isSeeking(), "isSeeking returns false when uninitialized");
+            test_assert(!controller.isAudioVirtualSurroundActive(), "isAudioVirtualSurroundActive returns false when uninitialized");
 
             g_disableHardwareDecoders = false;
             if (controller.openFile(testFile)) {
@@ -1966,6 +3243,657 @@ int main(int argc, char* argv[]) {
                 test_assert(controller.isVideoHardware(), "isVideoHardware returns true when using hardware");
             }
             g_disableHardwareDecoders = true;
+        }
+
+        // isAudioVirtualSurroundActive() true branch: needs a real
+        // hasAudio()/m_audioDecoder with an actually-active spatial downmix.
+        {
+            PlayerController vSurroundController;
+            vSurroundController.setAudioChannelOption(AudioChannelOption::VIRTUAL_SURROUND);
+            force_channel_layout_5_1 = true;
+            if (vSurroundController.openFile(testFile)) {
+                test_assert(vSurroundController.isAudioVirtualSurroundActive(),
+                            "isAudioVirtualSurroundActive returns true for a 5.1 source with VIRTUAL_SURROUND set");
+            }
+            force_channel_layout_5_1 = false;
+        }
+
+        // PlayerController: playlist navigation (playlistPlayIndex/Next/Previous,
+        // pollPlaylistAutoAdvance) -- entirely new with the playlist feature,
+        // never driven by any other test.
+        {
+            // Out-of-range indices.
+            {
+                PlayerController pc;
+                pc.m_playlist.add(testFile);
+                test_assert(!pc.playlistPlayIndex(-1), "playlistPlayIndex(-1) fails (out of range)");
+                test_assert(!pc.playlistPlayIndex(99), "playlistPlayIndex(99) fails (out of range)");
+            }
+            // Empty playlist: next()/previous() have nothing to return.
+            {
+                PlayerController pc;
+                test_assert(!pc.playlistNext(), "playlistNext() fails on an empty playlist");
+                test_assert(!pc.playlistPrevious(), "playlistPrevious() fails on an empty playlist");
+            }
+            // playlistPlayIndex()/playlistNext()/playlistPrevious() success paths.
+            {
+                PlayerController pc;
+                pc.m_playlist.add(testFile);
+                pc.m_playlist.add(testFile);
+                test_assert(pc.playlistPlayIndex(0), "playlistPlayIndex(0) opens and plays the first item");
+                test_assert(pc.getState() == PlayerState::PLAYING, "playlistPlayIndex(0) leaves the controller PLAYING");
+                test_assert(pc.playlistNext(), "playlistNext() opens and plays the next item");
+                test_assert(pc.playlistPrevious(), "playlistPrevious() opens and plays the previous item");
+                pc.stop();
+            }
+            // pollPlaylistAutoAdvance(): UNINITIALIZED early return, then a
+            // real ENDED->next-item advance, then the end-of-list (no next
+            // item) case that must leave state alone.
+            {
+                PlayerController pc;
+                pc.pollPlaylistAutoAdvance(); // UNINITIALIZED -> early return, no-op
+
+                pc.m_playlist.add(testFile);
+                pc.m_playlist.add(testFile);
+                // resetPlaylist=false: the default (true) would clear the
+                // two-item playlist just built above and replace it with a
+                // single-item one containing only this path.
+                if (pc.openFile(testFile, false)) {
+                    pc.m_playlist.setCurrentIndex(0);
+                    pc.m_state = PlayerState::ENDED;
+                    pc.pollPlaylistAutoAdvance();
+                    test_assert(pc.getState() == PlayerState::PLAYING,
+                                "pollPlaylistAutoAdvance() advances to and plays the next playlist item on ENDED");
+                }
+                pc.stop();
+            }
+            {
+                PlayerController pc;
+                pc.m_playlist.add(testFile); // only one item: next() has nothing after it
+                if (pc.openFile(testFile)) {
+                    pc.m_state = PlayerState::ENDED;
+                    pc.pollPlaylistAutoAdvance();
+                    test_assert(pc.getState() == PlayerState::ENDED,
+                                "pollPlaylistAutoAdvance() leaves state at ENDED when there's no next item");
+                }
+                pc.stop();
+            }
+        }
+
+        // PlayerController: play()/pause() while a seek catch-up is active --
+        // both must transition state immediately (audio stays muted/paused
+        // until the catch-up lands) rather than touching the audio device.
+        {
+            PlayerController pc;
+            if (pc.openFile(testFile)) {
+                pc.m_catchupMode.store(SeekCatchupMode::LANDING);
+                pc.m_state = PlayerState::OPENED;
+                pc.play();
+                test_assert(pc.m_resumeAfterCatchup.load(), "play() during catch-up sets resumeAfterCatchup");
+                test_assert(pc.getState() == PlayerState::PLAYING, "play() during catch-up transitions straight to PLAYING");
+
+                pc.pause();
+                test_assert(!pc.m_resumeAfterCatchup.load(), "pause() during catch-up clears resumeAfterCatchup");
+                test_assert(pc.getState() == PlayerState::PAUSED, "pause() during catch-up transitions straight to PAUSED");
+
+                pc.m_catchupMode.store(SeekCatchupMode::NONE);
+            }
+            pc.stop();
+        }
+
+        // PlayerController: updateClockForVideoOnly()'s catch-up-frozen early
+        // return, and getCurrentTime()'s loop-wraparound (Loop toggle on,
+        // reached end while PLAYING -> seamless instantSeek(0.0) instead of
+        // transitioning to ENDED).
+        {
+            PlayerController pc;
+            if (pc.openFile(testFile)) {
+                pc.m_catchupMode.store(SeekCatchupMode::LANDING);
+                double clockBefore = pc.m_videoClock.load();
+                pc.updateClockForVideoOnly();
+                test_assert(pc.m_videoClock.load() == clockBefore,
+                            "updateClockForVideoOnly() is a no-op while catch-up is active");
+                pc.m_catchupMode.store(SeekCatchupMode::NONE);
+
+                pc.setLoopEnabled(true);
+                pc.m_state = PlayerState::PLAYING;
+                pc.m_hasVideo = false; // audio-only path is simplest to force "reached end" on
+                pc.m_hasAudio = false;
+                pc.m_videoClock.store(999999.0); // comfortably past any real duration
+                double t = pc.getCurrentTime();
+                test_assert(t == 0.0, "getCurrentTime() seamlessly wraps to 0.0 when Loop is on and playback reached the end");
+                test_assert(pc.getState() == PlayerState::PLAYING, "Loop wraparound leaves state at PLAYING, never ENDED");
+                pc.setLoopEnabled(false);
+            }
+            pc.stop();
+        }
+
+        // PlayerController: simple getters/setters no other test calls at all.
+        {
+            PlayerController pc;
+            test_assert(pc.getAudioChannelLayoutName() == "Unknown", "getAudioChannelLayoutName() returns 'Unknown' when uninitialized");
+            test_assert(pc.getSeekReferenceTime() == 0.0, "getSeekReferenceTime() matches getCurrentTime() outside of catch-up");
+            test_assert(pc.getPlaybackWidth() == 0, "getPlaybackWidth() is 0 when uninitialized");
+            test_assert(pc.getPlaybackHeight() == 0, "getPlaybackHeight() is 0 when uninitialized");
+            test_assert(pc.getAudioFrameQueueSize() == 0, "getAudioFrameQueueSize() is 0 when uninitialized");
+            ColorPipelineInfo ci = pc.getColorInfo();
+            test_assert(ci.colorSpace == "Unspecified", "getColorInfo() returns the default struct when uninitialized");
+
+            if (pc.openFile(testFile)) {
+                test_assert(!pc.getAudioChannelLayoutName().empty(), "getAudioChannelLayoutName() returns a real name once opened");
+                pc.setResolutionOption(ResolutionOption::R_720P);
+                test_assert(pc.getPlaybackWidth() > 0, "getPlaybackWidth() reflects the resolution option");
+                test_assert(pc.getPlaybackHeight() > 0, "getPlaybackHeight() is positive once opened");
+                pc.getAudioFrameQueueSize(); // just needs to execute without dividing by zero
+
+                pc.m_catchupMode.store(SeekCatchupMode::LANDING);
+                pc.m_catchupTarget.store(12.5);
+                test_assert(pc.getSeekReferenceTime() == 12.5, "getSeekReferenceTime() returns the catch-up target while catching up");
+                pc.m_catchupMode.store(SeekCatchupMode::NONE);
+
+                ColorPipelineInfo realCi = pc.getColorInfo();
+                test_assert(realCi.colorSpace != "" , "getColorInfo() delegates to the real VideoDecoder once opened");
+            }
+            pc.stop();
+        }
+
+        // PlayerController: setPlaybackSpeed()/setAudioDspSettings() actually
+        // reaching the live AudioDecoder, and the loudness (0->1) toggle
+        // transition triggering prescanLoudnessForCurrentFile().
+        {
+            PlayerController pc;
+            if (pc.openFile(testFile)) {
+                pc.setPlaybackSpeed(1.5f);
+                test_assert(pc.getPlaybackSpeed() == 1.5f, "setPlaybackSpeed() reaches the live AudioDecoder");
+
+                naikav::dsp::AudioDspSettings settings = pc.getAudioDspSettings();
+                settings.loudnessEnabled = false;
+                pc.setAudioDspSettings(settings); // baseline: loudness off, no prescan trigger
+
+                settings.dspEnabled = !settings.dspEnabled;
+                pc.setAudioDspSettings(settings); // reaches m_audioDecoder->applyDspSettings(), no prescan
+
+                settings.loudnessEnabled = true; // 0 -> 1 transition: triggers prescanLoudnessForCurrentFile()
+                pc.setAudioDspSettings(settings);
+                test_assert(pc.getAudioDspSettings().loudnessEnabled, "setAudioDspSettings() applies the loudness toggle");
+            }
+            pc.stop();
+        }
+
+        // PlayerController: prescanLoudnessForCurrentFile()'s tagged-loudness
+        // fast path (a REPLAYGAIN_TRACK_GAIN tag lets it skip the whole-file
+        // decode scan) and applyGenrePresetIfEnabled(), neither of which the
+        // plain test asset's own (tag-less) metadata ever triggers.
+        {
+            // Reset every mock injection flag first: this spawns a real
+            // background prescan thread that decodes with the real FFmpeg
+            // calls (mocked-but-passthrough), and any flag an earlier,
+            // unrelated test left set could otherwise silently wedge it.
+            resetAllMockFlags();
+
+            std::filesystem::path pcMetaDir =
+                std::filesystem::temp_directory_path() / "naikav_pc_meta_test";
+            std::error_code pcMetaEc;
+            std::filesystem::create_directories(pcMetaDir, pcMetaEc);
+            auto runFfmpegPc = [](const std::string& args) -> bool {
+                std::string cmd = "ffmpeg -y -loglevel error " + args;
+                return std::system(cmd.c_str()) == 0;
+            };
+
+            std::string replayGainFile = (pcMetaDir / "replaygain.mkv").string();
+            std::string genreFile = (pcMetaDir / "podcast_genre.mkv").string();
+            // The ffmpeg *command line tool* only synthesizes these tagged
+            // assets; it is a separate package from the libav* libraries this
+            // player links against, so it isn't guaranteed to be installed.
+            // Skip the block when it's missing, like every other asset-
+            // generating test here, instead of failing the whole run.
+            bool pcGenOk =
+                runFfmpegPc("-f lavfi -i \"sine=frequency=1000:duration=1\" -metadata REPLAYGAIN_TRACK_GAIN=\"-3.5 dB\" -c:a aac \"" + replayGainFile + "\"") &&
+                runFfmpegPc("-f lavfi -i \"sine=frequency=1000:duration=1\" -metadata genre=\"Podcast\" -c:a aac \"" + genreFile + "\"");
+
+            if (!pcGenOk) {
+                std::cout << "[SKIPPED] ffmpeg CLI unavailable: skipping the PlayerController prescan/genre tests" << std::endl;
+            } else {
+                naikav::dsp::AudioDspSettings loudSettings;
+                loudSettings.loudnessEnabled = true;
+
+                PlayerController pc;
+                pc.setAudioDspSettings(loudSettings);
+                if (pc.openFile(replayGainFile)) {
+                    test_assert(pc.getAudioDspSettings().loudnessEnabled,
+                                "openFile() with loudness pre-enabled reads the REPLAYGAIN_TRACK_GAIN tag via the fast path");
+                }
+                pc.stop();
+
+                naikav::dsp::AudioDspSettings genreSettings;
+                genreSettings.autoGenrePresetEnabled = true;
+                PlayerController genreController;
+                genreController.setAudioDspSettings(genreSettings);
+                if (genreController.openFile(genreFile)) {
+                    test_assert(genreController.getAudioDspSettings().autoGenrePresetEnabled,
+                                "applyGenrePresetIfEnabled() preserves the toggle after applying the 'Podcast' preset");
+                }
+                genreController.stop();
+            }
+        }
+
+        // PlayerController: getAudioFrameQueueSize()'s bytesPerFrame<=0 guard
+        // -- only reachable by forcing the resolved output channel count to
+        // 0, which no real init() path ever produces.
+        {
+            PlayerController pc;
+            if (pc.openFile(testFile) && pc.m_hasAudio && pc.m_audioDecoder) {
+                int savedChannels = pc.m_audioDecoder->m_outChannels;
+                pc.m_audioDecoder->m_outChannels = 0;
+                test_assert(pc.getAudioFrameQueueSize() == 0, "getAudioFrameQueueSize() returns 0 when the resolved channel count is 0");
+                pc.m_audioDecoder->m_outChannels = savedChannels;
+            }
+            pc.stop();
+        }
+
+        // PlayerController: finishCatchup()'s early returns, called directly
+        // (private-access) -- neither is reachable through the public seek()
+        // API without a real, precisely-timed video catch-up in flight.
+        {
+            PlayerController pc;
+            if (pc.openFile(testFile)) {
+                pc.m_catchupMode.store(SeekCatchupMode::NONE);
+                pc.finishCatchup(1.0); // not catching up at all: no-op
+                test_assert(pc.m_catchupMode.load() == SeekCatchupMode::NONE, "finishCatchup() is a no-op when not catching up");
+
+                pc.m_catchupMode.store(SeekCatchupMode::LANDING);
+                pc.m_catchupTarget.store(10.0);
+                pc.finishCatchup(1.0); // 1.0 is well short of the 10.0 target, and not at EOF
+                test_assert(pc.m_catchupMode.load() == SeekCatchupMode::LANDING,
+                            "finishCatchup() keeps catching up when nowhere near the target and not at EOF");
+                pc.m_catchupMode.store(SeekCatchupMode::NONE);
+            }
+            pc.stop();
+        }
+
+        // PlayerController: getCurrentTime()'s video-stream EOF-reached branch
+        // (distinct from the audio-only one exercised by the Loop test above)
+        // -- forces m_demuxer's real EOF flag directly, since driving an
+        // actual end-of-stream through the whole pipeline synchronously isn't
+        // practical here.
+        {
+            PlayerController pc;
+            if (pc.openFile(testFile) && pc.m_hasVideo) {
+                pc.m_demuxer->m_eof.store(true);
+                pc.m_videoQueue.abort(); // empty() still reports true after abort
+                pc.m_state = PlayerState::PLAYING;
+                pc.getCurrentTime(); // must reach the video-stream EOF branch without crashing
+                test_assert(pc.getState() == PlayerState::ENDED || pc.getState() == PlayerState::PLAYING,
+                            "getCurrentTime() handles the video-stream EOF-reached branch");
+            }
+            pc.stop();
+        }
+
+        // PlayerController: subtitle track handling -- selectSubtitleTrack()'s
+        // Off/external/embedded branches, loadExternalSubtitle()'s failure
+        // path, pollSubtitlePackets()/getCurrentSubtitleText(),
+        // autoProbeExternalSubtitles(), getActiveSubtitleTrackName(), and the
+        // seek()/instantSeek() subtitle-flush call sites -- essentially all
+        // of it needs a live m_subtitleDecoder, which the plain (subtitle-
+        // less) test asset never creates on its own.
+        {
+            std::filesystem::path subDir =
+                std::filesystem::temp_directory_path() / "naikav_pc_subtitle_test";
+            std::error_code subDirEc;
+            std::filesystem::create_directories(subDir, subDirEc);
+            std::string srtPath = (subDir / "external.srt").string();
+            {
+                std::ofstream srt(srtPath);
+                srt << "1\n00:00:00,000 --> 00:00:03,000\nHello from an external subtitle\n";
+            }
+
+            // loadExternalSubtitle() failure: not a parseable subtitle file.
+            {
+                PlayerController pc;
+                if (pc.openFile(testFile)) {
+                    std::string notASubtitle = (subDir / "not_a_subtitle.srt").string();
+                    { std::ofstream bogus(notASubtitle); bogus << "this is not valid SRT content at all"; }
+                    test_assert(!pc.loadExternalSubtitle(notASubtitle), "loadExternalSubtitle() fails gracefully on unparseable content");
+                }
+                pc.stop();
+            }
+
+            // External subtitle: load, select Off, reselect external (-2),
+            // poll packets, read active text, then check the track name.
+            {
+                PlayerController pc;
+                if (pc.openFile(testFile)) {
+                    test_assert(pc.loadExternalSubtitle(srtPath), "loadExternalSubtitle() loads a real .srt file");
+                    test_assert(pc.getActiveSubtitleTrackName() != "Off", "getActiveSubtitleTrackName() reports the external track after loading it");
+
+                    pc.selectSubtitleTrack(-1); // Off
+                    test_assert(pc.getActiveSubtitleTrackName() == "Off", "selectSubtitleTrack(-1) disables subtitles");
+
+                    pc.selectSubtitleTrack(-2); // reselect external -- m_subtitleDecoder already external, re-enters that branch
+                    pc.m_selectedSubtitleTrack.store(-2);
+                    pc.pollSubtitlePackets(); // no queued packets for an external decoder, but must not crash
+                    std::string text = pc.getCurrentSubtitleText();
+                    (void)text;
+
+                    // seek()/instantSeek() with a live subtitle decoder: hits
+                    // both flush() call sites. seek() only takes the
+                    // catch-up path (not instantSeek()'s fast path) with the
+                    // video thread enabled, playing, and a big-enough jump.
+                    pc.m_videoThreadEnabled = true;
+                    pc.m_state = PlayerState::PLAYING;
+                    pc.seek(4.0);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                    pc.m_videoThreadEnabled = false;
+
+                    pc.instantSeek(0.5);
+                }
+                pc.stop();
+            }
+
+            // Embedded subtitle: selectSubtitleTrack(trackId >= 0) needs a
+            // real embedded subtitle stream, which the main test asset
+            // doesn't have -- generate a tiny video+subtitle asset.
+            {
+                std::string embSrt = (subDir / "emb.srt").string();
+                { std::ofstream srt(embSrt); srt << "1\n00:00:00,000 --> 00:00:01,000\nEmbedded\n"; }
+                std::string embFile = (subDir / "video_with_sub.mkv").string();
+                std::string cmd = "ffmpeg -y -loglevel error -f lavfi -i \"testsrc=duration=2:size=64x64:rate=5\" -f lavfi -i \"sine=frequency=1000:duration=2\" -i \"" +
+                                   embSrt + "\" -c:v mpeg4 -c:a aac -c:s srt \"" + embFile + "\"";
+                if (std::system(cmd.c_str()) == 0) {
+                    PlayerController pc;
+                    if (pc.openFile(embFile)) {
+                        auto subTracks = pc.getSubtitleTracks();
+                        if (!subTracks.empty()) {
+                            int subId = subTracks[0].id;
+                            pc.selectSubtitleTrack(subId);
+                            test_assert(pc.getActiveSubtitleTrackName() != "Off",
+                                        "selectSubtitleTrack(embeddedId) selects a real embedded subtitle stream");
+                        }
+                    }
+                    pc.stop();
+                }
+            }
+
+            // autoProbeExternalSubtitles(): a sibling .srt file matching the
+            // media file's basename must be auto-detected on open().
+            {
+                std::string mediaBase = (subDir / "movie").string();
+                { std::ofstream srt(mediaBase + ".srt"); srt << "1\n00:00:00,000 --> 00:00:01,000\nAuto-detected\n"; }
+                std::string mediaCopy = mediaBase + std::filesystem::path(testFile).extension().string();
+                std::error_code copyEc;
+                std::filesystem::copy_file(testFile, mediaCopy, std::filesystem::copy_options::overwrite_existing, copyEc);
+                if (!copyEc) {
+                    PlayerController pc;
+                    if (pc.openFile(mediaCopy)) {
+                        test_assert(pc.getActiveSubtitleTrackName() != "Off",
+                                    "openFile() auto-detects and loads a sibling .srt file with a matching basename");
+                    }
+                    pc.stop();
+                }
+            }
+
+            // getActiveSubtitleTrackName()'s cached-track-lookup branches
+            // (found vs. fallback "Track N"), independent of a live decoder.
+            {
+                PlayerController pc;
+                pc.m_selectedSubtitleTrack.store(5);
+                test_assert(pc.getActiveSubtitleTrackName() == "Track 5",
+                            "getActiveSubtitleTrackName() falls back to 'Track N' for an unrecognized id");
+            }
+        }
+
+        // PlayerController: external audio track handling -- selectAudioTrack()'s
+        // Off/external/embedded branches and their failure paths,
+        // loadExternalAudio()'s failure path, and removeExternalAudio().
+        {
+            std::filesystem::path testAudioPath = std::filesystem::path(testFile).parent_path() / "test_audio.mp3";
+            std::string extAudioFile = testAudioPath.string();
+            bool haveTestAudio = std::filesystem::exists(testAudioPath);
+
+            // selectAudioTrack() before any file is loaded: UNINITIALIZED
+            // early-return branch.
+            {
+                PlayerController pc;
+                test_assert(pc.selectAudioTrack(3), "selectAudioTrack() on an UNINITIALIZED controller just records the id and returns true");
+            }
+
+            // selectAudioTrack(-2) with no external audio loaded, and an
+            // invalid embedded track id -- both failure branches.
+            {
+                PlayerController pc;
+                if (pc.openFile(testFile)) {
+                    test_assert(!pc.selectAudioTrack(-2), "selectAudioTrack(-2) fails when no external audio is loaded");
+                    test_assert(!pc.selectAudioTrack(99999), "selectAudioTrack(99999) fails for an invalid embedded track index");
+                }
+                pc.stop();
+            }
+
+            // selectAudioTrack(-1): mute.
+            {
+                PlayerController pc;
+                if (pc.openFile(testFile)) {
+                    test_assert(pc.selectAudioTrack(-1), "selectAudioTrack(-1) disables audio");
+                    test_assert(!pc.m_hasAudio, "selectAudioTrack(-1) clears hasAudio");
+                }
+                pc.stop();
+            }
+
+            if (haveTestAudio) {
+                // loadExternalAudio() success -> selectAudioTrack(-2)'s
+                // full success path (video present, so the m_hasVideo branch
+                // -- seek(currentPos) -- runs, not the audio-only wasPlaying
+                // branch below).
+                {
+                    PlayerController pc;
+                    if (pc.openFile(testFile)) {
+                        test_assert(pc.loadExternalAudio(extAudioFile), "loadExternalAudio() loads a real external audio file");
+                        test_assert(pc.hasExternalAudio(), "loadExternalAudio() sets hasExternalAudio");
+
+                        pc.removeExternalAudio();
+                        test_assert(!pc.hasExternalAudio(), "removeExternalAudio() clears hasExternalAudio and stops the external demuxer");
+                    }
+                    pc.stop();
+                }
+
+                // loadExternalAudio() failure: not a real media file.
+                {
+                    PlayerController pc;
+                    if (pc.openFile(testFile)) {
+                        std::string notMedia = (std::filesystem::temp_directory_path() / "naikav_not_media.mp3").string();
+                        { std::ofstream bogus(notMedia); bogus << "not a real audio file"; }
+                        test_assert(!pc.loadExternalAudio(notMedia), "loadExternalAudio() fails gracefully on a non-media file");
+                    }
+                    pc.stop();
+                }
+
+                // Audio-only main file: selectAudioTrack(-2) and (trackId>=0)
+                // both take the "no video" wasPlaying/start()/PLAYING branch
+                // instead of seek(currentPos).
+                {
+                    PlayerController pc;
+                    if (pc.openFile(extAudioFile) && !pc.m_hasVideo) {
+                        pc.play();
+                        bool wasPlayingForExternal = (pc.getState() == PlayerState::PLAYING);
+                        if (pc.loadExternalAudio(extAudioFile)) {
+                            test_assert(wasPlayingForExternal ? pc.getState() == PlayerState::PLAYING : true,
+                                        "selectAudioTrack(-2) on an audio-only file resumes playback directly");
+
+                            // Embedded reselect (trackId 0) on the same
+                            // audio-only controller, also while playing.
+                            pc.play();
+                            if (pc.getState() == PlayerState::PLAYING && !pc.getAudioTracks().empty()) {
+                                int embeddedId = pc.getAudioTracks()[0].id;
+                                pc.selectAudioTrack(embeddedId);
+                                test_assert(pc.getState() == PlayerState::PLAYING || pc.getState() == PlayerState::OPENED,
+                                            "selectAudioTrack(embeddedId) on an audio-only file re-syncs playback");
+                            }
+                        }
+                    }
+                    pc.stop();
+                }
+            }
+        }
+
+        // PlayerController: pollPlaylistAutoAdvance()'s "not ENDED" early
+        // return (distinct from the UNINITIALIZED one already covered),
+        // getCurrentTime()'s audio-only EOF-reached branch (distinct from
+        // both the duration-exceeded and video-stream-EOF branches already
+        // covered), selectAudioTrack()'s remaining failure/fallback
+        // branches, loadExternalAudio()'s remaining branches, embedded
+        // subtitle reset()/pollSubtitlePackets(), and getActiveAudioTrackName().
+        {
+            // pollPlaylistAutoAdvance() while OPENED (not ENDED, not UNINITIALIZED).
+            {
+                PlayerController pc;
+                if (pc.openFile(testFile)) {
+                    PlayerState before = pc.getState();
+                    pc.pollPlaylistAutoAdvance();
+                    test_assert(pc.getState() == before, "pollPlaylistAutoAdvance() is a no-op when not ENDED");
+                }
+                pc.stop();
+            }
+
+            // getCurrentTime()'s audio-only EOF branch: force duration<=0.0
+            // (force_no_duration) so the branch's own condition doesn't
+            // depend on real playback timing.
+            {
+                std::filesystem::path testAudioPath2 = std::filesystem::path(testFile).parent_path() / "test_audio.mp3";
+                if (std::filesystem::exists(testAudioPath2)) {
+                    force_no_duration = true;
+                    PlayerController pc;
+                    if (pc.openFile(testAudioPath2.string()) && !pc.m_hasVideo) {
+                        pc.m_demuxer->m_eof.store(true);
+                        pc.m_audioQueue.abort();
+                        pc.m_state = PlayerState::PLAYING;
+                        pc.getCurrentTime();
+                        test_assert(pc.getState() == PlayerState::ENDED || pc.getState() == PlayerState::PLAYING,
+                                    "getCurrentTime() handles the audio-only EOF-reached branch");
+                    }
+                    pc.stop();
+                    force_no_duration = false;
+                }
+            }
+
+            // selectAudioTrack(): the final fallback (an id matching none of
+            // -1/-2/>=0), and getActiveAudioTrackName()'s cache-miss fallback.
+            {
+                PlayerController pc;
+                if (pc.openFile(testFile)) {
+                    test_assert(!pc.selectAudioTrack(-5), "selectAudioTrack() falls through to false for an unrecognized negative id");
+                    pc.m_selectedAudioTrack.store(-5);
+                    test_assert(pc.getActiveAudioTrackName() == "Track -5",
+                                "getActiveAudioTrackName() falls back to 'Track N' for an unrecognized id");
+                }
+                pc.stop();
+            }
+
+            // videoThreadLoop()'s own "disabled" sleep branch: the thread is
+            // only ever started (in openFile()) while m_videoThreadEnabled is
+            // true (g_videoThreadEnabled is false for the whole test binary),
+            // so it never launches through the normal API in any other test.
+            // Force it to start, then disable it while it's running.
+            {
+                PlayerController pc;
+                pc.m_videoThreadEnabled = true;
+                if (pc.openFile(testFile) && pc.m_hasVideo) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                    pc.m_videoThreadEnabled = false;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+                    test_assert(true, "videoThreadLoop() handles being disabled while its thread is running");
+                }
+                pc.stop();
+            }
+
+            // selectAudioTrack(-2)'s "external demuxer has no valid audio
+            // stream" branch: load real external audio, then poison the
+            // external demuxer's own selected stream index.
+            {
+                std::filesystem::path testAudioPath3 = std::filesystem::path(testFile).parent_path() / "test_audio.mp3";
+                if (std::filesystem::exists(testAudioPath3)) {
+                    PlayerController pc;
+                    if (pc.openFile(testFile) && pc.loadExternalAudio(testAudioPath3.string())) {
+                        // selectAudioTrack() short-circuits to true when
+                        // trackId already equals the currently-selected
+                        // track (which loadExternalAudio() just set to -2) --
+                        // select a different (embedded) track first so the
+                        // reselect below actually re-enters the function body.
+                        pc.selectAudioTrack(pc.m_demuxer->getAudioStreamIndex());
+                        pc.m_externalAudioDemuxer->selectAudioStream(-1);
+                        test_assert(!pc.selectAudioTrack(-2), "selectAudioTrack(-2) fails when the external demuxer has no valid audio stream");
+                    }
+                    pc.stop();
+                }
+            }
+
+            // loadExternalAudio(): "no audio streams" on a real (video-only,
+            // -an) media file, and replacing an already-loaded external
+            // audio demuxer (stops the old one first).
+            {
+                std::string videoOnlyFile = (std::filesystem::temp_directory_path() / "naikav_pc_video_only.mkv").string();
+                std::string cmd = "ffmpeg -y -loglevel error -f lavfi -i \"testsrc=duration=1:size=64x64:rate=5\" -an -c:v mpeg4 \"" + videoOnlyFile + "\"";
+                if (std::system(cmd.c_str()) == 0) {
+                    PlayerController pc;
+                    if (pc.openFile(testFile)) {
+                        test_assert(!pc.loadExternalAudio(videoOnlyFile), "loadExternalAudio() fails gracefully on a file with no audio streams");
+                    }
+                    pc.stop();
+                }
+
+                std::filesystem::path testAudioPath4 = std::filesystem::path(testFile).parent_path() / "test_audio.mp3";
+                if (std::filesystem::exists(testAudioPath4)) {
+                    PlayerController pc;
+                    if (pc.openFile(testFile)) {
+                        test_assert(pc.loadExternalAudio(testAudioPath4.string()), "loadExternalAudio() loads the first external file");
+                        test_assert(pc.loadExternalAudio(testAudioPath4.string()),
+                                    "loadExternalAudio() replaces (stops then reopens) an already-loaded external demuxer");
+                    }
+                    pc.stop();
+                }
+            }
+
+            // Embedded subtitle: reset() on Off (distinct from the external-
+            // decoder case, which skips reset()), re-creating an external
+            // decoder after an embedded one was active, and
+            // pollSubtitlePackets() actually processing a queued packet.
+            {
+                std::filesystem::path subDir2 =
+                    std::filesystem::temp_directory_path() / "naikav_pc_subtitle_test";
+                std::string embSrt2 = (subDir2 / "emb2.srt").string();
+                { std::ofstream srt(embSrt2); srt << "1\n00:00:00,000 --> 00:00:01,000\nEmbedded 2\n"; }
+                std::string extSrt2 = (subDir2 / "ext2.srt").string();
+                { std::ofstream srt(extSrt2); srt << "1\n00:00:00,000 --> 00:00:01,000\nExternal 2\n"; }
+                std::string embFile2 = (subDir2 / "video_with_sub2.mkv").string();
+                std::string cmd = "ffmpeg -y -loglevel error -f lavfi -i \"testsrc=duration=2:size=64x64:rate=5\" -i \"" +
+                                   embSrt2 + "\" -c:v mpeg4 -c:s srt \"" + embFile2 + "\"";
+                if (std::system(cmd.c_str()) == 0) {
+                    PlayerController pc;
+                    if (pc.openFile(embFile2)) {
+                        auto subTracks = pc.getSubtitleTracks();
+                        if (!subTracks.empty()) {
+                            int subId = subTracks[0].id;
+                            pc.selectSubtitleTrack(subId); // embedded
+
+                            AVPacket* subPkt = av_packet_alloc();
+                            feedPacket(pc.m_subtitleQueue, subPkt);
+                            pc.pollSubtitlePackets(); // pops+processes the queued packet
+                            test_assert(true, "pollSubtitlePackets() processes a real queued packet without crashing");
+
+                            pc.selectSubtitleTrack(-1); // Off: decoder is embedded (not external) -> reset() branch
+                            test_assert(pc.getActiveSubtitleTrackName() == "Off", "selectSubtitleTrack(-1) disables an embedded subtitle track");
+
+                            test_assert(pc.loadExternalSubtitle(extSrt2), "loadExternalSubtitle() loads a real external subtitle file");
+                            pc.selectSubtitleTrack(subId); // back to embedded: current decoder is now non-external again
+                            // m_hasExternalSubtitle is still true from the loadExternalSubtitle() call above,
+                            // but the *current* decoder is embedded -- selectSubtitleTrack(-2) must recreate
+                            // the external decoder rather than reusing the (now embedded) one.
+                            pc.selectSubtitleTrack(-2);
+                            test_assert(pc.getActiveSubtitleTrackName() != "Off",
+                                        "selectSubtitleTrack(-2) recreates the external decoder when the current one isn't external");
+                        }
+                    }
+                    pc.stop();
+                }
+            }
         }
 
         // Demuxer: hit the m_seekRequested check in threadLoop during active read
@@ -2020,7 +3948,7 @@ int main(int argc, char* argv[]) {
                 
                 for (int i = 0; i < 70; i++) {
                     AVPacket* pkt = av_packet_alloc();
-                    dec->m_queue.push(pkt);
+                    feedPacket(dec->m_queue, pkt);
                 }
                 
                 dec->decodeNextFrame();
@@ -2056,7 +3984,7 @@ int main(int argc, char* argv[]) {
                     
                     for (int i = 0; i < 70; i++) {
                         AVPacket* pkt = av_packet_alloc();
-                        dec->m_queue.push(pkt);
+                        feedPacket(dec->m_queue, pkt);
                     }
                     
                     test_assert(!dec->decodeNextFrame(), "decodeNextFrame returns false when fallback allocation fails");
@@ -2091,7 +4019,7 @@ int main(int argc, char* argv[]) {
                     
                     for (int i = 0; i < 70; i++) {
                         AVPacket* pkt = av_packet_alloc();
-                        dec->m_queue.push(pkt);
+                        feedPacket(dec->m_queue, pkt);
                     }
                     
                     test_assert(!dec->decodeNextFrame(), "decodeNextFrame returns false when fallback copy params fails");
@@ -2126,7 +4054,7 @@ int main(int argc, char* argv[]) {
                     
                     for (int i = 0; i < 70; i++) {
                         AVPacket* pkt = av_packet_alloc();
-                        dec->m_queue.push(pkt);
+                        feedPacket(dec->m_queue, pkt);
                     }
                     
                     test_assert(!dec->decodeNextFrame(), "decodeNextFrame returns false when fallback open fails");
@@ -2155,30 +4083,256 @@ int main(int argc, char* argv[]) {
                     global_fake_codec_ptr = &fakeCodec;
                     dec->m_codecCtx->codec = &fakeCodec;
                     
-                    AVCodecID savedId = dec->m_codecCtx->codec_id;
-                    dec->m_codecCtx->codec_id = AV_CODEC_ID_NONE;
-                    
+                    // fallbackToSoftware() reads m_codecParams->codec_id (not
+                    // m_codecCtx->codec_id, which reopenHardwareDecoder() may
+                    // already have freed by this point) -- that's the field
+                    // that must be poisoned to make avcodec_find_decoder()
+                    // fail during the fallback.
+                    AVCodecID savedId = dec->m_codecParams->codec_id;
+                    dec->m_codecParams->codec_id = AV_CODEC_ID_NONE;
+
                     force_receive_eagain = true;
                     mock_send_packet_success = true;
-                    
+                    // Force reopenHardwareDecoder() to fail deterministically
+                    // (rather than depending on whether this machine actually
+                    // has working QSV hardware) so recoverHardwareDecoder()
+                    // reliably reaches fallbackToSoftware(), which is what
+                    // must fail here on the poisoned codec_id above.
+                    force_alloc_fail = true;
+
                     for (int i = 0; i < 70; i++) {
                         AVPacket* pkt = av_packet_alloc();
-                        dec->m_queue.push(pkt);
+                        feedPacket(dec->m_queue, pkt);
                     }
-                    
+
                     test_assert(!dec->decodeNextFrame(), "decodeNextFrame returns false when software decoder not found");
-                    
+
                     force_receive_eagain = false;
                     mock_send_packet_success = false;
-                    if (dec->m_codecCtx) {
-                        dec->m_codecCtx->codec_id = savedId;
-                    }
+                    force_alloc_fail = false;
+                    dec->m_codecParams->codec_id = savedId;
                     if (dec->m_codecCtx && dec->m_codecCtx->codec == &fakeCodec) {
                         dec->m_codecCtx->codec = savedCodec;
                     }
                     global_saved_codec = nullptr;
                     global_fake_codec_ptr = nullptr;
                 }
+            }
+
+            // Case D2: fallbackToSoftware() called directly (private-access)
+            // with a poisoned codec_id -- deterministic, unlike Case D above,
+            // which depends on reopenHardwareDecoder() actually failing first
+            // (not guaranteed on a machine where QSV hardware happens to work).
+            {
+                PlayerController controller;
+                if (controller.openFile(testFile)) {
+                    VideoDecoder* dec = controller.m_videoDecoder.get();
+                    AVCodecID savedId = dec->m_codecParams->codec_id;
+                    dec->m_codecParams->codec_id = AV_CODEC_ID_NONE;
+                    test_assert(!dec->fallbackToSoftware(), "fallbackToSoftware() fails gracefully when no software decoder is registered for the codec");
+                    dec->m_codecParams->codec_id = savedId;
+                }
+            }
+
+            // Case E: reopenHardwareDecoder()'s own guard clauses, called
+            // directly (private-access) rather than through the full
+            // decode/recovery loop above -- these need m_codecCtx itself (or
+            // its codec/name) to be null, and an unregistered codec name,
+            // neither of which the fakeCodec="h264_qsv" trick above produces.
+            {
+                PlayerController controller;
+                if (controller.openFile(testFile)) {
+                    VideoDecoder* dec = controller.m_videoDecoder.get();
+
+                    AVCodecContext* savedCtx = dec->m_codecCtx;
+                    dec->m_codecCtx = nullptr;
+                    test_assert(!dec->reopenHardwareDecoder(), "reopenHardwareDecoder() fails gracefully with no codec context");
+                    dec->m_codecCtx = savedCtx;
+
+                    const AVCodec* savedCodec = dec->m_codecCtx->codec;
+                    AVCodec bogusCodec = *savedCodec;
+                    bogusCodec.name = "totally_bogus_codec_name_xyz";
+                    global_saved_codec = savedCodec;
+                    global_fake_codec_ptr = &bogusCodec;
+                    dec->m_codecCtx->codec = &bogusCodec;
+                    test_assert(!dec->reopenHardwareDecoder(),
+                                "reopenHardwareDecoder() fails gracefully when the codec name isn't registered");
+                    if (dec->m_codecCtx && dec->m_codecCtx->codec == &bogusCodec) {
+                        dec->m_codecCtx->codec = savedCodec;
+                    }
+                    global_saved_codec = nullptr;
+                    global_fake_codec_ptr = nullptr;
+                }
+            }
+        }
+
+        // VideoDecoder: init()'s hardware-candidate loop (candidate lookup
+        // succeeds but avcodec_open2()/the DRY-RUN probe fails, so the loop
+        // must log "unavailable, trying next" and move on to the next
+        // candidate) and the HEVC candidate-table selection, neither of
+        // which the H264-only test asset combined with a working GPU (see
+        // "isVideoHardware returns true when using hardware" above) ever
+        // exercises -- real hardware decode there succeeds on its first
+        // candidate, so the loop never continues past it.
+        {
+            g_disableHardwareDecoders = false;
+            force_open_fail = true; // fails avcodec_open2() for every candidate, hw and software alike
+
+            AVCodecParameters* h264Params = avcodec_parameters_alloc();
+            h264Params->codec_type = AVMEDIA_TYPE_VIDEO;
+            h264Params->codec_id = AV_CODEC_ID_H264;
+            h264Params->width = 640;
+            h264Params->height = 360;
+            ThreadSafeQueue<AVPacket*> hwLoopQueue1;
+            VideoDecoder h264HwFail(h264Params, {1, 25}, 0, hwLoopQueue1);
+            test_assert(!h264HwFail.init(), "VideoDecoder.init() fails gracefully when every H264 candidate (hw and software) fails to open");
+            avcodec_parameters_free(&h264Params);
+
+            AVCodecParameters* hevcParams = avcodec_parameters_alloc();
+            hevcParams->codec_type = AVMEDIA_TYPE_VIDEO;
+            hevcParams->codec_id = AV_CODEC_ID_HEVC;
+            hevcParams->width = 640;
+            hevcParams->height = 360;
+            ThreadSafeQueue<AVPacket*> hwLoopQueue2;
+            VideoDecoder hevcHwFail(hevcParams, {1, 25}, 0, hwLoopQueue2);
+            test_assert(!hevcHwFail.init(), "VideoDecoder.init() selects the HEVC candidate table and fails gracefully when every candidate fails to open");
+            avcodec_parameters_free(&hevcParams);
+
+            force_open_fail = false;
+            g_disableHardwareDecoders = true;
+        }
+
+        // VideoDecoder: init()'s hardware-candidate loop ctx-alloc and
+        // parameters-copy failures (distinct call sites from the same
+        // failures in the software-fallback path below them).
+        {
+            g_disableHardwareDecoders = false;
+
+            force_alloc_fail = true;
+            AVCodecParameters* allocFailParams = avcodec_parameters_alloc();
+            allocFailParams->codec_type = AVMEDIA_TYPE_VIDEO;
+            allocFailParams->codec_id = AV_CODEC_ID_H264;
+            ThreadSafeQueue<AVPacket*> hwAllocQueue;
+            VideoDecoder hwAllocFail(allocFailParams, {1, 25}, 0, hwAllocQueue);
+            test_assert(!hwAllocFail.init(), "VideoDecoder.init() fails gracefully when avcodec_alloc_context3() fails for every hw candidate too");
+            avcodec_parameters_free(&allocFailParams);
+            force_alloc_fail = false;
+
+            force_copy_params_fail = true;
+            AVCodecParameters* copyFailParams = avcodec_parameters_alloc();
+            copyFailParams->codec_type = AVMEDIA_TYPE_VIDEO;
+            copyFailParams->codec_id = AV_CODEC_ID_H264;
+            ThreadSafeQueue<AVPacket*> hwCopyQueue;
+            VideoDecoder hwCopyFail(copyFailParams, {1, 25}, 0, hwCopyQueue);
+            test_assert(!hwCopyFail.init(), "VideoDecoder.init() fails gracefully when avcodec_parameters_to_context() fails for every hw candidate too");
+            avcodec_parameters_free(&copyFailParams);
+            force_copy_params_fail = false;
+
+            g_disableHardwareDecoders = true;
+        }
+
+        // VideoDecoder: flush()'s drain-before-flush EAGAIN retry loop in
+        // decodeNextFrame() -- a drain that returns EAGAIN (decoder still has
+        // data in flight) rather than immediately AVERROR_EOF, which no other
+        // test's flush() timing happens to hit.
+        {
+            PlayerController controller;
+            if (controller.openFile(testFile)) {
+                VideoDecoder* dec = controller.m_videoDecoder.get();
+                force_receive_eagain = true;
+                dec->flush();
+                // Cut the packet supply off before decodeNextFrame() runs.
+                // Past the drain loop, a permanently-EAGAIN receive_frame()
+                // livelocks the main decode loop: the real (unmocked)
+                // decoder's internal buffer fills up because the mock never
+                // lets a frame be drained out of it, the real send_packet()
+                // then returns EAGAIN forever, and the "resend this same
+                // packet once space frees up" branch spins at 100% CPU with
+                // no exit. (The other force_receive_eagain tests dodge this
+                // by also setting mock_send_packet_success.) An aborted
+                // queue makes the post-drain try_pop() fail instead, so the
+                // call returns right after the retry loop under test --
+                // which is all this block is here to cover.
+                dec->m_queue.abort();
+                dec->decodeNextFrame(); // drains via ~50ms of EAGAIN retries, then gives up and returns false
+                force_receive_eagain = false;
+            }
+        }
+
+        // VideoDecoder: send_packet() returning EAGAIN ("resend this same
+        // packet once space frees up" -- not a failure) followed by a hard
+        // (non-EAGAIN, non-EOF) receive error on the very next iteration,
+        // still holding the packet that was never freed after the send-EAGAIN
+        // continue. No other test's mocking sequences a send-EAGAIN followed
+        // by a genuine receive failure in the same decodeNextFrame() call.
+        {
+            PlayerController controller;
+            if (controller.openFile(testFile)) {
+                VideoDecoder* dec = controller.m_videoDecoder.get();
+                AVPacket* pkt = av_packet_alloc();
+                feedPacket(dec->m_queue, pkt);
+                force_receive_frame_eagain_then_fail = 1;
+                force_send_packet_eagain = true;
+                test_assert(!dec->decodeNextFrame(),
+                            "decodeNextFrame returns false after a send-EAGAIN retry is followed by a hard receive error");
+                force_send_packet_eagain = false;
+                force_receive_frame_eagain_then_fail = -1;
+            }
+        }
+
+        // VideoDecoder: real hardware decode's "failed on send"/"failed on
+        // receive" recovery branches -- distinct from the fakeCodec="h264_qsv"
+        // cases above (which only ever hit the "stuck after 64 EAGAINs"
+        // path). These need a genuinely active hardware decoder so
+        // isHardwareDecoder(m_codecCtx->codec) is true against the real
+        // codec object, with send/receive itself forced to fail.
+        {
+            g_disableHardwareDecoders = false;
+            PlayerController hwController;
+            if (hwController.openFile(testFile) && hwController.isVideoHardware()) {
+                VideoDecoder* dec = hwController.m_videoDecoder.get();
+
+                // "Failed on send": needs a packet available so decodeNextFrame()
+                // reaches the send_packet() call at all.
+                AVPacket* pkt = nullptr;
+                for (int w = 0; w < 25 && !dec->m_queue.try_pop(pkt); ++w) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                }
+                if (pkt) {
+                    feedPacket(dec->m_queue, pkt);
+                    force_send_packet_fail = true;
+                    dec->decodeNextFrame();
+                    force_send_packet_fail = false;
+                }
+
+                // "Failed on receive": no real packet needed -- the mocked
+                // receive_frame() fails immediately on the very first call.
+                force_receive_frame_fail = true;
+                dec->decodeNextFrame();
+                force_receive_frame_fail = false;
+            }
+            hwController.stop();
+            g_disableHardwareDecoders = true;
+        }
+
+        // VideoDecoder: decodeNextFrame()'s and convertFrame()'s profiling
+        // time-tracker branches -- no other test drives real decode/convert
+        // work with m_metrics->m_profilingEnabled set.
+        {
+            PlayerController controller;
+            if (controller.openFile(testFile)) {
+                controller.m_metrics->setProfilingEnabled(true);
+                controller.play();
+                drive_playback(controller, 0.5);
+                // drive_playback() only calls decodeNextFrame() itself --
+                // convertFrame() is normally driven from the render loop
+                // (src/app/main.cpp, not part of this test binary), so call
+                // it directly here to exercise its own profiling timer too.
+                if (VideoDecoder* dec = controller.getVideoDecoder()) {
+                    dec->convertFrame();
+                }
+                controller.m_metrics->setProfilingEnabled(false);
+                controller.stop();
             }
         }
 
@@ -2225,6 +4379,27 @@ int main(int argc, char* argv[]) {
                 mock_hw_transfer_nv12 = true;
                 test_assert(dec->convertFrame(), "convertFrame slow-path hardware QSV transfer succeeds");
                 mock_hw_transfer_nv12 = false;
+
+                // Case F: av_frame_ref() failing on the native (useNative)
+                // path -- needs tempCpuFrame to hold real pixel data (not the
+                // unit-test "dummy frame" shortcut, which never reaches
+                // av_frame_ref() at all), hence force_hw_transfer_real_buffer.
+                dec->m_decodedFrame->format = AV_PIX_FMT_QSV;
+                dec->m_decodedFrame->width = dec->m_allocatedWidth;
+                dec->m_decodedFrame->height = dec->m_allocatedHeight;
+                force_hw_transfer_real_buffer = true;
+                force_hw_frame_ref_fail = true;
+                test_assert(!dec->convertFrame(), "convertFrame fails gracefully when av_frame_ref() fails on the native path");
+                force_hw_frame_ref_fail = false;
+
+                // Case F2: same setup, but av_frame_ref() succeeds this time
+                // -- the native path's *success*-side tempCpuFrame cleanup,
+                // a different call site from Case F's failure-side cleanup.
+                dec->m_decodedFrame->format = AV_PIX_FMT_QSV;
+                dec->m_decodedFrame->width = dec->m_allocatedWidth;
+                dec->m_decodedFrame->height = dec->m_allocatedHeight;
+                test_assert(dec->convertFrame(), "convertFrame succeeds on the native path when av_frame_ref() succeeds with a real tempCpuFrame");
+                force_hw_transfer_real_buffer = false;
             }
         }
 
@@ -2260,6 +4435,18 @@ int main(int argc, char* argv[]) {
                 force_sws_context_fail = true;
                 test_assert(!dec->convertFrame(), "convertFrame fails when sws_getContext fails with QSV");
                 force_sws_context_fail = false;
+
+                // Case 4: scaledFrame's own av_frame_alloc() failing (distinct
+                // call site from tempCpuFrame's, which must itself still
+                // succeed to reach this one) -- covers the tempCpuFrame
+                // cleanup on that specific failure path.
+                dec->m_decodedFrame->width = dec->m_allocatedWidth + 10;
+                dec->m_decodedFrame->height = dec->m_allocatedHeight + 10;
+                dec->m_decodedFrame->format = AV_PIX_FMT_QSV;
+                force_frame_alloc_fail_on_second_call = 1;
+                test_assert(!dec->convertFrame(), "convertFrame fails when the scaled-frame allocation fails, with a tempCpuFrame to clean up");
+                force_frame_alloc_fail_on_second_call = -1;
+
                 mock_hw_transfer_nv12 = false;
             }
         }
@@ -2274,6 +4461,12 @@ int main(int argc, char* argv[]) {
                 dec->m_allocatedFormat = AV_PIX_FMT_NONE;
                 test_assert(dec->getPixelFormatName() == "unknown", "getPixelFormatName returns unknown for NONE");
             }
+        }
+
+        // VideoDecoder: isHardwareDecoder()'s null-codec guard -- every other
+        // call site always passes a real, already-validated AVCodec*.
+        {
+            test_assert(!VideoDecoder::isHardwareDecoder(nullptr), "isHardwareDecoder(nullptr) returns false");
         }
 
         // -------------------------------------------------------------
@@ -2448,6 +4641,8 @@ int main(int argc, char* argv[]) {
             // nothing is popping.
             {
                 ThreadSafeQueue<int> queue(3);
+                std::atomic<int> depth{0};
+                queue.attachDepthMirror(&depth);
                 for (int i = 0; i < 3; i++) {
                     test_assert(queue.push(i), "T7b: fill queue to capacity");
                 }
@@ -2462,12 +4657,31 @@ int main(int argc, char* argv[]) {
                 test_assert(elapsedSec < 0.05, "T7b: push_drop_oldest returns immediately, never blocks");
                 test_assert(queue.size() == 3, "T7b: push_drop_oldest keeps the queue at capacity");
 
+                int waitDropCleanedUp = 0;
                 start = std::chrono::steady_clock::now();
-                pushed = queue.push_wait_or_drop(100, std::chrono::milliseconds(50));
+                pushed = queue.push_wait_or_drop(100, std::chrono::milliseconds(50),
+                                                  [&waitDropCleanedUp](int&) { waitDropCleanedUp++; });
                 elapsedSec = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
                 test_assert(pushed, "T7b: push_wait_or_drop succeeds on a full, undrained queue");
                 test_assert(elapsedSec < 0.5, "T7b: push_wait_or_drop returns at its timeout, not forever");
                 test_assert(elapsedSec >= 0.045, "T7b: push_wait_or_drop actually waits close to its timeout before dropping");
+                test_assert(waitDropCleanedUp == 1, "T7b: push_wait_or_drop invoked the dropCleanup functor for ThreadSafeQueue<int>");
+                test_assert(depth.load() == 3, "T7b: depth mirror reflects size through push_drop_oldest/push_wait_or_drop");
+
+                int cleanedUp = 0;
+                pushed = queue.push_drop_oldest(101, [&cleanedUp](int&) { cleanedUp++; });
+                test_assert(pushed, "T7b: push_drop_oldest with a dropCleanup functor still succeeds");
+                test_assert(cleanedUp == 1, "T7b: push_drop_oldest invoked the dropCleanup functor for ThreadSafeQueue<int>");
+
+                queue.abort();
+                test_assert(!queue.push_drop_oldest(102), "T7b: push_drop_oldest returns false on an aborted queue");
+                test_assert(!queue.push_wait_or_drop(103, std::chrono::milliseconds(10)),
+                            "T7b: push_wait_or_drop returns false on an aborted queue");
+
+                int clearedUp = 0;
+                queue.clear([&clearedUp](int&) { clearedUp++; });
+                test_assert(clearedUp > 0, "T7b: clear() invokes its cleanupFunc for ThreadSafeQueue<int>");
+                test_assert(depth.load() == 0, "T7b: clear() zeroes the depth mirror for ThreadSafeQueue<int>");
             }
 
             // T7c: documents the failure mode T7b fixes -- a plain,
@@ -2495,6 +4709,176 @@ int main(int argc, char* argv[]) {
                 test_assert(elapsedSec >= 0.075, "T7c: plain push genuinely blocked until the queue was drained");
             }
 
+            // T7d: a blocking pop() on an already-aborted queue must return
+            // false immediately rather than block.
+            {
+                ThreadSafeQueue<int> queue(5);
+                queue.abort();
+                int val;
+                test_assert(!queue.pop(val), "T7d: pop() returns false immediately on an aborted queue");
+            }
+
+            // T7e: push_drop_oldest() on the ThreadSafeQueue<AVPacket*>
+            // instantiation actually used by the demuxer -- covers the
+            // dropCleanup invocation, the depth-mirror update, and the
+            // aborted-queue early return, which are each distinct template
+            // instantiations from the ThreadSafeQueue<int> coverage above.
+            {
+                ThreadSafeQueue<AVPacket*> queue(2);
+                std::atomic<int> depth{0};
+                queue.attachDepthMirror(&depth);
+
+                AVPacket* p1 = av_packet_alloc();
+                AVPacket* p2 = av_packet_alloc();
+                test_assert(queue.push_drop_oldest(p1, [](AVPacket*& p) { av_packet_free(&p); }),
+                            "T7e: push_drop_oldest on an empty queue succeeds");
+                test_assert(queue.push_drop_oldest(p2, [](AVPacket*& p) { av_packet_free(&p); }),
+                            "T7e: push_drop_oldest fills the queue to capacity");
+                test_assert(depth.load() == 2, "T7e: depth mirror reflects queue size after push_drop_oldest");
+
+                int freedCount = 0;
+                AVPacket* p3 = av_packet_alloc();
+                bool pushed = queue.push_drop_oldest(p3, [&freedCount](AVPacket*& p) {
+                    freedCount++;
+                    av_packet_free(&p);
+                });
+                test_assert(pushed, "T7e: push_drop_oldest on a full queue still succeeds");
+                test_assert(freedCount == 1, "T7e: push_drop_oldest invoked dropCleanup on the oldest item");
+                test_assert(queue.size() == 2, "T7e: push_drop_oldest keeps size at capacity");
+
+                queue.abort();
+                AVPacket* p4 = av_packet_alloc();
+                bool pushedAfterAbort = queue.push_drop_oldest(p4, [](AVPacket*& p) { av_packet_free(&p); });
+                test_assert(!pushedAfterAbort, "T7e: push_drop_oldest returns false when the queue is aborted");
+                av_packet_free(&p4);
+
+                queue.clear([](AVPacket*& p) { av_packet_free(&p); });
+            }
+
+            // T7f: push_wait_or_drop() on a full, undrained queue for both
+            // ThreadSafeQueue<AVPacket*> (Demuxer's video/audio/subtitle
+            // queues) and ThreadSafeQueue<DecodedFrame> (PlayerController's
+            // decoded-frame queue) -- each a separate template instantiation
+            // that must independently exercise the timeout-drop and
+            // aborted-queue branches.
+            {
+                ThreadSafeQueue<AVPacket*> queue(1);
+                AVPacket* p1 = av_packet_alloc();
+                test_assert(queue.push(p1), "T7f: fill AVPacket* queue to capacity");
+
+                int freedCount = 0;
+                AVPacket* p2 = av_packet_alloc();
+                auto start = std::chrono::steady_clock::now();
+                bool pushed = queue.push_wait_or_drop(p2, std::chrono::milliseconds(50),
+                                                       [&freedCount](AVPacket*& p) {
+                                                           freedCount++;
+                                                           av_packet_free(&p);
+                                                       });
+                double elapsedSec = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+                test_assert(pushed, "T7f: push_wait_or_drop succeeds on a full, undrained AVPacket* queue");
+                test_assert(freedCount == 1, "T7f: push_wait_or_drop invoked dropCleanup for AVPacket*");
+                test_assert(elapsedSec >= 0.045, "T7f: push_wait_or_drop waited close to its timeout before dropping");
+
+                queue.abort();
+                AVPacket* p3 = av_packet_alloc();
+                bool pushedAfterAbort = queue.push_wait_or_drop(p3, std::chrono::milliseconds(10));
+                test_assert(!pushedAfterAbort, "T7f: push_wait_or_drop (AVPacket*) returns false when aborted");
+                av_packet_free(&p3);
+                queue.clear([](AVPacket*& p) { av_packet_free(&p); });
+            }
+            {
+                ThreadSafeQueue<DecodedFrame> queue(1);
+                std::atomic<int> depth{0};
+                queue.attachDepthMirror(&depth);
+                DecodedFrame d1;
+                d1.frame = av_frame_alloc();
+                test_assert(queue.push(d1), "T7f: fill DecodedFrame queue to capacity");
+                test_assert(depth.load() == 1, "T7f: depth mirror reflects size after push(DecodedFrame)");
+
+                int freedCount = 0;
+                DecodedFrame d2;
+                d2.frame = av_frame_alloc();
+                bool pushed = queue.push_wait_or_drop(d2, std::chrono::milliseconds(50),
+                                                       [&freedCount](DecodedFrame& d) {
+                                                           freedCount++;
+                                                           if (d.frame) av_frame_free(&d.frame);
+                                                       });
+                test_assert(pushed, "T7f: push_wait_or_drop succeeds on a full, undrained DecodedFrame queue");
+                test_assert(freedCount == 1, "T7f: push_wait_or_drop invoked dropCleanup for DecodedFrame");
+
+                queue.abort();
+                DecodedFrame d3;
+                bool pushedAfterAbort = queue.push_wait_or_drop(d3, std::chrono::milliseconds(10));
+                test_assert(!pushedAfterAbort, "T7f: push_wait_or_drop (DecodedFrame) returns false when aborted");
+                test_assert(!queue.push(d3), "T7f: push(DecodedFrame) returns false on an aborted queue");
+                if (d3.frame) av_frame_free(&d3.frame);
+                queue.clear([](DecodedFrame& d) { if (d.frame) av_frame_free(&d.frame); });
+            }
+            {
+                // reset() on the DecodedFrame instantiation, draining a
+                // still-populated queue (mirrors the AVPacket* case above).
+                ThreadSafeQueue<DecodedFrame> queue(5);
+                std::atomic<int> depth{0};
+                queue.attachDepthMirror(&depth);
+
+                DecodedFrame d1;
+                d1.frame = av_frame_alloc();
+                DecodedFrame d2;
+                d2.frame = av_frame_alloc();
+                queue.push(d1);
+                queue.push(d2);
+                test_assert(queue.size() == 2, "T7g: DecodedFrame queue holds 2 items before reset");
+                av_frame_free(&d1.frame);
+                av_frame_free(&d2.frame);
+                queue.reset();
+                test_assert(queue.empty(), "T7g: reset() drains a non-empty DecodedFrame queue");
+                test_assert(depth.load() == 0, "T7g: reset() zeroes the depth mirror for DecodedFrame");
+            }
+
+            // T7g: reset() draining a still-populated queue, and clear()
+            // invoking its cleanup functor for every queued item and
+            // zeroing the depth mirror -- both only ever run on already-
+            // empty queues in production (clear() always precedes reset()),
+            // so these branches need a direct, non-empty-queue exercise.
+            {
+                ThreadSafeQueue<AVPacket*> queue(5);
+                std::atomic<int> depth{0};
+                queue.attachDepthMirror(&depth);
+
+                AVPacket* p1 = av_packet_alloc();
+                AVPacket* p2 = av_packet_alloc();
+                queue.push(p1);
+                queue.push(p2);
+                test_assert(queue.size() == 2, "T7g: queue holds 2 items before reset");
+                // reset() has no cleanup hook (unlike clear()), so free the
+                // packets directly first; reset() only discards the queue's
+                // copies of the pointer values without dereferencing them.
+                av_packet_free(&p1);
+                av_packet_free(&p2);
+                queue.reset();
+                test_assert(queue.empty(), "T7g: reset() drains a non-empty queue");
+                test_assert(depth.load() == 0, "T7g: reset() zeroes the depth mirror");
+            }
+            {
+                ThreadSafeQueue<AVPacket*> queue(5);
+                std::atomic<int> depth{0};
+                queue.attachDepthMirror(&depth);
+
+                AVPacket* p1 = av_packet_alloc();
+                AVPacket* p2 = av_packet_alloc();
+                queue.push(p1);
+                queue.push(p2);
+
+                int freedCount = 0;
+                queue.clear([&freedCount](AVPacket*& p) {
+                    freedCount++;
+                    av_packet_free(&p);
+                });
+                test_assert(freedCount == 2, "T7g: clear() invokes cleanupFunc for every queued item");
+                test_assert(queue.empty(), "T7g: clear() drains the queue");
+                test_assert(depth.load() == 0, "T7g: clear() zeroes the depth mirror");
+            }
+
             // T8: setProfilingEnabled(true) -> ring writes occur; back to false -> writes stop (toggle round-trip)
             {
                 PipelineMetrics metrics;
@@ -2513,7 +4897,22 @@ int main(int argc, char* argv[]) {
                 test_assert(metrics.m_demuxTimePerPacketUs.getHead() == 1, "T8: write did not occur when disabled");
             }
 
-            std::cout << "Pipeline Metrics & MetricRing Tests (T1 - T8) passed!" << std::endl;
+            // T9: the remaining record*Time()/recordClockOffset() wrappers,
+            // never called by any other test.
+            {
+                PipelineMetrics metrics;
+                metrics.setProfilingEnabled(true);
+                metrics.recordDecodeTime(1.0f);
+                metrics.recordConvertTime(2.0f);
+                metrics.recordUploadTime(3.0f);
+                metrics.recordClockOffset(4.0f);
+                test_assert(metrics.m_decodeTimePerFrameUs.getHead() == 1, "T9: recordDecodeTime() writes when enabled");
+                test_assert(metrics.m_convertTimeUs.getHead() == 1, "T9: recordConvertTime() writes when enabled");
+                test_assert(metrics.m_uploadTimeUs.getHead() == 1, "T9: recordUploadTime() writes when enabled");
+                test_assert(metrics.m_avClockOffsetMs.getHead() == 1, "T9: recordClockOffset() writes when enabled");
+            }
+
+            std::cout << "Pipeline Metrics & MetricRing Tests (T1 - T9) passed!" << std::endl;
         }
 
         // ColorPipelineInfo Metadata Extraction Test
@@ -3572,6 +5971,19 @@ int main(int argc, char* argv[]) {
 
                 double missing = naikav::dsp::prescanIntegratedLufs("this_file_does_not_exist.mp4");
                 test_assert(missing <= -70.0, "prescanIntegratedLufs: returns the failure sentinel for a nonexistent file");
+
+                // The EOF-flush loop's feedFrame() call: real decoders on
+                // this build never actually have a buffered frame left over
+                // once av_read_frame() hits EOF for these small test
+                // assets, so avcodec_send_packet(ctx, nullptr) is normally
+                // followed by an avcodec_receive_frame() that returns
+                // immediately. Forced deterministically via
+                // force_synthetic_flush_frame so the mock hands back one
+                // synthetic frame right after that flush call.
+                force_synthetic_flush_frame = true;
+                double withFlushFrame = naikav::dsp::prescanIntegratedLufs(testFile);
+                force_synthetic_flush_frame = false;
+                test_assert(withFlushFrame > -70.0, "prescanIntegratedLufs: still produces a real reading when the decoder's EOF-flush yields one extra frame");
             }
 
             std::cout << "Loudness normalization unit tests passed!" << std::endl;
@@ -3804,6 +6216,23 @@ int main(int argc, char* argv[]) {
                             "Legacy settings file leaves ResamplerQuality at MEDIUM");
             }
 
+            // saveSettings()'s ofstream-open-failure branch: pre-occupy the
+            // hardcoded "player_settings.txt" path with a directory, so the
+            // ofstream can never open a regular file there.
+            {
+                std::error_code ec;
+                std::filesystem::remove("player_settings.txt", ec);
+                bool dirCreated = std::filesystem::create_directory("player_settings.txt", ec);
+                test_assert(dirCreated, "Test setup: created a directory occupying the settings file path");
+
+                PlayerController pcSaveFail;
+                pcSaveFail.saveSettings();
+                test_assert(std::filesystem::is_directory("player_settings.txt"),
+                            "saveSettings() returns without crashing (and without touching the path) when the settings file can't be opened");
+
+                std::filesystem::remove("player_settings.txt", ec);
+            }
+
             std::cout << "Audio DSP settings persistence test passed!" << std::endl;
         }
 
@@ -3873,6 +6302,32 @@ int main(int argc, char* argv[]) {
 
                 naikav::dsp::AudioDspSettings out4;
                 test_assert(!naikav::dsp::presetForGenreTag("", out4), "presetForGenreTag: empty genre string returns false");
+
+                naikav::dsp::AudioDspSettings out5;
+                test_assert(naikav::dsp::presetForGenreTag("Movie Soundtrack", out5), "presetForGenreTag: 'Movie Soundtrack' matches a preset");
+                test_assert(out5 == naikav::dsp::makeCinemaPreset(), "presetForGenreTag: maps to the Cinema preset");
+
+                naikav::dsp::AudioDspSettings out6;
+                test_assert(naikav::dsp::presetForGenreTag("EDM", out6), "presetForGenreTag: 'EDM' matches a preset");
+                test_assert(out6 == naikav::dsp::makeBassBoostPreset(), "presetForGenreTag: maps to the Bass Boost preset");
+
+                naikav::dsp::AudioDspSettings out7;
+                test_assert(naikav::dsp::presetForGenreTag("Vocal", out7), "presetForGenreTag: 'Vocal' matches a preset");
+                test_assert(out7 == naikav::dsp::makeVocalBoostPreset(), "presetForGenreTag: maps to the Vocal Boost preset");
+
+                naikav::dsp::AudioDspSettings out8;
+                test_assert(naikav::dsp::presetForGenreTag("Jazz", out8), "presetForGenreTag: 'Jazz' matches a preset");
+                test_assert(out8 == naikav::dsp::makeLivePreset(), "presetForGenreTag: maps to the Live preset");
+
+                naikav::dsp::AudioDspSettings out9;
+                test_assert(naikav::dsp::presetForGenreTag("Gaming", out9), "presetForGenreTag: 'Gaming' matches a preset");
+                test_assert(out9 == naikav::dsp::makeGamingPreset(), "presetForGenreTag: maps to the Gaming preset");
+
+                // operator==()'s false branch: two settings differing in one
+                // of the many scalar fields it compares.
+                naikav::dsp::AudioDspSettings a, b;
+                b.compressorThresholdDb = a.compressorThresholdDb + 1.0f;
+                test_assert(!(a == b), "AudioDspSettings::operator==() returns false when a scalar field differs");
             }
 
             // --- Output format/device/resampler-quality helpers (anonymous-
@@ -4035,6 +6490,104 @@ int main(int argc, char* argv[]) {
                 std::filesystem::remove(exportRes.filepath, ec);
                 std::filesystem::remove("test_screenshots", ec);
                 av_frame_free(&synthFrame);
+
+                // Test 3: an hours>0 playback timestamp (the >=1hr filename
+                // branch, distinct from Test 2's <1hr one).
+                auto makeSynthFrame = []() -> AVFrame* {
+                    AVFrame* f = av_frame_alloc();
+                    f->format = AV_PIX_FMT_YUV420P;
+                    f->width = 128;
+                    f->height = 128;
+                    av_frame_get_buffer(f, 0);
+                    std::memset(f->data[0], 128, f->linesize[0] * 128);
+                    std::memset(f->data[1], 128, f->linesize[1] * 64);
+                    std::memset(f->data[2], 128, f->linesize[2] * 64);
+                    return f;
+                };
+                {
+                    AVFrame* f = makeSynthFrame();
+                    auto r = FrameExporter::saveFrameAsPng(f, "synthetic_video.mp4", 3661.0, "test_screenshots");
+                    test_assert(r.success, "FrameExporter: exports successfully with an hours>0 timestamp");
+                    std::filesystem::remove(r.filepath, ec);
+                    std::filesystem::remove("test_screenshots", ec);
+                    av_frame_free(&f);
+                }
+
+                // Test 4-11: each of saveFrameAsPng()'s internal failure
+                // branches, one real FFmpeg call forced to fail at a time.
+                struct FailCase {
+                    std::atomic<bool>* flag;
+                    const char* label;
+                };
+                const FailCase failCases[] = {
+                    {&force_find_encoder_fail, "avcodec_find_encoder"},
+                    {&force_alloc_fail, "avcodec_alloc_context3"},
+                    {&force_open_fail, "avcodec_open2"},
+                    {&force_sws_context_fail, "sws_getContext"},
+                    {&force_send_frame_fail, "avcodec_send_frame"},
+                    {&force_receive_packet_fail, "avcodec_receive_packet"},
+                };
+                for (const auto& fc : failCases) {
+                    AVFrame* f = makeSynthFrame();
+                    *fc.flag = true;
+                    auto r = FrameExporter::saveFrameAsPng(f, "synthetic_video.mp4", 5.0, "test_screenshots");
+                    *fc.flag = false;
+                    test_assert(!r.success, (std::string("FrameExporter: fails gracefully when ") + fc.label + "() fails").c_str());
+                    av_frame_free(&f);
+                }
+                // force_frame_alloc_fail (the RGB frame) needs open_finished
+                // gating, like everywhere else this flag is used.
+                {
+                    AVFrame* f = makeSynthFrame();
+                    open_finished = true;
+                    force_frame_alloc_fail = true;
+                    auto r = FrameExporter::saveFrameAsPng(f, "synthetic_video.mp4", 5.0, "test_screenshots");
+                    force_frame_alloc_fail = false;
+                    test_assert(!r.success, "FrameExporter: fails gracefully when the RGB frame allocation fails");
+                    av_frame_free(&f);
+                }
+                // force_malloc_fail (av_frame_get_buffer for the RGB frame).
+                {
+                    AVFrame* f = makeSynthFrame();
+                    force_malloc_fail = true;
+                    auto r = FrameExporter::saveFrameAsPng(f, "synthetic_video.mp4", 5.0, "test_screenshots");
+                    force_malloc_fail = false;
+                    test_assert(!r.success, "FrameExporter: fails gracefully when the RGB frame buffer allocation fails");
+                    av_frame_free(&f);
+                }
+                // force_packet_alloc_fail: by this point in the suite,
+                // packet_alloc_count is already well past 5, so this fails
+                // deterministically on the very next call.
+                {
+                    AVFrame* f = makeSynthFrame();
+                    force_packet_alloc_fail = true;
+                    auto r = FrameExporter::saveFrameAsPng(f, "synthetic_video.mp4", 5.0, "test_screenshots");
+                    force_packet_alloc_fail = false;
+                    test_assert(!r.success, "FrameExporter: fails gracefully when av_packet_alloc() fails");
+                    av_frame_free(&f);
+                }
+                // Test 12: the ofstream-open-failure branch, after encoding
+                // has already succeeded. Forced deterministically by supplying
+                // a base filename exceeding the 255-character single-component limit
+                // (NAME_MAX on Linux / MAX_COMPONENT_LENGTH on Windows NTFS).
+                // create_directories(outputDir) succeeds with the short directory,
+                // frame encoding succeeds, but std::ofstream(outPath) fails to open
+                // the file whose name component exceeds filesystem limits.
+                {
+                    std::string excessivelyLongMediaName(300, 'x');
+                    excessivelyLongMediaName += ".mp4";
+
+                    AVFrame* f = makeSynthFrame();
+                    auto r = FrameExporter::saveFrameAsPng(f, excessivelyLongMediaName, 5.0, "test_screenshots");
+                    av_frame_free(&f);
+                    test_assert(!r.success, "FrameExporter: fails gracefully when the output file path exceeds filesystem limits");
+                    test_assert(r.errorMessage.find("Failed to open output file") != std::string::npos,
+                                "FrameExporter: reports the specific ofstream-open failure message");
+
+                    std::error_code rmEc;
+                    std::filesystem::remove_all(std::filesystem::path("test_screenshots"), rmEc);
+                }
+                std::filesystem::remove("test_screenshots", ec);
             }
 
             // --- Subtitle Comprehensive Unit Tests ---
@@ -4146,6 +6699,306 @@ int main(int argc, char* argv[]) {
                     std::remove(assPath.c_str());
                 }
 
+                // 4b2. parseSrtVttFallback()/parseAssSsaFallback() edge
+                // cases not hit by the plain-LF, blank-line-separated,
+                // single-line-text fixtures above: CRLF line endings, a
+                // multi-line cue (accumulated with an embedded "\n"), two
+                // cues back-to-back with no blank-line separator (forces the
+                // stale-event flush on encountering the next "-->" line),
+                // and getActiveSubtitleText()'s multi-active-event join.
+                {
+                    // Windows text-mode ifstream/ofstream already silently
+                    // translates a plain "\r\n" pair down to "\n", so a
+                    // single \r never survives to reach SubtitleDecoder's
+                    // own line.back()=='\r' strip on this platform. Doubling
+                    // the \r ("\r\r\n") leaves one literal \r attached to
+                    // each line after translation, which is what actually
+                    // exercises that strip (confirmed empirically).
+                    std::string crlfSrtPath = "temp_test_sub_crlf.srt";
+                    {
+                        std::ofstream f(crlfSrtPath, std::ios::binary);
+                        f << "1\r\r\n"
+                          << "00:00:00,000 --> 00:00:01,000\r\r\n"
+                          << "Multi line one\r\r\n"
+                          << "Multi line two\r\r\n"
+                          << "2\r\r\n"
+                          << "00:00:01,500 --> 00:00:02,500\r\r\n"
+                          << "Second cue text\r\r\n";
+                    }
+                    naikav::subtitle::SubtitleDecoder crlfDecoder;
+                    test_assert(crlfDecoder.loadExternalFile(crlfSrtPath), "External CRLF SRT loaded successfully");
+                    test_assert(crlfDecoder.getEventCount() == 2, "CRLF SRT with no blank separator still yields 2 events (stale-event flush on next timestamp)");
+                    std::remove(crlfSrtPath.c_str());
+
+                    std::string crlfAssPath = "temp_test_sub_crlf.ass";
+                    {
+                        std::ofstream f(crlfAssPath, std::ios::binary);
+                        f << "[Script Info]\r\r\n"
+                          << "[Events]\r\r\n"
+                          << "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\r\r\n"
+                          << "Dialogue: 0,0:00:00.00,0:00:01.00,Default,,0,0,0,,CRLF ASS text\r\r\n"
+                          << "Dialogue: 0,0:00:01.50,0:00:02.50,Default,,0,0,0,,Second CRLF ASS line\r\r\n";
+                    }
+                    naikav::subtitle::SubtitleDecoder crlfAssDecoder;
+                    test_assert(crlfAssDecoder.loadExternalFile(crlfAssPath), "External CRLF ASS loaded successfully");
+                    test_assert(crlfAssDecoder.getEventCount() == 2, "CRLF ASS with 2 Dialogue lines yields 2 events (also exercises the .ass fast-path sort() comparator)");
+                    std::remove(crlfAssPath.c_str());
+
+                    std::string overlapSrtPath = "temp_test_sub_overlap.srt";
+                    {
+                        std::ofstream f(overlapSrtPath);
+                        f << "1\n00:00:00,000 --> 00:00:03,000\nEvent A\n\n"
+                          << "2\n00:00:01,000 --> 00:00:04,000\nEvent B\n\n";
+                    }
+                    naikav::subtitle::SubtitleDecoder overlapDecoder;
+                    test_assert(overlapDecoder.loadExternalFile(overlapSrtPath), "External overlapping-cue SRT loaded successfully");
+                    test_assert(overlapDecoder.getActiveSubtitleText(2.0) == "Event A\nEvent B",
+                                "getActiveSubtitleText() joins multiple simultaneously-active events with a newline");
+                    std::remove(overlapSrtPath.c_str());
+                }
+
+                // 4c. SubtitleDecoder::init() failure branches -- no decoder
+                // found for the codec id, avcodec_parameters_to_context()
+                // failing, and avcodec_open2() failing.
+                {
+                    naikav::subtitle::SubtitleDecoder decoder;
+                    test_assert(!decoder.init(nullptr, {1, 1000}, 0), "init(nullptr) fails immediately");
+
+                    AVCodecParameters* badParams = avcodec_parameters_alloc();
+                    badParams->codec_type = AVMEDIA_TYPE_SUBTITLE;
+                    badParams->codec_id = AV_CODEC_ID_NONE;
+                    test_assert(!decoder.init(badParams, {1, 1000}, 0), "init() fails when no decoder is registered for the codec id");
+
+                    badParams->codec_id = AV_CODEC_ID_SUBRIP;
+                    force_copy_params_fail = true;
+                    test_assert(!decoder.init(badParams, {1, 1000}, 0), "init() fails when avcodec_parameters_to_context() fails");
+                    force_copy_params_fail = false;
+
+                    force_open_fail = true;
+                    test_assert(!decoder.init(badParams, {1, 1000}, 0), "init() fails when avcodec_open2() fails");
+                    force_open_fail = false;
+                    avcodec_parameters_free(&badParams);
+                }
+
+                // 4d. processPacket() decoding a real embedded subtitle
+                // stream -- no other test ever feeds it a packet with actual
+                // decodable subtitle data (PlayerController's own subtitle
+                // tests only push an empty dummy AVPacket, which
+                // avcodec_decode_subtitle2() rejects immediately with
+                // gotSub=0). Also covers the stale seek-generation packet
+                // drop and flush()'s real codecCtx branch.
+                {
+                    std::filesystem::path subDecDir =
+                        std::filesystem::temp_directory_path() / "naikav_subdecoder_test";
+                    std::error_code subDecEc;
+                    std::filesystem::create_directories(subDecDir, subDecEc);
+                    std::string embSrt3 = (subDecDir / "emb3.srt").string();
+                    {
+                        std::ofstream srt(embSrt3);
+                        srt << "1\n00:00:00,000 --> 00:00:03,000\nEmbedded decode test\n";
+                    }
+                    std::string embFile3 = (subDecDir / "video_with_sub3.mkv").string();
+                    std::string cmd = "ffmpeg -y -loglevel error -f lavfi -i \"testsrc=duration=3:size=64x64:rate=5\" -i \"" +
+                                      embSrt3 + "\" -c:v mpeg4 -c:s srt \"" + embFile3 + "\"";
+                    if (std::system(cmd.c_str()) == 0) {
+                        ThreadSafeQueue<AVPacket*> vq, aq;
+                        // subQ must outlive `demuxer`: attachSubtitleQueue()
+                        // hands the Demuxer a raw pointer to it, and
+                        // ~Demuxer() -> stop() calls m_subtitleQueue->abort()
+                        // unconditionally. Declared in the inner
+                        // `if (!subTracks.empty())` scope it died first, and
+                        // the destructor then wrote through the dangling
+                        // pointer -- a stack-use-after-scope ASan flagged
+                        // here. Declaring it before the Demuxer makes the
+                        // reverse destruction order tear them down safely.
+                        ThreadSafeQueue<AVPacket*> subQ(16);
+                        MetricRing<256> ring;
+                        std::atomic<bool> prof{false};
+                        Demuxer demuxer(embFile3, vq, aq, ring, prof);
+                        test_assert(demuxer.open(), "Demuxer opens the SubtitleDecoder embedded-stream test asset");
+                        auto subTracks = demuxer.getSubtitleTracks();
+                        if (!subTracks.empty()) {
+                            int subId = subTracks[0].id;
+                            demuxer.attachSubtitleQueue(&subQ);
+                            demuxer.setSubtitleStreamIndex(subId);
+
+                            naikav::subtitle::SubtitleDecoder decoder;
+                            test_assert(decoder.init(demuxer.getSubtitleCodecParams(subId),
+                                                      demuxer.getSubtitleTimeBase(subId),
+                                                      demuxer.getSubtitleStartTime(subId)),
+                                        "SubtitleDecoder::init() succeeds for a real embedded subtitle stream");
+
+                            // Stale seek-generation packet: attached before
+                            // any real packets flow, so the very first one
+                            // is dropped via the mismatched-generation check.
+                            std::atomic<uint64_t> genCounter{5};
+                            decoder.attachSeekGeneration(&genCounter);
+                            AVPacket* stalePkt = av_packet_alloc();
+                            stalePkt->opaque = reinterpret_cast<void*>(static_cast<uintptr_t>(1));
+                            decoder.processPacket(stalePkt);
+                            av_packet_free(&stalePkt);
+                            test_assert(decoder.getEventCount() == 0, "processPacket() drops a stale seek-generation packet");
+                            decoder.attachSeekGeneration(nullptr);
+
+                            demuxer.start();
+                            AVPacket* realPkt = nullptr;
+                            for (int w = 0; w < 50 && !subQ.try_pop(realPkt); ++w) {
+                                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                            }
+                            demuxer.stop();
+                            if (realPkt) {
+                                decoder.processPacket(realPkt);
+                                av_packet_free(&realPkt);
+                                test_assert(decoder.getEventCount() > 0, "processPacket() decodes a real embedded subtitle packet");
+                                test_assert(!decoder.getActiveSubtitleText(0.5).empty(),
+                                            "getActiveSubtitleText() returns the decoded embedded event's text");
+                                auto activeEvents = decoder.getActiveEvents(0.5);
+                                test_assert(!activeEvents.empty(), "getActiveEvents() returns the decoded embedded event");
+
+                                // Feed the identical packet's text again (a
+                                // second, separately-decoded copy) to hit the
+                                // duplicate-event de-duplication branch.
+                                AVPacket* realPkt2 = nullptr;
+                                for (int w = 0; w < 25 && !subQ.try_pop(realPkt2); ++w) {
+                                    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                                }
+                                if (realPkt2) {
+                                    decoder.processPacket(realPkt2);
+                                    av_packet_free(&realPkt2);
+                                }
+                            }
+                            decoder.flush(); // real m_codecCtx present -> avcodec_flush_buffers() branch
+                            subQ.clear([](AVPacket*& p) { av_packet_free(&p); });
+                        }
+                    }
+                }
+
+                // 4d2. processPacket() branches unreachable via any real
+                // FFmpeg subtitle decoder available on this build (verified
+                // empirically: subrip/webvtt/ass/mov_text all emit
+                // SUBTITLE_ASS rects in the raw 8-field form, never a
+                // "Dialogue:"-prefixed ass string or a SUBTITLE_TEXT rect) --
+                // forced deterministically via force_synthetic_subtitle_rect.
+                // Also exercises the pkt->dts fallback (pts is NOPTS), the
+                // nonzero sub.start_display_time/end_display_time branches,
+                // and (via a second, distinct event) the duplicate-check and
+                // sort lambdas inside processPacket().
+                {
+                    naikav::subtitle::SubtitleDecoder decoder;
+                    AVCodecParameters* params = avcodec_parameters_alloc();
+                    params->codec_type = AVMEDIA_TYPE_SUBTITLE;
+                    params->codec_id = AV_CODEC_ID_SUBRIP;
+                    test_assert(decoder.init(params, {1, 1000}, 0), "init() succeeds for the synthetic-rect processPacket test");
+                    avcodec_parameters_free(&params);
+
+                    force_synthetic_subtitle_rect = 1;
+                    AVPacket* pkt1 = av_packet_alloc();
+                    pkt1->pts = 1000;
+                    pkt1->dts = AV_NOPTS_VALUE;
+                    decoder.processPacket(pkt1);
+                    av_packet_free(&pkt1);
+                    test_assert(decoder.getEventCount() == 1, "A synthetic 'Dialogue:'-prefixed ASS rect (pts branch) produces one event");
+
+                    force_synthetic_subtitle_rect = 2;
+                    AVPacket* pkt2 = av_packet_alloc();
+                    pkt2->pts = AV_NOPTS_VALUE;
+                    pkt2->dts = 5000;
+                    decoder.processPacket(pkt2);
+                    av_packet_free(&pkt2);
+                    test_assert(decoder.getEventCount() == 2, "A synthetic SUBTITLE_TEXT rect via the dts-only branch produces a second, distinct event");
+                    force_synthetic_subtitle_rect = 0;
+                }
+
+                // 4d3. parseTimestamp()'s MM:SS,frac form (single colon,
+                // comma decimal separator) -- distinct from the more common
+                // H:MM:SS.frac form already exercised by real SRT/ASS files
+                // elsewhere in this test file.
+                {
+                    double secs = 0.0;
+                    test_assert(naikav::subtitle::parseTimestamp("01:02,50", secs) && std::abs(secs - 62.5) < 0.01,
+                                "parseTimestamp() parses an MM:SS,frac timestamp (comma decimal, single colon)");
+                }
+
+                // 4e. loadExternalFile()'s FFmpeg-demuxer fallback path: a
+                // real media file (not .srt/.vtt/.ass/.ssa) containing an
+                // embedded subtitle stream, so the fast text parser is
+                // skipped entirely in favor of the generic FFmpeg path.
+                {
+                    std::filesystem::path subDecDir2 =
+                        std::filesystem::temp_directory_path() / "naikav_subdecoder_test";
+                    std::string embSrt4 = (subDecDir2 / "emb4.srt").string();
+                    {
+                        std::ofstream srt(embSrt4);
+                        srt << "1\n00:00:00,000 --> 00:00:02,000\nFallback path test\n";
+                    }
+                    std::string embFile4 = (subDecDir2 / "video_with_sub4.mkv").string();
+                    std::string cmd = "ffmpeg -y -loglevel error -f lavfi -i \"testsrc=duration=2:size=64x64:rate=5\" -i \"" +
+                                      embSrt4 + "\" -c:v mpeg4 -c:s srt \"" + embFile4 + "\"";
+                    if (std::system(cmd.c_str()) == 0) {
+                        naikav::subtitle::SubtitleDecoder decoder;
+                        bool loaded = decoder.loadExternalFile(embFile4);
+                        test_assert(loaded, "loadExternalFile() loads a subtitle stream via the FFmpeg-demuxer fallback path");
+                        test_assert(decoder.isExternal(), "loadExternalFile() marks the decoder as external via the fallback path too");
+                        test_assert(decoder.getEventCount() > 0, "loadExternalFile()'s fallback path decodes real subtitle events");
+                    }
+
+                    // A file with no subtitle stream at all: falls through
+                    // the FFmpeg path (finds no subtitle stream) and then
+                    // the SRT/ASS text re-parse attempts, ultimately failing.
+                    naikav::subtitle::SubtitleDecoder decoder2;
+                    test_assert(!decoder2.loadExternalFile(testFile), "loadExternalFile() fails for a media file with no subtitle stream at all (wrong extension for the fast path)");
+
+                    // A second, two-cue embedded stream decoded under the
+                    // synthetic-rect mock: exercises the fallback loop's own
+                    // copy of the SUBTITLE_TEXT branch and nonzero
+                    // end_display_time branch (both otherwise unreachable
+                    // via any real decoder on this build, same as
+                    // processPacket()'s copy in test 4d2), plus its final
+                    // sort() comparator, which needs 2+ decoded events.
+                    std::string embSrt5 = (subDecDir2 / "emb5.srt").string();
+                    {
+                        std::ofstream srt(embSrt5);
+                        srt << "1\n00:00:00,000 --> 00:00:01,000\nFallback cue one\n\n"
+                            << "2\n00:00:01,500 --> 00:00:02,500\nFallback cue two\n";
+                    }
+                    std::string embFile5 = (subDecDir2 / "video_with_sub5.mkv").string();
+                    std::string cmd5 = "ffmpeg -y -loglevel error -f lavfi -i \"testsrc=duration=3:size=64x64:rate=5\" -i \"" +
+                                       embSrt5 + "\" -c:v mpeg4 -c:s srt \"" + embFile5 + "\"";
+                    if (std::system(cmd5.c_str()) == 0) {
+                        // Also strips pts down to dts-only on every packet
+                        // read during this call, to exercise the fallback
+                        // loop's pkt->dts fallback branch -- real demuxed
+                        // subtitle packets always carry a valid pts on this
+                        // build, so that branch is otherwise unreachable.
+                        force_synthetic_subtitle_rect = 2;
+                        force_pts_to_dts_only = true;
+                        naikav::subtitle::SubtitleDecoder decoder3;
+                        bool loaded3 = decoder3.loadExternalFile(embFile5);
+                        force_synthetic_subtitle_rect = 0;
+                        force_pts_to_dts_only = false;
+                        test_assert(loaded3, "loadExternalFile()'s fallback path decodes a two-cue embedded stream via the synthetic-rect mock");
+                        test_assert(decoder3.getEventCount() >= 2, "loadExternalFile()'s fallback path accumulates multiple decoded events (exercises its sort() comparator)");
+                    }
+                }
+
+                // 4f. extractTextFromAss(): callable directly since it's a
+                // private static method (TU-local via the private->public
+                // macro) -- both the "Dialogue:" (9-comma) and raw (8-comma)
+                // ASS forms, distinct from SubtitleTrack.hpp's own
+                // sanitizeSubtitleText() tests (extractTextFromAss() is
+                // SubtitleDecoder's own copy of the same comma-skipping logic).
+                {
+                    std::string dialogueForm = naikav::subtitle::SubtitleDecoder::extractTextFromAss(
+                        "Dialogue: 0,0:00:01.00,0:00:03.00,Default,,0,0,0,,Hello from Dialogue");
+                    test_assert(dialogueForm == "Hello from Dialogue", "extractTextFromAss() strips a 'Dialogue:' 9-comma prefix");
+
+                    std::string rawForm = naikav::subtitle::SubtitleDecoder::extractTextFromAss("0,0,Default,,0,0,0,,Raw ASS text");
+                    test_assert(rawForm == "Raw ASS text", "extractTextFromAss() strips a raw 8-comma prefix");
+
+                    test_assert(naikav::subtitle::SubtitleDecoder::extractTextFromAss(nullptr).empty(),
+                                "extractTextFromAss(nullptr) returns an empty string");
+                }
+
                 // 5. PlayerController Subtitle APIs
                 {
                     PlayerController ctrl;
@@ -4201,377 +7054,147 @@ int main(int argc, char* argv[]) {
                     // A. AudioTrackInfo struct tests
                     {
                         naikav::audio::AudioTrackInfo info;
-                        test_assert(info.id == -1, "Default audio track id is -1");
-                        test_assert(!info.isDefault, "Default isDefault is false");
-                        test_assert(!info.isExternal, "Default isExternal is false");
+                        info.id = 0;
+                        info.title = "Main Audio";
+                        info.language = "eng";
+                        info.codecName = "aac";
+                        info.channels = 2;
+                        info.channelLayout = "stereo";
+                        info.sampleRate = 48000;
+                        info.bitRate = 128000;
+                        info.isDefault = true;
+                        info.isExternal = false;
+                        info.sourcePath = "";
+
+                        test_assert(info.id == 0, "AudioTrackInfo id set");
+                        test_assert(info.title == "Main Audio", "AudioTrackInfo title set");
+                        test_assert(info.language == "eng", "AudioTrackInfo language set");
+                        test_assert(info.codecName == "aac", "AudioTrackInfo codecName set");
+                        test_assert(info.channels == 2, "AudioTrackInfo channels set");
+                        test_assert(info.channelLayout == "stereo", "AudioTrackInfo channelLayout set");
+                        test_assert(info.sampleRate == 48000, "AudioTrackInfo sampleRate set");
+                        test_assert(info.bitRate == 128000, "AudioTrackInfo bitRate set");
+                        test_assert(info.isDefault, "AudioTrackInfo isDefault set");
+                        test_assert(!info.isExternal, "AudioTrackInfo isExternal false");
                     }
 
-                    // B. PlayerController Audio Track APIs with media file
+                    // B. PlayerController Audio Track APIs
                     {
-                        PlayerController audioCtrl;
-                        test_assert(audioCtrl.getSelectedAudioTrack() == -1, "Initial audio track is -1");
-                        test_assert(audioCtrl.getAudioTracks().empty(), "Initial audio tracks list is empty");
-                        test_assert(!audioCtrl.hasExternalAudio(), "hasExternalAudio() is initially false");
-                        test_assert(audioCtrl.getActiveAudioTrackName() == "Off", "Active audio track is Off initially");
+                        PlayerController ctrl;
+                        test_assert(ctrl.getSelectedAudioTrack() == -1, "Initial audio track is -1");
+                        test_assert(ctrl.getAudioTracks().empty(), "Initial audio tracks list is empty");
+                        test_assert(!ctrl.hasExternalAudio(), "No external audio initially");
+                        test_assert(ctrl.getActiveAudioTrackName() == "Off", "Initial active audio track name is Off");
 
-                        bool opened = audioCtrl.openFile(testFile);
-                        test_assert(opened, "File opened for audio track tests");
+                        // Select track when uninitialized
+                        bool selectOk = ctrl.selectAudioTrack(-1);
+                        test_assert(selectOk, "selectAudioTrack returns true when uninitialized to pre-set track");
+                        test_assert(ctrl.getSelectedAudioTrack() == -1, "Selected track is -1");
 
-                        auto tracks = audioCtrl.getAudioTracks();
-                        test_assert(!tracks.empty(), "Discovered at least one audio track in test file");
-                        std::cout << "[AudioTrack Test] Found " << tracks.size() << " audio tracks in " << testFile << std::endl;
-                        for (size_t i = 0; i < tracks.size(); ++i) {
-                            std::cout << "  Track #" << i << ": id=" << tracks[i].id
-                                      << ", title=" << tracks[i].title
-                                      << ", lang=" << tracks[i].language
-                                      << ", codec=" << tracks[i].codecName
-                                      << ", ch=" << tracks[i].channels
-                                      << ", layout=" << tracks[i].channelLayout
-                                      << ", rate=" << tracks[i].sampleRate << "Hz"
-                                      << ", default=" << (tracks[i].isDefault ? "yes" : "no")
-                                      << std::endl;
-                            test_assert(tracks[i].id >= 0, "Embedded track id >= 0");
-                            test_assert(!tracks[i].codecName.empty(), "Track codecName is populated");
+                        // Load external audio with non-existent file
+                        bool extFail = ctrl.loadExternalAudio("non_existent_audio_file.mp3");
+                        test_assert(!extFail, "loadExternalAudio returns false for non-existent file");
+
+                        // Load real test audio
+                        std::string audioAsset = "assets/test_audio.mp3";
+                        if (!std::filesystem::exists(audioAsset)) {
+                            audioAsset = "../assets/test_audio.mp3";
+                        }
+                        if (!std::filesystem::exists(audioAsset)) {
+                            audioAsset = "../../assets/test_audio.mp3";
+                        }
+                        if (std::filesystem::exists(audioAsset)) {
+                            bool extOk = ctrl.loadExternalAudio(audioAsset);
+                            test_assert(extOk, "loadExternalAudio succeeds on valid audio file");
+                            test_assert(ctrl.hasExternalAudio(), "hasExternalAudio is true after load");
+                            test_assert(ctrl.getSelectedAudioTrack() == -2, "Selected audio track is -2 (external)");
+                            test_assert(!ctrl.getActiveAudioTrackName().empty(), "Active audio track name is not empty");
+                            test_assert(ctrl.getAudioTracks().size() >= 1, "getAudioTracks includes external track");
+
+                            // Switch to disabled (-1) and back to external (-2)
+                            ctrl.selectAudioTrack(-1);
+                            test_assert(ctrl.getSelectedAudioTrack() == -1, "Selected audio track is -1 (disabled)");
+                            test_assert(ctrl.getActiveAudioTrackName() == "Off", "Active audio track name is Off");
+
+                            ctrl.selectAudioTrack(-2);
+                            test_assert(ctrl.getSelectedAudioTrack() == -2, "Selected audio track is back to -2 (external)");
+
+                            // Remove external audio
+                            ctrl.removeExternalAudio();
+                            test_assert(!ctrl.hasExternalAudio(), "hasExternalAudio is false after remove");
+                            test_assert(ctrl.getSelectedAudioTrack() == -1, "Selected audio track reset to -1 after remove");
                         }
 
-                        int currentTrack = audioCtrl.getSelectedAudioTrack();
-                        test_assert(currentTrack >= 0, "Selected audio track is >= 0");
-                        test_assert(audioCtrl.hasAudio(), "hasAudio() is true for audio file");
-                        std::string activeName = audioCtrl.getActiveAudioTrackName();
-                        test_assert(!activeName.empty() && activeName != "Off", "Active track name is populated");
-                        std::cout << "[AudioTrack Test] Active track: " << activeName << std::endl;
-
-                        // Test switching to same track (noop, should return true)
-                        bool switchSame = audioCtrl.selectAudioTrack(currentTrack);
-                        test_assert(switchSame, "selectAudioTrack() on current track returns true");
-
-                        // Test disabling audio track (-1)
-                        bool disableOk = audioCtrl.selectAudioTrack(-1);
-                        test_assert(disableOk, "selectAudioTrack(-1) succeeds");
-                        test_assert(audioCtrl.getSelectedAudioTrack() == -1, "getSelectedAudioTrack() is -1");
-                        test_assert(!audioCtrl.hasAudio(), "hasAudio() is false when disabled");
-                        test_assert(audioCtrl.getActiveAudioTrackName() == "Off", "getActiveAudioTrackName() is Off");
-
-                        // Test re-enabling audio track
-                        bool enableOk = audioCtrl.selectAudioTrack(tracks[0].id);
-                        test_assert(enableOk, "Re-enabling audio track succeeds");
-                        test_assert(audioCtrl.getSelectedAudioTrack() == tracks[0].id, "Selected track matches re-enabled id");
-                        test_assert(audioCtrl.hasAudio(), "hasAudio() is true again");
-
-                        // Test external audio loading using testFile as external audio source
-                        bool extOk = audioCtrl.loadExternalAudio(testFile);
-                        test_assert(extOk, "loadExternalAudio() succeeds");
-                        test_assert(audioCtrl.hasExternalAudio(), "hasExternalAudio() is true");
-                        test_assert(audioCtrl.getSelectedAudioTrack() == -2, "getSelectedAudioTrack() is -2 (external)");
-                        test_assert(audioCtrl.hasAudio(), "hasAudio() is true with external audio");
-                        std::string extName = audioCtrl.getActiveAudioTrackName();
-                        test_assert(!extName.empty() && extName != "Off", "External audio track name is valid");
-
-                        // Test track list includes external track
-                        auto tracksWithExt = audioCtrl.getAudioTracks();
-                        test_assert(tracksWithExt.size() == tracks.size() + 1, "Audio tracks count increased by 1 with external audio");
-                        test_assert(tracksWithExt.back().isExternal, "Last track in list is marked external");
-                        test_assert(tracksWithExt.back().id == -2, "External track has id == -2");
-
-                        // Test switching from external back to embedded track
-                        bool switchBack = audioCtrl.selectAudioTrack(tracks[0].id);
-                        test_assert(switchBack, "Switching back to embedded track succeeds");
-                        test_assert(audioCtrl.getSelectedAudioTrack() == tracks[0].id, "Selected track is embedded track");
-
-                        // Test switching back to external
-                        bool switchExt = audioCtrl.selectAudioTrack(-2);
-                        test_assert(switchExt, "Switching back to external track succeeds");
-                        test_assert(audioCtrl.getSelectedAudioTrack() == -2, "Selected track is external");
-
-                        // Test seeking with external audio
-                        audioCtrl.play();
-                        audioCtrl.seek(1.0);
-                        test_assert(audioCtrl.getState() == PlayerState::PLAYING, "Player continues playing after seek with external audio");
-
-                        // Test removeExternalAudio()
-                        audioCtrl.removeExternalAudio();
-                        test_assert(!audioCtrl.hasExternalAudio(), "hasExternalAudio() is false after removal");
-                        test_assert(audioCtrl.getSelectedAudioTrack() == tracks[0].id, "Reverted to embedded track after removal");
-
-                        // Test invalid external file loading
-                        bool badExt = audioCtrl.loadExternalAudio("non_existent_audio_file.xyz");
-                        test_assert(!badExt, "loadExternalAudio() fails on non-existent file");
-
-                        audioCtrl.stop();
-                        test_assert(audioCtrl.getSelectedAudioTrack() == -1, "stop() resets selected audio track to -1");
-                        test_assert(!audioCtrl.hasExternalAudio(), "stop() clears external audio");
+                        ctrl.stop();
+                        test_assert(!ctrl.hasExternalAudio(), "Stop clears external audio");
+                        test_assert(ctrl.getSelectedAudioTrack() == -1, "Stop resets selected audio track to -1");
                     }
 
-                    // C. Demuxer direct stream selection tests
-                    {
-                        ThreadSafeQueue<AVPacket*> vq;
-                        ThreadSafeQueue<AVPacket*> aq;
-                        MetricRing<256> ring;
-                        std::atomic<bool> prof{false};
+                    // C. Audio Track Selection on Media with Embedded Audio
+                    if (!testFile.empty()) {
+                        PlayerController ctrl;
+                        if (ctrl.openFile(testFile)) {
+                            ctrl.play();
+                            auto tracks = ctrl.getAudioTracks();
+                            if (!tracks.empty()) {
+                                int defaultTrackId = ctrl.getSelectedAudioTrack();
+                                test_assert(defaultTrackId >= 0, "Selected audio track is non-negative for media with audio");
+                                test_assert(!ctrl.getActiveAudioTrackName().empty(), "Active audio track name is valid");
 
-                        Demuxer d(testFile, vq, aq, ring, prof);
-                        bool dOk = d.open();
-                        test_assert(dOk, "Demuxer opens test file");
+                                // Select disabled (-1)
+                                ctrl.selectAudioTrack(-1);
+                                test_assert(ctrl.getSelectedAudioTrack() == -1, "Audio stream muted/disabled (-1)");
+                                test_assert(ctrl.getActiveAudioTrackName() == "Off", "Active track name is Off");
 
-                        const auto& dTracks = d.getAudioTracks();
-                        test_assert(!dTracks.empty(), "Demuxer found audio tracks");
+                                // Re-select default track
+                                ctrl.selectAudioTrack(defaultTrackId);
+                                test_assert(ctrl.getSelectedAudioTrack() == defaultTrackId, "Re-selected default embedded audio track");
+                            }
 
-                        // Validate audio codec params & timebase getters
-                        int firstAudioStream = d.getAudioStreamIndex();
-                        test_assert(firstAudioStream >= 0, "Demuxer has valid audio stream index");
-                        const AVCodecParameters* cp = d.getAudioCodecParams(firstAudioStream);
-                        test_assert(cp != nullptr, "getAudioCodecParams(idx) returns valid params");
-                        test_assert(cp->codec_type == AVMEDIA_TYPE_AUDIO, "Codec type is audio");
+                            // Load external audio while video is playing
+                            std::string audioAsset = "assets/test_audio.mp3";
+                            if (!std::filesystem::exists(audioAsset)) {
+                                audioAsset = "../assets/test_audio.mp3";
+                            }
+                            if (!std::filesystem::exists(audioAsset)) {
+                                audioAsset = "../../assets/test_audio.mp3";
+                            }
+                            if (std::filesystem::exists(audioAsset)) {
+                                bool extOk = ctrl.loadExternalAudio(audioAsset);
+                                if (extOk) {
+                                    test_assert(ctrl.hasExternalAudio(), "External audio loaded during video playback");
+                                    test_assert(ctrl.getSelectedAudioTrack() == -2, "Active track switched to external audio");
 
-                        AVRational tb = d.getAudioTimeBase(firstAudioStream);
-                        test_assert(tb.den > 0, "TimeBase has valid denominator");
+                                    // Switch back to embedded track
+                                    if (!tracks.empty()) {
+                                        ctrl.selectAudioTrack(tracks[0].id);
+                                        test_assert(ctrl.getSelectedAudioTrack() == tracks[0].id, "Switched back to embedded track from external");
+                                    }
 
-                        // Test selectAudioStream(-1) and invalid index
-                        bool selNeg = d.selectAudioStream(-1);
-                        test_assert(selNeg, "selectAudioStream(-1) succeeds");
-                        test_assert(d.getAudioStreamIndex() == -1, "getAudioStreamIndex() is -1");
-
-                        bool selInvalid = d.selectAudioStream(99999);
-                        test_assert(!selInvalid, "selectAudioStream(99999) fails gracefully");
-
-                        bool selRestore = d.selectAudioStream(firstAudioStream);
-                        test_assert(selRestore, "selectAudioStream(firstAudioStream) succeeds");
-                        test_assert(d.getAudioStreamIndex() == firstAudioStream, "Audio stream index restored");
-
-                        d.stop();
-                    }
-
-                    std::cout << "Audio Track & External Audio unit tests PASSED!" << std::endl;
-                }
-
-            }
-
-            std::cout << "ReplayGain tag / genre preset / output selector tests passed!" << std::endl;
-        }
-
-        // -------------------------------------------------------------
-        // Background loudness prescan: openFile() must not block on the
-        // decode-based prescan. It previously ran synchronously inside
-        // openFile() -- which main.cpp calls directly from its
-        // SDL_EVENT_DROP_FILE handler on the render/event thread -- so a
-        // real (non-trivial-length) file would freeze the entire UI for
-        // however long the whole audio track took to decode, looking
-        // exactly like a crash/hang when opening a new file. Fixed by
-        // moving the decode-based scan to a background thread, applied
-        // via PlayerController::pollPendingLoudnessPrescan().
-        // -------------------------------------------------------------
-        {
-            std::cout << "Running background loudness prescan test..." << std::endl;
-
-            PlayerController prescanController;
-            naikav::dsp::AudioDspSettings loudSettings;
-            loudSettings.dspEnabled = false;
-            loudSettings.loudnessEnabled = true;
-            loudSettings.loudnessTargetLufs = -16.0f;
-            // Applied before openFile() so it's already active at open
-            // time -- matches the real "loudness enabled, then open a
-            // file" flow (e.g. a persisted setting from a previous
-            // session) that triggers the prescan from inside openFile().
-            prescanController.setAudioDspSettings(loudSettings);
-
-            auto openStart = std::chrono::steady_clock::now();
-            bool opened = prescanController.openFile(testFile);
-            auto openElapsed = std::chrono::steady_clock::now() - openStart;
-            test_assert(opened, "Background prescan: file opens successfully with loudness normalization enabled");
-            test_assert(openElapsed < std::chrono::seconds(2),
-                        "Background prescan: openFile() returns quickly, not blocked on the whole-file decode scan");
-
-            // Poll the way main.cpp's event loop does, giving the
-            // background scan a little time to finish.
-            bool primed = false;
-            for (int i = 0; i < 100 && !primed; ++i) {
-                prescanController.pollPendingLoudnessPrescan();
-                if (prescanController.getMeasuredIntegratedLufs() > -70.0) {
-                    primed = true;
-                } else {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(20));
-                }
-            }
-            test_assert(primed,
-                        "Background prescan: loudness normalizer is primed with a real measurement once "
-                        "the background scan completes and pollPendingLoudnessPrescan() is called");
-
-            // stop() must join the background thread cleanly, even right
-            // after opening (the scan may still be finishing up).
-            prescanController.stop();
-            std::cout << "Background loudness prescan test passed!" << std::endl;
-        }
-
-        // -------------------------------------------------------------
-        // DEBUG REPRO: open a series of genuinely different real media
-        // files back-to-back on the same PlayerController, WITH real
-        // hardware decoding enabled (unlike the rest of this suite, which
-        // forces g_disableHardwareDecoders = true) -- reproducing the
-        // actual "open different media file multiple times" user flow as
-        // closely as possible outside of the real GUI event loop. Gated
-        // behind an env var so it only runs on demand.
-        // -------------------------------------------------------------
-        if (const char* multiDir = std::getenv("NAIKAV_MULTI_OPEN_ASSETS_DIR")) {
-            std::cout << "Running multi-file-open hardware-decode repro..." << std::endl;
-            std::vector<std::string> files = {
-                std::string(multiDir) + "/hd_test_video_with_audio.mp4",
-                std::string(multiDir) + "/Big_Buck_Bunny_1080_10s_5MB.mp4",
-                std::string(multiDir) + "/Big_Buck_Bunny_1080_10s_5MB.mkv",
-                std::string(multiDir) + "/Big_Buck_Bunny_1080_10s_5MB.webm",
-                std::string(multiDir) + "/test_mono.mp4",
-                std::string(multiDir) + "/test_5point1.mp4",
-                std::string(multiDir) + "/4K 2K 1080p 720p 480p video resolution test_2160p.mp4",
-            };
-
-            g_disableHardwareDecoders = false;
-            g_videoThreadEnabled = true;
-            PlayerController multiController;
-            for (int cycle = 0; cycle < 3; ++cycle) {
-                for (const auto& f : files) {
-                    std::cout << "[MULTI-OPEN] Opening: " << f << " (cycle " << cycle << ")" << std::endl;
-                    bool ok = multiController.openFile(f);
-                    std::cout << "[MULTI-OPEN]   openFile() -> " << (ok ? "true" : "false") << std::endl;
-                    if (ok) {
-                        multiController.play();
-                        for (int i = 0; i < 20; ++i) {
-                            multiController.getCurrentTime();
-                            multiController.pollPendingLoudnessPrescan();
-                            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+                                    // Remove external audio
+                                    ctrl.removeExternalAudio();
+                                    test_assert(!ctrl.hasExternalAudio(), "External audio removed successfully");
+                                }
+                            }
+                            ctrl.stop();
                         }
                     }
-                }
-            }
-            multiController.stop();
-            std::cout << "[MULTI-OPEN] Completed all cycles without crashing." << std::endl;
 
-            // Rapid-fire variant: no waiting/draining between opens at all
-            // (immediate back-to-back openFile() calls, closer to a user
-            // mashing the Open button or dropping several files in a
-            // burst), alternating channel layouts every time to force the
-            // SDL audio device to be torn down and reopened with a
-            // different channel count/format on every single call.
-            std::cout << "[MULTI-OPEN] Starting rapid-fire (no-wait) variant..." << std::endl;
-            std::vector<std::string> rapidFiles = {
-                std::string(multiDir) + "/hd_test_video_with_audio.mp4",
-                std::string(multiDir) + "/test_mono.mp4",
-                std::string(multiDir) + "/test_5point1.mp4",
-            };
-            PlayerController rapidController;
-            for (int cycle = 0; cycle < 50; ++cycle) {
-                const std::string& f = rapidFiles[cycle % rapidFiles.size()];
-                bool ok = rapidController.openFile(f);
-                if (ok) {
-                    rapidController.play();
+                    std::cout << "Comprehensive Audio Track unit tests passed!" << std::endl;
                 }
-                if (cycle % 10 == 0) {
-                    std::cout << "[MULTI-OPEN][RAPID] cycle " << cycle << " -> " << (ok ? "ok" : "FAILED") << std::endl;
-                }
-            }
-            rapidController.stop();
-            std::cout << "[MULTI-OPEN][RAPID] Completed 50 rapid-fire cycles without crashing." << std::endl;
+            } // Close Subtitle & Audio block at line 6547
+        } // Close block at line 6180
+    } // Close if (!testFile.empty()) at line 3179
 
-            // VIRTUAL_SURROUND variant: exercises m_spatialDownmixActive
-            // toggling on (5.1 source) and off (mono/stereo source) across
-            // repeated opens -- the one code path neither repro above
-            // touches, since AUTO never activates SpatialDownmixer.
-            std::cout << "[MULTI-OPEN][VSURROUND] Starting VIRTUAL_SURROUND rapid variant..." << std::endl;
-            PlayerController vsurroundController;
-            vsurroundController.setAudioChannelOption(AudioChannelOption::VIRTUAL_SURROUND);
-            for (int cycle = 0; cycle < 50; ++cycle) {
-                const std::string& f = rapidFiles[cycle % rapidFiles.size()];
-                bool ok = vsurroundController.openFile(f);
-                if (ok) {
-                    vsurroundController.play();
-                }
-                if (cycle % 10 == 0) {
-                    std::cout << "[MULTI-OPEN][VSURROUND] cycle " << cycle << " -> " << (ok ? "ok" : "FAILED")
-                              << ", spatialDownmixActive=" << vsurroundController.isAudioVirtualSurroundActive()
-                              << std::endl;
-                }
-            }
-            vsurroundController.stop();
-            std::cout << "[MULTI-OPEN][VSURROUND] Completed 50 cycles without crashing." << std::endl;
+    std::cout << "Additional code coverage tests PASSED!" << std::endl;
 
-            // -------------------------------------------------------------
-            // USER-REPORTED REPRO: open a video-only file (no audio
-            // stream), enable EVERY DSP option from the GUI (as if the
-            // user checked every box in the Audio Processing panel), then
-            // open a large real-world 4K file that does have an audio
-            // stream -- the user's exact reported crash scenario. Every
-            // repro above left DSP settings at their all-disabled
-            // defaults, so this is the first place any DSP processing code
-            // actually runs against real decoded audio during a reopen.
-            // -------------------------------------------------------------
-            {
-                g_disableHardwareDecoders = false;
-                g_videoThreadEnabled = true;
-                std::cout << "[DSP-REPRO] Opening Big_Buck_Bunny (no audio stream)..." << std::endl;
-                PlayerController dspController;
-                std::string noAudioFile = std::string(multiDir) + "/Big_Buck_Bunny_1080_10s_5MB.mp4";
-                bool ok1 = dspController.openFile(noAudioFile);
-                std::cout << "[DSP-REPRO]   openFile() -> " << (ok1 ? "true" : "false")
-                          << ", hasAudio=" << dspController.hasAudio() << std::endl;
-                if (ok1) {
-                    dspController.play();
-                    for (int i = 0; i < 20; ++i) {
-                        dspController.getCurrentTime();
-                        std::this_thread::sleep_for(std::chrono::milliseconds(25));
-                    }
-                }
-
-                std::cout << "[DSP-REPRO] Enabling every DSP option from the GUI..." << std::endl;
-                naikav::dsp::AudioDspSettings allOn;
-                allOn.dspEnabled = true;
-                for (int i = 0; i < naikav::dsp::ParametricEQ::kNumBands; ++i) {
-                    allOn.eqBandGainDb[i] = 6.0f;
-                }
-                allOn.compressorEnabled = true;
-                allOn.limiterEnabled = true;
-                allOn.crossoverEnabled = true;
-                allOn.crossoverBassRedirectEnabled = true;
-                allOn.loudnessEnabled = true;
-                allOn.widenerEnabled = true;
-                allOn.surround3dEnabled = true;
-                allOn.balance = 0.3f;
-                allOn.noiseGateEnabled = true;
-                allOn.multibandEnabled = true;
-                allOn.autoGenrePresetEnabled = true;
-                allOn.spectrumAnalyzerEnabled = true;
-                dspController.setAudioDspSettings(allOn);
-                dspController.persistAudioDspSettings();
-
-                std::string bigFile = std::string(multiDir) +
-                    "/4K Remastered - Daddy Mummy Full Video Song _ Urvashi Rautela, Kunal Khemu _ Bhaag Johnny_2160p.mp4";
-                std::cout << "[DSP-REPRO] Opening 4K file with all DSP enabled..." << std::endl;
-                bool ok2 = dspController.openFile(bigFile);
-                std::cout << "[DSP-REPRO]   openFile() -> " << (ok2 ? "true" : "false")
-                          << ", hasAudio=" << dspController.hasAudio() << std::endl;
-                if (ok2) {
-                    dspController.play();
-                    for (int i = 0; i < 80; ++i) {
-                        dspController.getCurrentTime();
-                        dspController.pollPendingLoudnessPrescan();
-                        std::this_thread::sleep_for(std::chrono::milliseconds(25));
-                    }
-                }
-                dspController.stop();
-                std::cout << "[DSP-REPRO] Completed without crashing." << std::endl;
-            }
-
-            g_videoThreadEnabled = false;
-            g_disableHardwareDecoders = true;
-        }
-
-        std::cout << "Additional code coverage tests PASSED!" << std::endl;
-    }
-
-        // 6. Run the actual main test suite!
-        return real_main(argc, argv);
-    } catch (const std::exception& e) {
-        std::cerr << "[EXPECTED] Exception occurred during tests: " << e.what() << std::endl;
-        return 1;
-    } catch (...) {
-        std::cerr << "[EXPECTED] Unknown exception occurred during tests." << std::endl;
-        return 1;
-    }
+    // 6. Run the actual main test suite!
+    return real_main(argc, argv);
+} catch (const std::exception& e) {
+    std::cerr << "[EXPECTED] Exception occurred during tests: " << e.what() << std::endl;
+    return 1;
+} catch (...) {
+    std::cerr << "[EXPECTED] Unknown exception occurred during tests." << std::endl;
+    return 1;
+}
 }

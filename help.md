@@ -250,11 +250,30 @@ the same output already goes to the terminal.
 
 ## 4. UI Controls & Shortcuts
 
-The user interface uses Dear ImGui with frosted translucency overlay.
+The user interface uses Dear ImGui with frosted translucency overlay, high-DPI font rendering, and animated on-screen Toast notifications.
 
-### Media Selection
-- **Drag-and-Drop**: Drag a single video or audio file onto the application window to open and play it immediately, replacing whatever playlist was loaded. Dropping *more than one* file at once appends them all to the playlist instead and plays the first — see [Playlist](#playlist) below.
-- **Native File Dialog**: Click "Open Media File" or the folder icon in the controls dock to launch the platform-native file selector (automatically pauses background playback during file selection).
+### Media Selection & Batch Drag-and-Drop
+- **Single File Drag-and-Drop**: Drag a single video or audio file onto the application window to open and play it immediately, replacing whatever playlist was previously active.
+- **Batch Multi-File Drag-and-Drop**: Dropping *more than one* file onto the window collects and appends all dropped media files into the playlist in a batch, starting playback from the first newly added item.
+- **Native File Dialog**: Click "Open Media File" or the folder icon in the controls dock to launch the platform-native file selector (automatically pauses background playback during file browsing).
+
+### Fullscreen Mode, Mouse Gestures & Cursor Auto-Hide
+- **Fullscreen Mode**: Toggle borderless fullscreen using `F11` or `Alt+Enter`.
+- **Canvas Double-Click**: Double-clicking anywhere on the video canvas toggles fullscreen mode instantly.
+- **Cursor & Controls Auto-Hide**: During active video playback, the mouse cursor and the ImGui controls dock automatically fade out after **2.5 seconds** of mouse/keyboard inactivity. Moving the mouse, scrolling, clicking, or pressing any key immediately restores visibility.
+- **Exit Fullscreen / Application**: Pressing `Escape` exits fullscreen mode if active; if already in windowed mode, it cleanly exits the application.
+
+### Volume & Audio Mute Controls
+- **Dock Volume Slider**: Interactive volume slider with smooth linear software attenuation and instantaneous memcpy/memset bypasses for 0% and 100% states.
+- **Volume Hotkeys**: Press `Up Arrow` to increase volume by +5%, and `Down Arrow` to decrease volume by -5%.
+- **Mouse Wheel Adjustment**: Scrolling the mouse wheel over the video canvas adjusts volume up or down in 5% increments.
+- **Mute / Unmute**: Click the speaker icon button in the controls dock or press `M` to toggle audio mute on/off with on-screen Toast feedback.
+
+### Video Frame Screenshot Export (PNG)
+- **Hotkey `S`**: Capture the current video frame as a lossless full-resolution PNG image.
+- **Output Directory**: Saved directly to the `screenshots/` directory relative to the executable/working directory.
+- **Filename Formatting**: Automatically formatted as `NaikAVPlayer_<basename>_<YYYYMMDD_HHMMSS>_<time>.png` (e.g. `NaikAVPlayer_sample_20260820_212500_01m23s.png`).
+- **Toast Notifications**: Surfaces an on-screen toast displaying the saved filepath on success, or an error description if capture fails.
 
 ### Audio Track Selection & External Audio
 - **Controls Dock Audio Button (`[Audio]`)**: Click the headphone icon button in the controls dock bar to open the audio tracks popup menu.
@@ -265,7 +284,17 @@ The user interface uses Dear ImGui with frosted translucency overlay.
   - **Disable Audio (Mute Stream)**: Turns off audio decoding and routes silent frames.
 - **Hotkey `B`**: Press `B` to cycle sequentially through available audio streams (Off -> Embedded -> External -> Off) with on-screen Toast feedback.
 
-### Playback Speed Control
+### Subtitle Selection, External Files & Timing Delay
+- **Controls Dock Subtitle Button (`[CC]`)**: Click the closed-caption icon button to open the subtitle track selection popup menu:
+  - Select `Off`, embedded container subtitle streams (SRT, ASS/SSA, WebVTT, MOV Text), or external subtitle files.
+  - **Load External Subtitle File**: Native file picker to load standalone subtitle files (`.srt`, `.vtt`, `.ass`, `.ssa`, `.sub`).
+  - **Automatic Sidecar Detection**: External subtitle files adjacent to the media file with matching names are automatically detected and loaded on open.
+  - **Delay Offset Adjustment**: Fine-tune subtitle sync in 50ms steps (`-50ms` / `+50ms` / `Reset`).
+- **Hotkey `V`**: Cycle through available subtitle tracks (Off -> Embedded -> External -> Off).
+- **Hotkeys `G` / `H`**: Decrease or increase subtitle presentation timing delay by 50ms (-0.05s / +0.05s) with on-screen Toast notification.
+- **High-Contrast Backdrop**: Subtitles are rendered against a dark rounded translucent background box (`rgba(5, 5, 8, 0.78)`) with high-contrast white text for crisp readability across both bright and dark scenes.
+
+### Playback Speed Control (0.25x – 2.0x)
 - **Controls Dock Speed Button (`[Speed]`)**: Click the dedicated Speedometer icon button next to Resolution in the dock bar to open the speed popup:
   - Continuous slider (`0.25x` to `2.0x`).
   - One-click preset buttons (`0.25x`, `0.5x`, `0.75x`, `1.0x (Normal)`, `1.25x`, `1.5x`, `1.75x`, `2.0x`) with active checkmarks.
@@ -277,17 +306,31 @@ The user interface uses Dear ImGui with frosted translucency overlay.
 - **Controls Dock Loop Button (`[Loop]`)**: Click the loop icon button in the transport group (`[<<] [Play/Pause] [Stop] [>>] [Loop]`) to toggle continuous playback. The button lights up with a cyan accent glow when active.
 - **Hotkey `L`**: Press `L` to toggle continuous loop mode on/off with on-screen Toast feedback.
 
-### Playlist
+### Playlist Panel & Auto-Advance
 - **Controls Dock Playlist Button**: Click the list icon button next to Subtitles in the controls dock to open the Playlist panel.
   - **Add Files...**: Native multi-select file picker to append one or more media files.
   - **Add Folder...**: Native folder picker; appends every supported media file found directly in that folder (not subfolders), sorted alphabetically.
-  - **Reorder**: Drag any row to a new position in the list.
+  - **Reorder**: Drag any row to a new position in the list using ImGui drag-and-drop.
   - **Remove**: Click a row's `x` button, or select a row and press `Delete`.
   - **Double-click** a row to jump straight to playing it.
   - **Repeat mode**: `Off` / `All` / `One`, and a **Shuffle** toggle -- both apply once playback naturally reaches end-of-file, independently of the transport `[Loop]` button (which always just repeats the current file and takes priority over the playlist while it's on).
-- **Multi-File Drag-and-Drop**: Dropping more than one file onto the window adds them all to the playlist and starts playing the first one (dropping a single file behaves as before -- it just opens and plays, replacing the playlist with that one file).
 - **Hotkey `P`**: Press `P` to toggle the Playlist panel.
-- Playlist contents and repeat/shuffle state persist across restarts, the same way other player settings do.
+- **Persistence**: Playlist contents save as `playlist.m3u8` and settings (`playlist_current_index`, `playlist_repeat_mode`, `playlist_shuffle`) persist in `player_settings.txt`.
+
+### Real-Time Audio Visualizer (Modes & Palettes)
+- **Automatic Audio-Only Mode**: Activates when loading audio-only files (MP3, AAC, FLAC, OGG, WAV, etc.), excluding embedded album art from video pipelines.
+- **4 Visualizer Modes**:
+  1. **Neon Equalizer Bars (Default)**: 64 logarithmic frequency bands covering ~20 Hz to 20 kHz, smoothed with fast attack and exponential decay, gravity-falling peak cap indicators, floor reflections, and bass-reactive central ambient glow.
+  2. **Smooth Waveform**: Continuous oscillating audio oscilloscope ribbon with multi-layer glow and gradient fill.
+  3. **Radial Audio Disc**: 360-degree circular visualizer with rotating vinyl disc aesthetics, pulsating center bass ring, and radiating frequency spikes.
+  4. **Mirrored Stereo Spectrum**: Symmetrical top-and-bottom frequency equalizer bars meeting at a glowing horizon line.
+- **4 Color Palettes**: `Cyberpunk` (Cyan/Magenta), `Sunset Fire` (Amber/Hot Pink), `Mint Emerald` (Mint/Emerald), and `Electric Violet` (Aqua/Purple).
+
+### Diagnostics HUD & Telemetry Metrics
+- **Hotkey `D`** or CLI flag `--metrics`: Toggles real-time HUD displaying player states, playback clock drift, hardware/software decoder details, queue depths, frame pacing, and HDR/Colorimetry characteristics.
+
+### Audio Processing & DSP Panel
+- **Hotkey `A`** or Dock `[EQ]` Button: Toggles the dedicated Audio Processing overlay for parametric 5-band EQ, noise gate, compressors, limiter, crossover, EBU R128 loudness, 3D surround, stereo widener, balance, channel routing, and live FFT spectrum visualizer.
 
 ### Keyboard Shortcuts & Gestures
 
@@ -298,8 +341,8 @@ The user interface uses Dear ImGui with frosted translucency overlay.
 | **`Double-Click`** (on video) | Toggle Fullscreen Mode |
 | **`M`** | Toggle Audio Mute / Unmute |
 | **`Up Arrow`** / **`Down Arrow`** | Increase / Decrease Volume (±5%) |
-| **`Mouse Wheel`** (over video) | Adjust Volume Up / Down |
-| **`S`** | Capture Screenshot / Export Video Frame as PNG |
+| **`Mouse Wheel`** (over video) | Adjust Volume Up / Down (±5%) |
+| **`S`** | Capture Screenshot / Export Current Video Frame as PNG |
 | **`B`** | Cycle Audio Tracks (Off -> Embedded -> External -> Off) |
 | **`V`** | Cycle Subtitle Tracks (Off -> Embedded -> External -> Off) |
 | **`G`** / **`H`** | Adjust Subtitle Synchronization Delay (-50ms / +50ms) |
@@ -307,8 +350,9 @@ The user interface uses Dear ImGui with frosted translucency overlay.
 | **`[`** / **`]`** | Decrease / Increase playback speed by 0.25x (0.25x – 2.0x) |
 | **`Backspace`** | Reset playback speed to normal (1.0x) |
 | **`L`** | Toggle Continuous Loop Mode |
-| **`P`** | Toggle Playlist panel |
-| **`D`** | Toggle Diagnostics HUD overlay |
+| **`P`** | Toggle Playlist Panel |
+| **`Delete`** (in Playlist panel) | Remove selected item from playlist |
+| **`D`** | Toggle Diagnostics HUD overlay & Telemetry metrics |
 | **`A`** | Toggle Audio Processing panel (EQ, noise gate, compressor, multiband compressor, limiter, crossover, loudness, 3D surround, widener, balance, channel/device/format selection) |
 | **`Escape`** | Exit Fullscreen (if in fullscreen) or Exit application |
 
@@ -329,7 +373,7 @@ src/
 ├── playlist/  header-only queue/repeat/shuffle/M3U8 module (see Section 5f)
 ├── subtitle/  SubtitleDecoder.{hpp,cpp}, SubtitleTrack.hpp — decoding, parsing, sync, sanitization
 ├── ui/        PlayerUI.{hpp,cpp} — ImGui controls dock, diagnostics HUD, audio panel, subtitle overlay
-└── video/     VideoDecoder.{hpp,cpp} — HW/SW decode, frame conversion
+└── video/     VideoDecoder.{hpp,cpp}, FrameExporter.hpp — HW/SW decode, frame conversion, PNG screenshot export
 ```
 
 
@@ -465,6 +509,21 @@ NaikAVPlayer builds and plays a queue of local media files, with repeat/shuffle 
 
 ---
 
+## 5g. Video Frame Screenshot & Usability Architecture
+
+NaikAVPlayer implements a high-performance, non-blocking frame export engine and desktop usability layer:
+
+- **Lossless Video Frame Export (`FrameExporter`)**: Defined in `src/video/FrameExporter.hpp` (header-only, lightweight). When the user presses `S` or triggers a screenshot:
+  1. The player captures the current displayed `AVFrame` reference directly from the main render loop.
+  2. Creates a sanitized filename derived from the active media source name, current system timestamp, and playback time offset (`NaikAVPlayer_<basename>_<YYYYMMDD_HHMMSS>_<MMmSSs>.png`).
+  3. Allocates an `AVCodecContext` configured with `AV_CODEC_ID_PNG`, converting planar YUV/NV12/NV21 data to `AV_PIX_FMT_RGB24` via `sws_scale`.
+  4. Encodes and writes the PNG packet directly to disk within the `screenshots/` output directory.
+- **On-Screen Animated Toast Notifications**: Floating UI feedback banner rendered at the top/bottom of the display for track changes, delay offsets, screenshot confirmations, speed changes, loop toggling, and errors. Toasts feature smooth alpha fade-in / fade-out animations and configurable durations (default 3.5s).
+- **Cursor & Controls Dock Inactivity Timer**: Tracked via `lastMouseActivityTime` in `main.cpp`. If no mouse movement, mouse button, mouse wheel, or keyboard key event is detected for 2.5 seconds during active playback (`PlayerState::PLAYING`), SDL cursor is hidden (`SDL_HideCursor()`) and ImGui controls dock alpha fades to zero. Any user interaction instantly restores cursor and dock visibility.
+- **Auto-Pause During File Picker Navigation**: Whenever a native file dialog (media open, subtitle open, external audio open, folder picker, or multi-file open) is launched, the player automatically pauses background playback to prevent desynchronization or background noise, resuming upon dismissal if desired.
+
+---
+
 ## 6. Security, Maintenance & Dependency Management
 
 
@@ -560,45 +619,6 @@ The smoke test additionally links the player sources and FFmpeg/SDL3 — see the
 
 ---
 
-## 9. Troubleshooting
 
-### `Could not initialize SDL3: No available audio device` (Linux)
 
-SDL3 was compiled with only its `dummy`/`disk` audio drivers because none of `libasound2-dev` / `libpipewire-0.3-dev` / `libpulse-dev` were present at configure time — see [Section 1](#1-linux-binary-compatibility-limitation--prerequisites). CMake now fails configuration outright with instructions rather than producing a build that only breaks at runtime. Install the missing package(s) and **reconfigure** (`cmake -B build ...`); a plain `cmake --build` will not re-run `pkg-config` detection.
-
-### `h264_v4l2m2m unavailable` / software decode fallback on Raspberry Pi 5
-
-Expected, not a bug. The Pi 5's BCM2712 exposes only a hardware **HEVC/H.265** decode block (`rpi-hevc-dec`); unlike the Pi 4's BCM2711 it has **no hardware H.264 M2M decoder**, so `h264_v4l2m2m` cannot open and the pipeline correctly falls back to software `h264` (see [Section 5](#5-hardware-acceleration--dynamic-fallback)). The Cortex-A76 cores handle 1080p H.264 in software comfortably.
-
-### Crackling / clicking audio during otherwise normal playback
-
-Fixed. `swr_convert()` returning **0** — the normal "resampler is still filling its internal buffer" state — was handled only for the `< 0` (genuine error) case. A zero-sample result therefore fell through to `m_audioBufferSize = 0`, which `sdlAudioStreamCallback()` cannot distinguish from a starved queue, so it wrote a full block of digital silence into a perfectly healthy stream. Each block is a hard discontinuity: an audible click.
-
-Because soxr's internal latency grows with its precision setting, the defect scaled directly with `ResamplerQuality` — worst at **Very High**, and only present at all when the source rate differs from the 48 kHz output (so 44.1 kHz content, i.e. most music, was hit hardest). Measured on a 44.1 kHz stereo source at Very High: **17.25% of all audio callbacks** emitted silence, with the audio packet queue sitting at 149/150 the entire time. After the fix: **0.00%**, verified across mono, stereo and 5.1 sources. See the resampler-latency bullet in [Section 5b](#5b-audio-dsp--loudness-pipeline).
-
-If you hear crackling on a current build, run `tests/audio_underrun_smoke.cpp` (see [Section 8](#8-pipeline-instrumentation--metrics-reference)) against the offending file. A non-zero silence-injection percentage with per-path attribution tells you exactly which `decodeAndResample()` exit is responsible; a **0.00%** result means the callback never starved and the artifact is coming from somewhere other than underruns — most commonly gain staging (see below).
-
-### Distorted, harsh, or pumping audio (not clicks)
-
-Almost always gain staging rather than a pipeline defect. Overlapping parametric EQ bands stack: five bands at +6 dB each is roughly **+10 to +15 dB broadband** in the overlap regions, not +6 dB, which drives normal program material far past full scale and leaves both limiters in continuous heavy gain reduction. Loudness normalization can add up to a further +24 dB on top.
-
-Press **Flat** in the Audio Processing panel, or delete `player_settings.txt` and relaunch. Note that the master **Enable Audio Processing** toggle alone is not sufficient: loudness normalization, 3D surround, stereo widener, balance and the spectrum analyzer are all deliberately *outside* that switch (it gates only EQ / noise gate / compressor / multiband / limiter / crossover), so each must be turned off on its own.
-
-### Keyboard hotkeys (e.g. `P` for Playlist) don't respond before a file is opened, or while the Playlist panel is open
-
-Fixed — see [Section 5f](#5f-playlist-architecture)'s keyboard-nav capture bullet. Dear ImGui sets `io.WantCaptureKeyboard` true whenever a *focused* window has keyboard-nav enabled (this app turns on `ImGuiConfigFlags_NavEnableKeyboard` globally), and `main.cpp`'s entire hotkey switch is gated behind `!io.WantCaptureKeyboard`. Before a file is opened, the Welcome HUD is the only window on screen and didn't opt out of nav, so it was always focused and silently blocked *every* hotkey, not just Playlist-related ones — the same thing happened whenever the Playlist panel itself was open and focused. Both windows now pass `ImGuiWindowFlags_NoNav`; only Tab-based keyboard navigation within them is affected, not mouse interaction or `main.cpp`'s global hotkeys.
-
-### Playback freezes / system appears to hang after rapid seeking or seeking while paused
-
-Fixed — see [Section 5a](#5a-pipeline-backpressure--deadlock-prevention). The demuxer thread, which reads both streams, used to block indefinitely on a plain `push()` into the audio packet queue whenever nothing was draining it (audio is muted during a seek catch-up and stays paused while playback is paused). Once blocked it stopped calling `av_read_frame` entirely, starving the video queues too. All queue pushes are now bounded-wait with a drop fallback, so the pipeline self-recovers.
-
-### Audio-only / MP3 files skip rapidly or finish playback in ~4 seconds
-
-Fixed — see [Section 5c](#5c-audio-only-playback-pipeline--real-time-visualizer). `AudioDecoder` previously computed decoded audio frame PTS by dividing `pts` by `sample_rate` instead of converting from stream `m_timeBase`. On MP3 files (where `time_base` is typically `1/14112000`), timestamps scaled ~320x too fast, advancing the master clock past the track duration within milliseconds. In addition, the demuxer's initial paused-state push was dropping packets. Both issues are resolved and verified by automated test suites.
-
-### MP3 files with album artwork showing a blank screen instead of the visualizer
-
-Fixed — see [Section 5c](#5c-audio-only-playback-pipeline--real-time-visualizer). Embedded cover art (ID3 APIC / attached pictures) is demuxed by FFmpeg as a video stream with `AV_DISPOSITION_ATTACHED_PIC`. `Demuxer::open()` now filters out attached picture streams from `m_videoStreamIdx`, ensuring tracks with cover art correctly identify as audio-only files (`hasAudio() == true`, `hasVideo() == false`) and automatically activate the real-time visualizer.
-
----
 
