@@ -3051,14 +3051,14 @@ int main(int argc, char* argv[]) {
         }
         {
             naikav::dsp::SpatialDownmixer downmixer;
-            float dummyIn[8] = {0};
+            const float dummyIn[8] = {0};
             float dummyOut[8] = {0};
             downmixer.process(dummyIn, 4, dummyOut); // m_routes empty (never configured): early return
             test_assert(downmixer.numSourceChannels() == 0, "SpatialDownmixer::process() no-ops before configure()");
 
             downmixer.configure(naikav::dsp::SpatialDownmixer::SourceLayout::FIVEPOINT1_BACK, 48000.0);
             test_assert(downmixer.numSourceChannels() == 6, "SpatialDownmixer configures 6 routes for FIVEPOINT1_BACK");
-            float in6[6] = {0.1f, 0.1f, 0.1f, 0.1f, 0.1f, 0.1f};
+            const float in6[6] = {0.1f, 0.1f, 0.1f, 0.1f, 0.1f, 0.1f};
             float out2[2] = {0};
             downmixer.process(in6, 1, out2);
 

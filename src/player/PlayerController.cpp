@@ -937,7 +937,7 @@ void PlayerController::videoThreadLoop() {
 
         bool decoded = false;
         bool converted = false;
-        AVFrame* srcFrame = nullptr;
+        const AVFrame* srcFrame = nullptr;
         double framePts = 0.0;
         int frameWidth = 0;
         int frameHeight = 0;

@@ -44,7 +44,7 @@ public:
     SubtitleDecoder& operator=(const SubtitleDecoder&) = delete;
 
     // Initialize for an embedded subtitle stream
-    bool init(AVCodecParameters* codecParams, AVRational timeBase, int64_t startTime);
+    bool init(const AVCodecParameters* codecParams, AVRational timeBase, int64_t startTime);
 
     // Load and decode an external subtitle file (.srt, .vtt, .ass, .ssa, .sub)
     bool loadExternalFile(const std::string& filepath);

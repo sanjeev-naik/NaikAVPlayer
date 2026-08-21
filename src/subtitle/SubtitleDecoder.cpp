@@ -117,7 +117,7 @@ static bool parseTimestamp(const std::string& str, double& outSeconds) {
     }
 }
 
-bool SubtitleDecoder::init(AVCodecParameters* codecParams, AVRational timeBase, int64_t startTime) {
+bool SubtitleDecoder::init(const AVCodecParameters* codecParams, AVRational timeBase, int64_t startTime) {
     reset();
 
     if (!codecParams) return false;
@@ -308,7 +308,7 @@ bool SubtitleDecoder::loadExternalFile(const std::string& filepath) {
         }
 
         if (streamIdx >= 0) {
-            AVCodecParameters* codecParams = fmtCtx->streams[streamIdx]->codecpar;
+            const AVCodecParameters* codecParams = fmtCtx->streams[streamIdx]->codecpar;
             const AVCodec* decoder = avcodec_find_decoder(codecParams->codec_id);
             if (decoder) {
                 AVCodecContext* codecCtx = avcodec_alloc_context3(decoder);

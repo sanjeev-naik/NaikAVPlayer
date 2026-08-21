@@ -61,7 +61,7 @@ inline double prescanIntegratedLufs(const std::string& filePath, int audioStream
         return kFailureSentinel;
     }
 
-    AVCodecParameters* codecParams = fmtCtx->streams[streamIdx]->codecpar;
+    const AVCodecParameters* codecParams = fmtCtx->streams[streamIdx]->codecpar;
     const AVCodec* codec = avcodec_find_decoder(codecParams->codec_id);
     if (!codec) {
         avformat_close_input(&fmtCtx);
