@@ -6565,53 +6565,25 @@ int main(int argc, char* argv[]) {
                     av_frame_free(&f);
                 }
                 // Test 12: the ofstream-open-failure branch, after encoding
-                // has already succeeded. Forced deterministically via
-                // Windows' classic ~260-char MAX_PATH limit: a moderately
-                // deep nested output directory is well within the limit (so
-                // create_directories() succeeds), but appending the
-                // dynamically-generated PNG filename pushes the full path
-                // past it, so the ofstream open specifically fails while
-                // everything before it succeeded. The nesting depth is
-                // computed from the current working directory's own length
-                // so this holds regardless of where the test binary runs
-                // from, as long as the platform enforces the classic limit
-                // (true here; not exercised on platforms/configs where long
-                // paths are transparently supported).
+                // has already succeeded. Forced deterministically by supplying
+                // a base filename exceeding the 255-character single-component limit
+                // (NAME_MAX on Linux / MAX_COMPONENT_LENGTH on Windows NTFS).
+                // create_directories(outputDir) succeeds with the short directory,
+                // frame encoding succeeds, but std::ofstream(outPath) fails to open
+                // the file whose name component exceeds filesystem limits.
                 {
-                    std::error_code cwdEc;
-                    std::string cwdStr = std::filesystem::current_path(cwdEc).string();
-                    std::string longOutputDir = "fe_longpath_test";
-                    const std::string segment = "/segABCDEFGHIJKLMNOPQRSTUV";
-                    // The limit itself is platform-specific: Windows enforces
-                    // the classic 260-char MAX_PATH, while Linux allows a
-                    // 4096-char PATH_MAX (with each individual component
-                    // capped at 255, which the 26-char segments below stay
-                    // well clear of). Targeting the wrong one on Linux just
-                    // writes the PNG successfully and never reaches the
-                    // failure branch at all.
-#ifdef _WIN32
-                    const size_t pathLimit = 260;
-#else
-                    const size_t pathLimit = 4096;
-#endif
-                    // Grow the nested directory until its own absolute path
-                    // is deep into path-limit territory (comfortably under it,
-                    // create_directories still succeeds), while the ~50-char
-                    // generated filename appended on top will not fit.
-                    while (cwdEc || cwdStr.size() + 1 + longOutputDir.size() < pathLimit - 40) {
-                        longOutputDir += segment;
-                        if (cwdStr.size() + 1 + longOutputDir.size() > pathLimit + 140) break; // safety cap
-                    }
+                    std::string excessivelyLongMediaName(300, 'x');
+                    excessivelyLongMediaName += ".mp4";
 
                     AVFrame* f = makeSynthFrame();
-                    auto r = FrameExporter::saveFrameAsPng(f, "synthetic_video.mp4", 5.0, longOutputDir);
+                    auto r = FrameExporter::saveFrameAsPng(f, excessivelyLongMediaName, 5.0, "test_screenshots");
                     av_frame_free(&f);
-                    test_assert(!r.success, "FrameExporter: fails gracefully when the output file path exceeds MAX_PATH");
+                    test_assert(!r.success, "FrameExporter: fails gracefully when the output file path exceeds filesystem limits");
                     test_assert(r.errorMessage.find("Failed to open output file") != std::string::npos,
                                 "FrameExporter: reports the specific ofstream-open failure message");
 
                     std::error_code rmEc;
-                    std::filesystem::remove_all(std::filesystem::path("fe_longpath_test"), rmEc);
+                    std::filesystem::remove_all(std::filesystem::path("test_screenshots"), rmEc);
                 }
                 std::filesystem::remove("test_screenshots", ec);
             }
