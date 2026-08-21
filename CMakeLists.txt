@@ -831,3 +831,10 @@ if(NOT EXISTS "${TEST_VIDEO_PATH}")
 endif()
 
 add_test(NAME NaikAVPlayer_tests COMMAND NaikAVPlayer_tests "${TEST_VIDEO_PATH}")
+
+# The suite runs in well under a minute (~35s on a CI runner, a few minutes
+# under ASan/TSan). CTest buffers a test's output until it exits, so a hung
+# test otherwise produces a job that stalls with nothing printed at all until
+# the runner cancels it -- no clue as to where. A timeout turns that into a
+# bounded failure with the captured output attached.
+set_tests_properties(NaikAVPlayer_tests PROPERTIES TIMEOUT 900)

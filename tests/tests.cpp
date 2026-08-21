@@ -4197,6 +4197,19 @@ int main(int argc, char* argv[]) {
                 VideoDecoder* dec = controller.m_videoDecoder.get();
                 force_receive_eagain = true;
                 dec->flush();
+                // Cut the packet supply off before decodeNextFrame() runs.
+                // Past the drain loop, a permanently-EAGAIN receive_frame()
+                // livelocks the main decode loop: the real (unmocked)
+                // decoder's internal buffer fills up because the mock never
+                // lets a frame be drained out of it, the real send_packet()
+                // then returns EAGAIN forever, and the "resend this same
+                // packet once space frees up" branch spins at 100% CPU with
+                // no exit. (The other force_receive_eagain tests dodge this
+                // by also setting mock_send_packet_success.) An aborted
+                // queue makes the post-drain try_pop() fail instead, so the
+                // call returns right after the retry loop under test --
+                // which is all this block is here to cover.
+                dec->m_queue.abort();
                 dec->decodeNextFrame(); // drains via ~50ms of EAGAIN retries, then gives up and returns false
                 force_receive_eagain = false;
             }
@@ -6527,13 +6540,25 @@ int main(int argc, char* argv[]) {
                     std::string cwdStr = std::filesystem::current_path(cwdEc).string();
                     std::string longOutputDir = "fe_longpath_test";
                     const std::string segment = "/segABCDEFGHIJKLMNOPQRSTUV";
+                    // The limit itself is platform-specific: Windows enforces
+                    // the classic 260-char MAX_PATH, while Linux allows a
+                    // 4096-char PATH_MAX (with each individual component
+                    // capped at 255, which the 26-char segments below stay
+                    // well clear of). Targeting the wrong one on Linux just
+                    // writes the PNG successfully and never reaches the
+                    // failure branch at all.
+#ifdef _WIN32
+                    const size_t pathLimit = 260;
+#else
+                    const size_t pathLimit = 4096;
+#endif
                     // Grow the nested directory until its own absolute path
-                    // is deep into MAX_PATH territory (comfortably under it,
+                    // is deep into path-limit territory (comfortably under it,
                     // create_directories still succeeds), while the ~50-char
                     // generated filename appended on top will not fit.
-                    while (cwdEc || cwdStr.size() + 1 + longOutputDir.size() < 220) {
+                    while (cwdEc || cwdStr.size() + 1 + longOutputDir.size() < pathLimit - 40) {
                         longOutputDir += segment;
-                        if (cwdStr.size() + 1 + longOutputDir.size() > 400) break; // safety cap
+                        if (cwdStr.size() + 1 + longOutputDir.size() > pathLimit + 140) break; // safety cap
                     }
 
                     AVFrame* f = makeSynthFrame();
