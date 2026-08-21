@@ -155,8 +155,8 @@ static std::atomic<bool> force_channel_layout_describe_fail{false};
 static std::mutex mock_read_frame_mutex;
 static std::function<void()> on_mock_read_frame = nullptr;
 struct AVCodec;
-static const struct AVCodec* global_saved_codec = nullptr;
-static const struct AVCodec* global_fake_codec_ptr = nullptr;
+static std::atomic<const struct AVCodec*> global_saved_codec{nullptr};
+static std::atomic<const struct AVCodec*> global_fake_codec_ptr{nullptr};
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -411,9 +411,11 @@ inline SDL_AudioStream* mock_SDL_OpenAudioDeviceStream(SDL_AudioDeviceID devid, 
 #define SDL_OpenAudioDeviceStream mock_SDL_OpenAudioDeviceStream
 
 inline void mock_avcodec_free_context(AVCodecContext** pavctx) {
-    if (pavctx && *pavctx && global_saved_codec && global_fake_codec_ptr) {
-        if ((*pavctx)->codec == global_fake_codec_ptr) {
-            (*pavctx)->codec = global_saved_codec;
+    const AVCodec* savedCodec = global_saved_codec.load(std::memory_order_acquire);
+    const AVCodec* fakeCodec = global_fake_codec_ptr.load(std::memory_order_acquire);
+    if (pavctx && *pavctx && savedCodec && fakeCodec) {
+        if ((*pavctx)->codec == fakeCodec) {
+            (*pavctx)->codec = savedCodec;
         }
     }
     avcodec_free_context(pavctx);
