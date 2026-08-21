@@ -637,6 +637,26 @@ void test_assert(bool condition, const std::string& message) {
     }
 }
 
+// Feed a packet into a live PlayerController's packet queue without ever
+// blocking. ThreadSafeQueue::push() waits indefinitely while the queue sits
+// at capacity, and this binary runs with the video thread disabled
+// (g_videoThreadEnabled = false in main()), so nothing drains a video queue
+// the demuxer has already saturated -- which it does within milliseconds of
+// openFile() on any real file. A plain push() there deadlocks the test
+// thread outright, and only sometimes: it comes down to whether the demuxer
+// refills the slot a try_pop() just freed before this push() takes the lock.
+// push_wait_or_drop() is the codebase's own backstop for producers that must
+// not block (see ThreadSafeQueue.hpp) -- it drops the oldest packet to make
+// room rather than waiting forever.
+static bool feedPacket(ThreadSafeQueue<AVPacket*>& queue, AVPacket* packet) {
+    if (!queue.push_wait_or_drop(packet, std::chrono::milliseconds(50),
+                                 [](AVPacket*& dropped) { av_packet_free(&dropped); })) {
+        av_packet_free(&packet);
+        return false;
+    }
+    return true;
+}
+
 // Defensive reset of every force_*/mock_* injection flag to its default
 // (off/passthrough) state. Intended for tests that spawn real background
 // decode work (e.g. the loudness prescan thread) that must behave like real
@@ -1744,7 +1764,7 @@ int real_main(int argc, char* argv[]) {
 
         // Push a dummy packet to ensure queue is not empty, preventing premature EOF state transition
         AVPacket* dummyPkt = av_packet_alloc();
-        controller.m_videoQueue.push(dummyPkt);
+        feedPacket(controller.m_videoQueue, dummyPkt);
 
         // Verify getCurrentTime drives updateClockForVideoOnly()
         double videoOnlyTime1 = controller.getCurrentTime();
@@ -3830,7 +3850,7 @@ int main(int argc, char* argv[]) {
                             pc.selectSubtitleTrack(subId); // embedded
 
                             AVPacket* subPkt = av_packet_alloc();
-                            pc.m_subtitleQueue.push(subPkt);
+                            feedPacket(pc.m_subtitleQueue, subPkt);
                             pc.pollSubtitlePackets(); // pops+processes the queued packet
                             test_assert(true, "pollSubtitlePackets() processes a real queued packet without crashing");
 
@@ -3904,7 +3924,7 @@ int main(int argc, char* argv[]) {
                 
                 for (int i = 0; i < 70; i++) {
                     AVPacket* pkt = av_packet_alloc();
-                    dec->m_queue.push(pkt);
+                    feedPacket(dec->m_queue, pkt);
                 }
                 
                 dec->decodeNextFrame();
@@ -3940,7 +3960,7 @@ int main(int argc, char* argv[]) {
                     
                     for (int i = 0; i < 70; i++) {
                         AVPacket* pkt = av_packet_alloc();
-                        dec->m_queue.push(pkt);
+                        feedPacket(dec->m_queue, pkt);
                     }
                     
                     test_assert(!dec->decodeNextFrame(), "decodeNextFrame returns false when fallback allocation fails");
@@ -3975,7 +3995,7 @@ int main(int argc, char* argv[]) {
                     
                     for (int i = 0; i < 70; i++) {
                         AVPacket* pkt = av_packet_alloc();
-                        dec->m_queue.push(pkt);
+                        feedPacket(dec->m_queue, pkt);
                     }
                     
                     test_assert(!dec->decodeNextFrame(), "decodeNextFrame returns false when fallback copy params fails");
@@ -4010,7 +4030,7 @@ int main(int argc, char* argv[]) {
                     
                     for (int i = 0; i < 70; i++) {
                         AVPacket* pkt = av_packet_alloc();
-                        dec->m_queue.push(pkt);
+                        feedPacket(dec->m_queue, pkt);
                     }
                     
                     test_assert(!dec->decodeNextFrame(), "decodeNextFrame returns false when fallback open fails");
@@ -4058,7 +4078,7 @@ int main(int argc, char* argv[]) {
 
                     for (int i = 0; i < 70; i++) {
                         AVPacket* pkt = av_packet_alloc();
-                        dec->m_queue.push(pkt);
+                        feedPacket(dec->m_queue, pkt);
                     }
 
                     test_assert(!dec->decodeNextFrame(), "decodeNextFrame returns false when software decoder not found");
@@ -4226,7 +4246,7 @@ int main(int argc, char* argv[]) {
             if (controller.openFile(testFile)) {
                 VideoDecoder* dec = controller.m_videoDecoder.get();
                 AVPacket* pkt = av_packet_alloc();
-                dec->m_queue.push(pkt);
+                feedPacket(dec->m_queue, pkt);
                 force_receive_frame_eagain_then_fail = 1;
                 force_send_packet_eagain = true;
                 test_assert(!dec->decodeNextFrame(),
@@ -4255,7 +4275,7 @@ int main(int argc, char* argv[]) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(20));
                 }
                 if (pkt) {
-                    dec->m_queue.push(pkt);
+                    feedPacket(dec->m_queue, pkt);
                     force_send_packet_fail = true;
                     dec->decodeNextFrame();
                     force_send_packet_fail = false;
