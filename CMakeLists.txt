@@ -464,9 +464,13 @@ else()
     )
 endif()
 
-if(TARGET_PLATFORM_WINDOWS AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-    target_link_options(NaikAVPlayer PRIVATE -static-libgcc -static-libstdc++)
+if(TARGET_PLATFORM_WINDOWS)
     set_target_properties(NaikAVPlayer PROPERTIES WIN32_EXECUTABLE TRUE)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_link_options(NaikAVPlayer PRIVATE -static-libgcc -static-libstdc++)
+    elseif(MSVC)
+        target_link_options(NaikAVPlayer PRIVATE /ENTRY:mainCRTStartup)
+    endif()
 endif()
 
 # Link Linux specific libraries
