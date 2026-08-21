@@ -619,45 +619,6 @@ The smoke test additionally links the player sources and FFmpeg/SDL3 — see the
 
 ---
 
-## 9. Troubleshooting
 
-### `Could not initialize SDL3: No available audio device` (Linux)
 
-SDL3 was compiled with only its `dummy`/`disk` audio drivers because none of `libasound2-dev` / `libpipewire-0.3-dev` / `libpulse-dev` were present at configure time — see [Section 1](#1-linux-binary-compatibility-limitation--prerequisites). CMake now fails configuration outright with instructions rather than producing a build that only breaks at runtime. Install the missing package(s) and **reconfigure** (`cmake -B build ...`); a plain `cmake --build` will not re-run `pkg-config` detection.
-
-### `h264_v4l2m2m unavailable` / software decode fallback on Raspberry Pi 5
-
-Expected, not a bug. The Pi 5's BCM2712 exposes only a hardware **HEVC/H.265** decode block (`rpi-hevc-dec`); unlike the Pi 4's BCM2711 it has **no hardware H.264 M2M decoder**, so `h264_v4l2m2m` cannot open and the pipeline correctly falls back to software `h264` (see [Section 5](#5-hardware-acceleration--dynamic-fallback)). The Cortex-A76 cores handle 1080p H.264 in software comfortably.
-
-### Crackling / clicking audio during otherwise normal playback
-
-Fixed. `swr_convert()` returning **0** — the normal "resampler is still filling its internal buffer" state — was handled only for the `< 0` (genuine error) case. A zero-sample result therefore fell through to `m_audioBufferSize = 0`, which `sdlAudioStreamCallback()` cannot distinguish from a starved queue, so it wrote a full block of digital silence into a perfectly healthy stream. Each block is a hard discontinuity: an audible click.
-
-Because soxr's internal latency grows with its precision setting, the defect scaled directly with `ResamplerQuality` — worst at **Very High**, and only present at all when the source rate differs from the 48 kHz output (so 44.1 kHz content, i.e. most music, was hit hardest). Measured on a 44.1 kHz stereo source at Very High: **17.25% of all audio callbacks** emitted silence, with the audio packet queue sitting at 149/150 the entire time. After the fix: **0.00%**, verified across mono, stereo and 5.1 sources. See the resampler-latency bullet in [Section 5b](#5b-audio-dsp--loudness-pipeline).
-
-If you hear crackling on a current build, run `tests/audio_underrun_smoke.cpp` (see [Section 8](#8-pipeline-instrumentation--metrics-reference)) against the offending file. A non-zero silence-injection percentage with per-path attribution tells you exactly which `decodeAndResample()` exit is responsible; a **0.00%** result means the callback never starved and the artifact is coming from somewhere other than underruns — most commonly gain staging (see below).
-
-### Distorted, harsh, or pumping audio (not clicks)
-
-Almost always gain staging rather than a pipeline defect. Overlapping parametric EQ bands stack: five bands at +6 dB each is roughly **+10 to +15 dB broadband** in the overlap regions, not +6 dB, which drives normal program material far past full scale and leaves both limiters in continuous heavy gain reduction. Loudness normalization can add up to a further +24 dB on top.
-
-Press **Flat** in the Audio Processing panel, or delete `player_settings.txt` and relaunch. Note that the master **Enable Audio Processing** toggle alone is not sufficient: loudness normalization, 3D surround, stereo widener, balance and the spectrum analyzer are all deliberately *outside* that switch (it gates only EQ / noise gate / compressor / multiband / limiter / crossover), so each must be turned off on its own.
-
-### Keyboard hotkeys (e.g. `P` for Playlist) don't respond before a file is opened, or while the Playlist panel is open
-
-Fixed — see [Section 5f](#5f-playlist-architecture)'s keyboard-nav capture bullet. Dear ImGui sets `io.WantCaptureKeyboard` true whenever a *focused* window has keyboard-nav enabled (this app turns on `ImGuiConfigFlags_NavEnableKeyboard` globally), and `main.cpp`'s entire hotkey switch is gated behind `!io.WantCaptureKeyboard`. Before a file is opened, the Welcome HUD is the only window on screen and didn't opt out of nav, so it was always focused and silently blocked *every* hotkey, not just Playlist-related ones — the same thing happened whenever the Playlist panel itself was open and focused. Both windows now pass `ImGuiWindowFlags_NoNav`; only Tab-based keyboard navigation within them is affected, not mouse interaction or `main.cpp`'s global hotkeys.
-
-### Playback freezes / system appears to hang after rapid seeking or seeking while paused
-
-Fixed — see [Section 5a](#5a-pipeline-backpressure--deadlock-prevention). The demuxer thread, which reads both streams, used to block indefinitely on a plain `push()` into the audio packet queue whenever nothing was draining it (audio is muted during a seek catch-up and stays paused while playback is paused). Once blocked it stopped calling `av_read_frame` entirely, starving the video queues too. All queue pushes are now bounded-wait with a drop fallback, so the pipeline self-recovers.
-
-### Audio-only / MP3 files skip rapidly or finish playback in ~4 seconds
-
-Fixed — see [Section 5c](#5c-audio-only-playback-pipeline--real-time-visualizer). `AudioDecoder` previously computed decoded audio frame PTS by dividing `pts` by `sample_rate` instead of converting from stream `m_timeBase`. On MP3 files (where `time_base` is typically `1/14112000`), timestamps scaled ~320x too fast, advancing the master clock past the track duration within milliseconds. In addition, the demuxer's initial paused-state push was dropping packets. Both issues are resolved and verified by automated test suites.
-
-### MP3 files with album artwork showing a blank screen instead of the visualizer
-
-Fixed — see [Section 5c](#5c-audio-only-playback-pipeline--real-time-visualizer). Embedded cover art (ID3 APIC / attached pictures) is demuxed by FFmpeg as a video stream with `AV_DISPOSITION_ATTACHED_PIC`. `Demuxer::open()` now filters out attached picture streams from `m_videoStreamIdx`, ensuring tracks with cover art correctly identify as audio-only files (`hasAudio() == true`, `hasVideo() == false`) and automatically activate the real-time visualizer.
-
----
 
