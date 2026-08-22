@@ -141,8 +141,7 @@ private:
             if (before & 1u) continue; // write in progress
             if (mags) *mags = m_sharedMags;
             if (waveform) *waveform = m_sharedWaveform;
-            std::atomic_thread_fence(std::memory_order_acquire);
-            if (m_generation.load(std::memory_order_relaxed) == before) {
+            if (m_generation.load(std::memory_order_acquire) == before) {
                 return;
             }
         }
@@ -152,7 +151,6 @@ private:
 
     void publish(bool waveformOnlyZero = false) {
         m_generation.fetch_add(1, std::memory_order_release); // -> odd
-        std::atomic_thread_fence(std::memory_order_release);
         if (waveformOnlyZero) {
             std::fill(m_sharedMags.begin(), m_sharedMags.end(), kFloorDb);
             std::fill(m_sharedWaveform.begin(), m_sharedWaveform.end(), 0.0f);
@@ -160,7 +158,6 @@ private:
             std::copy(m_smoothed.begin(), m_smoothed.end(), m_sharedMags.begin());
             std::copy(m_ringBuffer.begin(), m_ringBuffer.end(), m_sharedWaveform.begin());
         }
-        std::atomic_thread_fence(std::memory_order_release);
         m_generation.fetch_add(1, std::memory_order_release); // -> even
     }
 

@@ -1206,9 +1206,7 @@ void AudioDecoder::applyDspSettings(const naikav::dsp::AudioDspSettings& raw) {
     // again next block. The audio thread applies the snapshot itself in
     // applyPendingDspSettings().
     m_mailboxSeq.fetch_add(1, std::memory_order_release);            // -> odd
-    std::atomic_thread_fence(std::memory_order_release);
     m_mailboxSettings = settings;
-    std::atomic_thread_fence(std::memory_order_release);
     m_mailboxSeq.fetch_add(1, std::memory_order_release);            // -> even
 
     // This thread's own record of what it published, for getDspSettings().
@@ -1224,8 +1222,7 @@ bool AudioDecoder::readMailboxSettings(naikav::dsp::AudioDspSettings* out, uint3
         const uint32_t before = m_mailboxSeq.load(std::memory_order_acquire);
         if (before & 1u) continue; // write in progress
         *out = m_mailboxSettings;
-        std::atomic_thread_fence(std::memory_order_acquire);
-        if (m_mailboxSeq.load(std::memory_order_relaxed) == before) {
+        if (m_mailboxSeq.load(std::memory_order_acquire) == before) {
             *seq = before;
             return true;
         }
