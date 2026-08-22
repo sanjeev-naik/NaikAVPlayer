@@ -590,13 +590,13 @@ inline bool mock_SDL_Init(SDL_InitFlags flags) {
 #define SDL_Init mock_SDL_Init
 
 inline SDL_AudioDeviceID* mock_SDL_GetAudioPlaybackDevices(int* count) {
-    int n = force_fake_playback_devices.load();
-    if (n > 0) {
-        SDL_AudioDeviceID* arr = static_cast<SDL_AudioDeviceID*>(SDL_malloc(sizeof(SDL_AudioDeviceID) * static_cast<size_t>(n)));
-        for (int i = 0; i < n; ++i) {
+    int numDevices = force_fake_playback_devices.load();
+    if (numDevices > 0) {
+        SDL_AudioDeviceID* arr = static_cast<SDL_AudioDeviceID*>(SDL_malloc(sizeof(SDL_AudioDeviceID) * static_cast<size_t>(numDevices)));
+        for (int i = 0; i < numDevices; ++i) {
             arr[i] = static_cast<SDL_AudioDeviceID>(9000 + i);
         }
-        *count = n;
+        *count = numDevices;
         return arr;
     }
     return SDL_GetAudioPlaybackDevices(count);
@@ -5674,9 +5674,9 @@ int main(int argc, char* argv[]) {
                     for (int b = 0; b < kBlocks; ++b) {
                         std::vector<float> buf(static_cast<size_t>(kBlock) * channels);
                         for (int i = 0; i < kBlock; ++i) {
-                            const int n = b * kBlock + i;
-                            const float l = kAmp * static_cast<float>(std::sin(2.0 * M_PI * kLeftHz * n / kSR));
-                            const float r = kAmp * static_cast<float>(std::sin(2.0 * M_PI * kRightHz * n / kSR));
+                            const int sampleIdx = b * kBlock + i;
+                            const float l = kAmp * static_cast<float>(std::sin(2.0 * M_PI * kLeftHz * sampleIdx / kSR));
+                            const float r = kAmp * static_cast<float>(std::sin(2.0 * M_PI * kRightHz * sampleIdx / kSR));
                             for (int c = 0; c < channels; ++c) {
                                 buf[static_cast<size_t>(i) * channels + c] = (c % 2 == 0) ? l : r;
                             }
@@ -5698,10 +5698,10 @@ int main(int argc, char* argv[]) {
                     naikav::dsp::BalanceControl bal;
                     bal.configure(2);
                     bal.configureFade(kSR);
-                    test_assert(worstStepUnder(2, [&](int b, float* p, int n) {
+                    test_assert(worstStepUnder(2, [&](int b, float* p, int numFrames) {
                                     if (b == 20) bal.setBalance(-0.8f);
                                     if (b == 40) bal.setBalance(0.0f);
-                                    bal.process(p, n);
+                                    bal.process(p, numFrames);
                                 }) < bound,
                                 "BalanceControl: a balance change glides instead of stepping the gain");
                 }
@@ -5711,9 +5711,9 @@ int main(int argc, char* argv[]) {
                     wid.configureFade(kSR);
                     wid.reserveBlock(kBlock);
                     wid.setEnabled(true);
-                    test_assert(worstStepUnder(2, [&](int b, float* p, int n) {
+                    test_assert(worstStepUnder(2, [&](int b, float* p, int numFrames) {
                                     if (b % 10 == 0) wid.setWidth(1.0f + (b / 10) * 0.4f);
-                                    wid.process(p, n);
+                                    wid.process(p, numFrames);
                                 }) < bound,
                                 "StereoWidener: a width sweep glides instead of stepping the side gain");
                 }
@@ -5722,9 +5722,9 @@ int main(int argc, char* argv[]) {
                     s3d.configure(2, kSR);
                     s3d.reserveBlock(kBlock);
                     s3d.setEnabled(true);
-                    test_assert(worstStepUnder(2, [&](int b, float* p, int n) {
+                    test_assert(worstStepUnder(2, [&](int b, float* p, int numFrames) {
                                     if (b % 10 == 0) s3d.setIntensity((b / 10) * 0.4f);
-                                    s3d.process(p, n);
+                                    s3d.process(p, numFrames);
                                 }) < bound,
                                 "Surround3D: an intensity sweep glides instead of stepping the ambience gain");
                 }
@@ -5735,10 +5735,10 @@ int main(int argc, char* argv[]) {
                     chain.setEnabled(true);
                     chain.crossover.setEnabled(true);
                     chain.crossover.setBassRedirectEnabled(true);
-                    test_assert(worstStepUnder(6, [&](int b, float* p, int n) {
+                    test_assert(worstStepUnder(6, [&](int b, float* p, int numFrames) {
                                     if (b == 20) chain.crossover.setLfeGainDb(-12.0f);
                                     if (b == 40) chain.crossover.setLfeGainDb(0.0f);
-                                    chain.process(p, n);
+                                    chain.process(p, numFrames);
                                 }) < bound,
                                 "Crossover: an LFE trim change glides instead of stepping that channel");
                 }
@@ -5748,10 +5748,10 @@ int main(int argc, char* argv[]) {
                     chain.reserveBlock(kBlock);
                     chain.setEnabled(true);
                     chain.compressor.setThresholdDb(-30.0f);
-                    test_assert(worstStepUnder(2, [&](int b, float* p, int n) {
+                    test_assert(worstStepUnder(2, [&](int b, float* p, int numFrames) {
                                     if (b == 20) chain.compressor.setRatio(8.0f);
                                     if (b == 40) chain.compressor.setRatio(1.0f); // back to inert
-                                    chain.process(p, n);
+                                    chain.process(p, numFrames);
                                 }) < bound,
                                 "Compressor: going inert glides the gain reduction out instead of dropping it");
                 }
@@ -5762,10 +5762,10 @@ int main(int argc, char* argv[]) {
                     chain.setEnabled(true);
                     chain.compressor.setThresholdDb(-30.0f);
                     chain.compressor.setRatio(4.0f);
-                    test_assert(worstStepUnder(2, [&](int b, float* p, int n) {
+                    test_assert(worstStepUnder(2, [&](int b, float* p, int numFrames) {
                                     if (b == 20) chain.compressor.setMakeupGainDb(6.0f);
                                     if (b == 40) chain.compressor.setMakeupGainDb(0.0f);
-                                    chain.process(p, n);
+                                    chain.process(p, numFrames);
                                 }) < bound,
                                 "Compressor: a makeup gain change glides instead of stepping");
                 }
@@ -5775,10 +5775,10 @@ int main(int argc, char* argv[]) {
                     chain.reserveBlock(kBlock);
                     chain.setEnabled(true);
                     chain.noiseGate.setThresholdDb(-6.0f);
-                    test_assert(worstStepUnder(2, [&](int b, float* p, int n) {
+                    test_assert(worstStepUnder(2, [&](int b, float* p, int numFrames) {
                                     if (b == 20) chain.noiseGate.setRatio(8.0f);
                                     if (b == 40) chain.noiseGate.setRatio(1.0f); // back to inert
-                                    chain.process(p, n);
+                                    chain.process(p, numFrames);
                                 }) < bound,
                                 "NoiseGate: going inert glides the attenuation out instead of releasing it in one sample");
                 }
@@ -5787,10 +5787,10 @@ int main(int argc, char* argv[]) {
                     chain.configure(2, kSR, -1);
                     chain.reserveBlock(kBlock);
                     chain.setEnabled(true);
-                    test_assert(worstStepUnder(2, [&](int b, float* p, int n) {
+                    test_assert(worstStepUnder(2, [&](int b, float* p, int numFrames) {
                                     if (b == 20) chain.limiter.setCeilingDb(-12.0f);
                                     if (b == 40) chain.limiter.setCeilingDb(0.0f);
-                                    chain.process(p, n);
+                                    chain.process(p, numFrames);
                                 }) < bound,
                                 "Limiter: a ceiling change glides instead of stepping the clamp");
                 }
@@ -5804,10 +5804,10 @@ int main(int argc, char* argv[]) {
                     chain.reserveBlock(kBlock);
                     chain.setEnabled(true);
                     chain.crossover.setEnabled(true);
-                    test_assert(worstStepUnder(6, [&](int b, float* p, int n) {
+                    test_assert(worstStepUnder(6, [&](int b, float* p, int numFrames) {
                                     if (b == 20) chain.crossover.setBassRedirectEnabled(true);
                                     if (b == 40) chain.crossover.setBassRedirectEnabled(false);
-                                    chain.process(p, n);
+                                    chain.process(p, numFrames);
                                 }) < bound,
                                 "Crossover: toggling bass redirect crossfades instead of swapping the signal path");
                 }
@@ -5823,14 +5823,14 @@ int main(int argc, char* argv[]) {
                     chain.configure(2, kSR, -1);
                     chain.reserveBlock(kBlock);
                     chain.setEnabled(true);
-                    test_assert(worstStepUnder(2, [&](int b, float* p, int n) {
+                    test_assert(worstStepUnder(2, [&](int b, float* p, int numFrames) {
                                     if (b == 15) for (int i = 0; i < naikav::dsp::ParametricEQ::kNumBands; ++i)
                                         chain.eq.setBandGainDb(i, 12.0f);   // all bands become active
                                     if (b == 30) for (int i = 0; i < naikav::dsp::ParametricEQ::kNumBands; ++i)
                                         chain.eq.setBandGainDb(i, -12.0f);  // preset jump, stays active
                                     if (b == 45) for (int i = 0; i < naikav::dsp::ParametricEQ::kNumBands; ++i)
                                         chain.eq.setBandGainDb(i, 0.0f);    // all bands go inactive
-                                    chain.process(p, n);
+                                    chain.process(p, numFrames);
                                 }) < bound,
                                 "ParametricEQ: bands entering and leaving the processing list fade rather than snap");
 
@@ -5933,15 +5933,15 @@ int main(int argc, char* argv[]) {
                 // Front-left-only signal should land almost entirely in the
                 // left output channel (direct route: FL -> gain 1.0 L / 0.0 R).
                 {
-                    int n = 100;
-                    std::vector<float> in(static_cast<size_t>(n) * 6, 0.0f);
-                    for (int f = 0; f < n; ++f) {
+                    int numFrames = 100;
+                    std::vector<float> in(static_cast<size_t>(numFrames) * 6, 0.0f);
+                    for (int f = 0; f < numFrames; ++f) {
                         in[static_cast<size_t>(f) * 6 + 0] = 0.5f; // FL only
                     }
-                    std::vector<float> out(static_cast<size_t>(n) * 2, 0.0f);
-                    dm.process(in.data(), n, out.data());
+                    std::vector<float> out(static_cast<size_t>(numFrames) * 2, 0.0f);
+                    dm.process(in.data(), numFrames, out.data());
                     float peakL = 0.0f, peakR = 0.0f;
-                    for (int f = 0; f < n; ++f) {
+                    for (int f = 0; f < numFrames; ++f) {
                         peakL = std::max(peakL, std::fabs(out[static_cast<size_t>(f) * 2 + 0]));
                         peakR = std::max(peakR, std::fabs(out[static_cast<size_t>(f) * 2 + 1]));
                     }
@@ -5953,15 +5953,15 @@ int main(int argc, char* argv[]) {
                 {
                     naikav::dsp::SpatialDownmixer dmCenter;
                     dmCenter.configure(SL::FIVEPOINT1_SIDE, kSR);
-                    int n = 100;
-                    std::vector<float> in(static_cast<size_t>(n) * 6, 0.0f);
-                    for (int f = 0; f < n; ++f) {
+                    int numFrames = 100;
+                    std::vector<float> in(static_cast<size_t>(numFrames) * 6, 0.0f);
+                    for (int f = 0; f < numFrames; ++f) {
                         in[static_cast<size_t>(f) * 6 + 2] = 0.5f; // FC only
                     }
-                    std::vector<float> out(static_cast<size_t>(n) * 2, 0.0f);
-                    dmCenter.process(in.data(), n, out.data());
+                    std::vector<float> out(static_cast<size_t>(numFrames) * 2, 0.0f);
+                    dmCenter.process(in.data(), numFrames, out.data());
                     float peakL = 0.0f, peakR = 0.0f;
-                    for (int f = 0; f < n; ++f) {
+                    for (int f = 0; f < numFrames; ++f) {
                         peakL = std::max(peakL, std::fabs(out[static_cast<size_t>(f) * 2 + 0]));
                         peakR = std::max(peakR, std::fabs(out[static_cast<size_t>(f) * 2 + 1]));
                     }
@@ -5978,13 +5978,13 @@ int main(int argc, char* argv[]) {
                 {
                     naikav::dsp::SpatialDownmixer dmSide;
                     dmSide.configure(SL::FIVEPOINT1_SIDE, kSR);
-                    int n = static_cast<int>(kSR * 0.02); // 20ms, enough to clear the ~8ms surround delay
-                    std::vector<float> in(static_cast<size_t>(n) * 6, 0.0f);
-                    for (int f = 0; f < n; ++f) {
+                    int numFrames = static_cast<int>(kSR * 0.02); // 20ms, enough to clear the ~8ms surround delay
+                    std::vector<float> in(static_cast<size_t>(numFrames) * 6, 0.0f);
+                    for (int f = 0; f < numFrames; ++f) {
                         in[static_cast<size_t>(f) * 6 + 4] = 0.5f; // SL only
                     }
-                    std::vector<float> out(static_cast<size_t>(n) * 2, 0.0f);
-                    dmSide.process(in.data(), n, out.data());
+                    std::vector<float> out(static_cast<size_t>(numFrames) * 2, 0.0f);
+                    dmSide.process(in.data(), numFrames, out.data());
 
                     // Frame 0 carries the direct term only: audible
                     // immediately, and quieter than the settled level that
@@ -5995,7 +5995,7 @@ int main(int argc, char* argv[]) {
                                 "SpatialDownmixer: the undelayed surround term is already panned toward its own side");
 
                     float tailPeakL = 0.0f, tailPeakR = 0.0f;
-                    for (int f = n - 100; f < n; ++f) {
+                    for (int f = numFrames - 100; f < numFrames; ++f) {
                         tailPeakL = std::max(tailPeakL, std::fabs(out[static_cast<size_t>(f) * 2 + 0]));
                         tailPeakR = std::max(tailPeakR, std::fabs(out[static_cast<size_t>(f) * 2 + 1]));
                     }
@@ -6011,13 +6011,13 @@ int main(int argc, char* argv[]) {
                 {
                     naikav::dsp::SpatialDownmixer dmLfe;
                     dmLfe.configure(SL::FIVEPOINT1_SIDE, kSR);
-                    int n = 10;
-                    std::vector<float> in(static_cast<size_t>(n) * 6, 0.0f);
-                    for (int f = 0; f < n; ++f) {
+                    int numFrames = 10;
+                    std::vector<float> in(static_cast<size_t>(numFrames) * 6, 0.0f);
+                    for (int f = 0; f < numFrames; ++f) {
                         in[static_cast<size_t>(f) * 6 + 3] = 0.8f; // LFE only
                     }
-                    std::vector<float> out(static_cast<size_t>(n) * 2, 0.0f);
-                    dmLfe.process(in.data(), n, out.data());
+                    std::vector<float> out(static_cast<size_t>(numFrames) * 2, 0.0f);
+                    dmLfe.process(in.data(), numFrames, out.data());
                     test_assert(std::fabs(out[0] - out[1]) < 1e-5f,
                                 "SpatialDownmixer: LFE-only source is non-directional (splits evenly)");
                     test_assert(out[0] > 0.0f, "SpatialDownmixer: LFE-only source is audible in the output");
@@ -6055,16 +6055,16 @@ int main(int argc, char* argv[]) {
                 s3dOn.configure(2, kSR);
                 s3dOn.setEnabled(true);
                 s3dOn.setIntensity(1.0f);
-                int n = static_cast<int>(kSR * 0.05); // 50ms, enough to clear both delay taps (15ms/35ms)
-                std::vector<float> in(static_cast<size_t>(n) * 2, 0.0f);
-                for (int f = 0; f < n; ++f) {
+                int numFrames = static_cast<int>(kSR * 0.05); // 50ms, enough to clear both delay taps (15ms/35ms)
+                std::vector<float> in(static_cast<size_t>(numFrames) * 2, 0.0f);
+                for (int f = 0; f < numFrames; ++f) {
                     // A steady, fully decorrelated (hard-left) signal so the
                     // synthesized ambience has something nonzero to work with.
                     in[static_cast<size_t>(f) * 2 + 0] = 0.6f;
                     in[static_cast<size_t>(f) * 2 + 1] = -0.6f;
                 }
                 auto inOriginal = in;
-                s3dOn.process(in.data(), n);
+                s3dOn.process(in.data(), numFrames);
 
                 bool everDiffered = false;
                 for (size_t i = 0; i < in.size(); ++i) {
@@ -6080,7 +6080,7 @@ int main(int argc, char* argv[]) {
                 // downmix) must be preserved exactly, sample-by-sample,
                 // regardless of intensity.
                 bool monoSumPreserved = true;
-                for (int f = 0; f < n; ++f) {
+                for (int f = 0; f < numFrames; ++f) {
                     float outSum = in[static_cast<size_t>(f) * 2 + 0] + in[static_cast<size_t>(f) * 2 + 1];
                     float inSum = inOriginal[static_cast<size_t>(f) * 2 + 0] + inOriginal[static_cast<size_t>(f) * 2 + 1];
                     if (std::fabs(outSum - inSum) > 1e-4f) {
@@ -6129,11 +6129,11 @@ int main(int argc, char* argv[]) {
                         if (b == (3 * kBlocks) / 4) toggle3d.setEnabled(true);
                         std::vector<float> block(static_cast<size_t>(kBlock) * 2);
                         for (int i = 0; i < kBlock; ++i) {
-                            const int n = b * kBlock + i;
+                            const int sampleIdx = b * kBlock + i;
                             block[static_cast<size_t>(i) * 2] =
-                                kAmp * static_cast<float>(std::sin(2.0 * M_PI * kLeftHz * n / kSR));
+                                kAmp * static_cast<float>(std::sin(2.0 * M_PI * kLeftHz * sampleIdx / kSR));
                             block[static_cast<size_t>(i) * 2 + 1] =
-                                kAmp * static_cast<float>(std::sin(2.0 * M_PI * kRightHz * n / kSR));
+                                kAmp * static_cast<float>(std::sin(2.0 * M_PI * kRightHz * sampleIdx / kSR));
                         }
                         toggle3d.process(block.data(), kBlock);
                         rendered.insert(rendered.end(), block.begin(), block.end());
@@ -6170,15 +6170,15 @@ int main(int argc, char* argv[]) {
                 // a bug in SpatialDownmixer itself.
                 naikav::dsp::SpatialDownmixer dmLoud;
                 dmLoud.configure(SL::FIVEPOINT1_SIDE, kSR);
-                int n = static_cast<int>(kSR * 0.05); // 50ms, clears the ~8ms surround delay
-                std::vector<float> loudIn(static_cast<size_t>(n) * 6, 0.0f);
-                for (int f = 0; f < n; ++f) {
+                int numFrames = static_cast<int>(kSR * 0.05); // 50ms, clears the ~8ms surround delay
+                std::vector<float> loudIn(static_cast<size_t>(numFrames) * 6, 0.0f);
+                for (int f = 0; f < numFrames; ++f) {
                     loudIn[static_cast<size_t>(f) * 6 + 0] = 0.95f; // FL
                     loudIn[static_cast<size_t>(f) * 6 + 2] = 0.95f; // FC
                     loudIn[static_cast<size_t>(f) * 6 + 4] = 0.95f; // SL
                 }
-                std::vector<float> downmixed(static_cast<size_t>(n) * 2, 0.0f);
-                dmLoud.process(loudIn.data(), n, downmixed.data());
+                std::vector<float> downmixed(static_cast<size_t>(numFrames) * 2, 0.0f);
+                dmLoud.process(loudIn.data(), numFrames, downmixed.data());
                 const float downmixedPeak = std::accumulate(
                     downmixed.begin(), downmixed.end(), 0.0f,
                     [](float acc, float v) { return std::max(acc, std::fabs(v)); });
@@ -6203,8 +6203,8 @@ int main(int argc, char* argv[]) {
                 widenerChain.setWidth(live.widenerWidth);
 
                 auto beforeFinalLimiter = downmixed;
-                s3dChain.process(beforeFinalLimiter.data(), n);
-                widenerChain.process(beforeFinalLimiter.data(), n);
+                s3dChain.process(beforeFinalLimiter.data(), numFrames);
+                widenerChain.process(beforeFinalLimiter.data(), numFrames);
                 const float chainedPeak = std::accumulate(
                     beforeFinalLimiter.begin(), beforeFinalLimiter.end(), 0.0f,
                     [](float acc, float v) { return std::max(acc, std::fabs(v)); });
@@ -6220,7 +6220,7 @@ int main(int argc, char* argv[]) {
                 finalSafety.configure(2, kSR);
                 finalSafety.setCeilingDb(0.0f);
                 auto afterFinalLimiter = beforeFinalLimiter;
-                finalSafety.process(afterFinalLimiter.data(), n);
+                finalSafety.process(afterFinalLimiter.data(), numFrames);
                 const float finalPeak = std::accumulate(
                     afterFinalLimiter.begin(), afterFinalLimiter.end(), 0.0f,
                     [](float acc, float v) { return std::max(acc, std::fabs(v)); });
@@ -6239,15 +6239,15 @@ int main(int argc, char* argv[]) {
             constexpr int kSR = 48000;
             constexpr int kChunk = 1024;
 
-            auto fillSine = [&](std::vector<float>& buf, double freqHz, float amplitude, int startSample, int n) {
-                for (int i = 0; i < n; ++i) {
+            auto fillSine = [&](std::vector<float>& buf, double freqHz, float amplitude, int startSample, int numSamples) {
+                for (int i = 0; i < numSamples; ++i) {
                     float s = amplitude * static_cast<float>(std::sin(2.0 * M_PI * freqHz * (startSample + i) / kSR));
                     buf[static_cast<size_t>(i) * 2] = s;
                     buf[static_cast<size_t>(i) * 2 + 1] = s;
                 }
             };
-            auto peakOf = [&](const std::vector<float>& buf, int n) {
-                return std::accumulate(buf.begin(), buf.begin() + n * 2, 0.0f,
+            auto peakOf = [&](const std::vector<float>& buf, int numSamples) {
+                return std::accumulate(buf.begin(), buf.begin() + numSamples * 2, 0.0f,
                                         [](float acc, float s) { return std::max(acc, std::fabs(s)); });
             };
 
@@ -6260,9 +6260,9 @@ int main(int argc, char* argv[]) {
                 std::vector<float> buf(kChunk * 2);
                 int total = kSR; // 1 second of -6dBFS 1kHz sine
                 for (int start = 0; start < total; start += kChunk) {
-                    int n = std::min(kChunk, total - start);
-                    fillSine(buf, 1000.0, 0.5f, start, n);
-                    meter.feed(buf.data(), n);
+                    int chunkFrames = std::min(kChunk, total - start);
+                    fillSine(buf, 1000.0, 0.5f, start, chunkFrames);
+                    meter.feed(buf.data(), chunkFrames);
                 }
                 double measured = meter.getIntegratedLufs();
                 test_assert(measured > -70.0, "LoudnessMeter: produces a real integrated reading after ~1s of audio");
@@ -6304,9 +6304,9 @@ int main(int argc, char* argv[]) {
                 int total = kSR * 2; // 2 seconds
                 float lastOutputPeak = 0.0f;
                 for (int start = 0; start < total; start += kChunk) {
-                    int n = std::min(kChunk, total - start);
-                    fillSine(buf, 1000.0, inputAmplitude, start, n);
-                    norm.process(buf.data(), n);
+                    int chunkFrames = std::min(kChunk, total - start);
+                    fillSine(buf, 1000.0, inputAmplitude, start, chunkFrames);
+                    norm.process(buf.data(), chunkFrames);
                     // Metering no longer happens inside process(): the
                     // audio thread only queues, and a normal thread drains.
                     // In the real player that drain is
@@ -6315,7 +6315,7 @@ int main(int argc, char* argv[]) {
                     // for that. See LoudnessNormalizer's class comment.
                     norm.serviceMetering();
                     if (start + kChunk >= total) {
-                        lastOutputPeak = peakOf(buf, n);
+                        lastOutputPeak = peakOf(buf, chunkFrames);
                     }
                 }
                 test_assert(lastOutputPeak < inputAmplitude * 0.9f,
@@ -6392,9 +6392,9 @@ int main(int argc, char* argv[]) {
                     auto renderBlock = [&](int blockIndex, std::vector<float>& into) {
                         std::vector<float> block(static_cast<size_t>(kBlock) * 2);
                         for (int i = 0; i < kBlock; ++i) {
-                            const int n = blockIndex * kBlock + i;
+                            const int sampleIdx = blockIndex * kBlock + i;
                             const float v = kAmp * static_cast<float>(
-                                std::sin(2.0 * M_PI * kToneHz * n / kSampleRate));
+                                std::sin(2.0 * M_PI * kToneHz * sampleIdx / kSampleRate));
                             block[static_cast<size_t>(i) * 2] = v;
                             block[static_cast<size_t>(i) * 2 + 1] = v;
                         }
@@ -6981,11 +6981,7 @@ int main(int argc, char* argv[]) {
 
                 // Test 4-11: each of saveFrameAsPng()'s internal failure
                 // branches, one real FFmpeg call forced to fail at a time.
-                struct FailCase {
-                    std::atomic<bool>* flag;
-                    const char* label;
-                };
-                const FailCase failCases[] = {
+                const std::pair<std::atomic<bool>*, const char*> failCases[] = {
                     {&force_find_encoder_fail, "avcodec_find_encoder"},
                     {&force_alloc_fail, "avcodec_alloc_context3"},
                     {&force_open_fail, "avcodec_open2"},
@@ -6995,10 +6991,10 @@ int main(int argc, char* argv[]) {
                 };
                 for (const auto& fc : failCases) {
                     AVFrame* f = makeSynthFrame();
-                    *fc.flag = true;
+                    *fc.first = true;
                     auto r = FrameExporter::saveFrameAsPng(f, "synthetic_video.mp4", 5.0, "test_screenshots");
-                    *fc.flag = false;
-                    test_assert(!r.success, (std::string("FrameExporter: fails gracefully when ") + fc.label + "() fails").c_str());
+                    *fc.first = false;
+                    test_assert(!r.success, (std::string("FrameExporter: fails gracefully when ") + fc.second + "() fails").c_str());
                     av_frame_free(&f);
                 }
                 // force_frame_alloc_fail (the RGB frame) needs open_finished

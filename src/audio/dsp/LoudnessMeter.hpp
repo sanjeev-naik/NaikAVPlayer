@@ -149,7 +149,8 @@ public:
         // A null frame signals end-of-stream. Nothing useful to do if the
         // source rejects it -- drain whatever the filter already produced
         // either way.
-        (void)av_buffersrc_add_frame(m_active.srcCtx, nullptr);
+        const int flushRet = av_buffersrc_add_frame(m_active.srcCtx, nullptr);
+        (void)flushRet;
         drainSink();
     }
 
