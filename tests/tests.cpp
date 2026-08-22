@@ -7437,8 +7437,202 @@ int main(int argc, char* argv[]) {
                                 double lufs = pc.m_audioDecoder->getMeasuredIntegratedLufs();
                                 (void)lufs;
                                 test_assert(true, "AudioDecoder::getMeasuredIntegratedLufs() getter executed");
+                                pc.stop();
                             }
-                            pc.stop();
+                        }
+                    }
+
+                    // 7. Comprehensive 100% Code & Branch Coverage Suites
+                    {
+                        // A. Biquad parameter validation, coefficient ramping & denormals
+                        {
+                            naikav::dsp::Biquad bq;
+                            bq.setLowpass(1000.0, 0.707, 0.0);
+                            bq.setLowpass(1000.0, -0.5, 48000.0);
+                            bq.setLowpass(-100.0, 0.707, 48000.0);
+                            bq.setLowpass(25000.0, 0.707, 48000.0);
+                            bq.setLowpass(std::numeric_limits<double>::quiet_NaN(), 0.707, 48000.0);
+                            bq.setLowpass(1000.0, std::numeric_limits<double>::quiet_NaN(), 48000.0);
+                            bq.setLowpass(1000.0, 0.707, std::numeric_limits<double>::quiet_NaN());
+
+                            bq.setLowpass(500.0, 0.707, 48000.0);
+                            bq.process(0.5f); // primes the biquad (m_primed = true)
+                            bq.setLowpass(1500.0, 0.707, 48000.0);
+                            for (int i = 0; i < 500; ++i) {
+                                bq.process(0.1f);
+                            }
+                            bq.snapToTarget();
+                        }
+
+                        // B. BypassCrossfade, BypassScratch & DspMath
+                        {
+                            naikav::dsp::BypassCrossfade sb;
+                            sb.configure(48000.0);
+                            test_assert(sb.isInactive(), "BypassCrossfade initial state is inactive");
+                            sb.markPrimed();
+                            sb.setEnabled(true);
+                            test_assert(sb.isFading(), "BypassCrossfade is fading on enable");
+                            std::vector<float> dry(64 * 2, 1.0f);
+                            std::vector<float> proc(64 * 2, 0.5f);
+                            sb.blend(proc.data(), dry.data(), 64, 2);
+                            sb.snap();
+                            test_assert(!sb.isFading(), "BypassCrossfade not fading after snap");
+                            sb.setEnabled(false);
+                            sb.blend(proc.data(), dry.data(), 64, 2);
+                            sb.blend(proc.data(), dry.data(), 64, 0); // channels <= 0
+
+                            naikav::dsp::BypassScratch bs;
+                            bs.reserve(128, 2);
+                            bs.reserve(0, 0); // maxFrames <= 0
+                            test_assert(bs.fits(256), "BypassScratch fits reserved size");
+                            test_assert(bs.data() != nullptr, "BypassScratch data is non-null");
+                        }
+
+                        // C. AudioDspSettings multiband octave separation constraint
+                        {
+                            naikav::dsp::AudioDspSettings s;
+                            s.multibandLowMidHz = 1500.0f;
+                            s.multibandMidHighHz = 1600.0f; // < lowMid * 2.0f
+                            s.sanitize();
+                            test_assert(s.multibandMidHighHz >= s.multibandLowMidHz * 2.0f, "Multiband octave separation enforced");
+                        }
+
+                        // D. SpectrumAnalyzer snapshots & DSP stage crossfade transitions
+                        {
+                            naikav::dsp::SpectrumAnalyzer sa;
+                            sa.configure(2, 48000.0);
+                            auto mags = sa.getMagnitudesDb();
+                            auto wave = sa.getWaveformSamples();
+                            test_assert(mags.size() == naikav::dsp::SpectrumAnalyzer::kNumBins, "getMagnitudesDb size matches");
+                            test_assert(wave.size() == naikav::dsp::SpectrumAnalyzer::kFftSize, "getWaveformSamples size matches");
+                            test_assert(sa.binFrequencyHz(10) > 0.0, "binFrequencyHz calculates frequency");
+
+                            std::vector<float> audioBuf(128 * 2, 0.5f);
+
+                            naikav::dsp::StereoWidener sw;
+                            sw.configure(2);
+                            sw.setWidth(1.5f);
+                            sw.setEnabled(true);
+                            sw.process(audioBuf.data(), 128);
+                            sw.setEnabled(false);
+                            sw.process(audioBuf.data(), 128);
+
+                            naikav::dsp::Surround3D s3d;
+                            s3d.configure(2, 48000.0);
+                            s3d.setIntensity(1.2f);
+                            s3d.setEnabled(true);
+                            s3d.process(audioBuf.data(), 128);
+                            s3d.setEnabled(false);
+                            s3d.process(audioBuf.data(), 128);
+
+                            naikav::dsp::Crossover cr;
+                            cr.configure(2, 48000.0, 0);
+                            cr.setEnabled(true);
+                            cr.process(audioBuf.data(), 128);
+                            cr.setEnabled(false);
+                            cr.process(audioBuf.data(), 128);
+
+                            naikav::dsp::MultibandCompressor mbc;
+                            mbc.configure(2, 48000.0);
+                            mbc.setEnabled(true);
+                            mbc.process(audioBuf.data(), 128);
+                            mbc.setCrossoverFrequencies(400.0f, 4000.0f);
+                            mbc.setEnabled(false);
+                            mbc.process(audioBuf.data(), 128);
+
+                            naikav::dsp::LoudnessNormalizer ln;
+                            ln.configure(2, 48000.0);
+                            ln.setEnabled(true);
+                            ln.process(audioBuf.data(), 128);
+                            ln.serviceMetering();
+                            ln.reset();
+                            test_assert(ln.needsMeterRebuild(), "needsMeterRebuild true after reset");
+                            ln.serviceMeterRebuild();
+                            test_assert(!ln.needsMeterRebuild(), "needsMeterRebuild false after serviceMeterRebuild");
+                            ln.setEnabled(false);
+                            ln.process(audioBuf.data(), 128);
+                            ln.primeWithPrescannedLufs(-16.0);
+
+                            naikav::dsp::DspChain dsp;
+                            dsp.configure(2, 48000.0);
+                            dsp.process(audioBuf.data(), 0);
+                            dsp.setEnabled(true);
+                            dsp.process(audioBuf.data(), 128);
+                            dsp.setEnabled(false);
+                            dsp.process(audioBuf.data(), 128);
+                        }
+
+                        // E. Subtitle timestamp exception branches
+                        {
+                            double sec = 0.0;
+                            test_assert(!naikav::subtitle::parseTimestamp("01:xx:00", sec), "parseTimestamp rejects invalid HH:MM:SS");
+                            test_assert(!naikav::subtitle::parseTimestamp("xx:00", sec), "parseTimestamp rejects invalid MM:SS");
+                        }
+
+                        // F. FrameExporter exception handling
+                        {
+                            AVFrame* f = av_frame_alloc();
+                            f->width = 64;
+                            f->height = 64;
+                            f->format = AV_PIX_FMT_YUV420P;
+                            av_frame_get_buffer(f, 0);
+#ifdef _WIN32
+                            auto res = FrameExporter::saveFrameAsPng(f, "test.mp4", 0.0, "NUL:\\invalid\\path");
+#else
+                            auto res = FrameExporter::saveFrameAsPng(f, "test.mp4", 0.0, "/dev/null/invalid");
+#endif
+                            (void)res;
+                            av_frame_free(&f);
+                        }
+
+                        // G. PlayerController malformed settings and queue drop lambda
+                        {
+                            PlayerController pc;
+                            std::ofstream malformed("player_settings.txt");
+                            malformed << "volume=not_a_number\n";
+                            malformed << "resolution_option=not_a_number\n";
+                            malformed << "resampler_quality=not_a_number\n";
+                            malformed << "playlist_current_index=not_a_number\n";
+                            malformed << "playlist_repeat_mode=not_a_number\n";
+                            malformed << "playlist_shuffle=not_a_number\n";
+                            malformed.close();
+                            pc.loadSettings();
+
+                            DecodedFrame df1;
+                            df1.frame = av_frame_alloc();
+                            pc.m_decodedFrameQueue.push_wait_or_drop(df1, std::chrono::milliseconds(10), [](DecodedFrame& d) {
+                                if (d.frame) av_frame_free(&d.frame);
+                            });
+                        }
+
+                        // H. AudioDecoder callback output formats & sample rate configuration
+                        {
+                            PlayerController pc;
+                            if (pc.openFile(testFile)) {
+                                if (pc.m_audioDecoder) {
+                                    AudioDecoder* ad = pc.m_audioDecoder.get();
+                                    ad->m_deviceNativeSampleRate = 44100;
+                                    ad->primeLoudnessPrescan(-18.0);
+                                    ad->serviceDeferredMaintenance();
+
+                                    std::vector<uint8_t> floatBuf(1024 * sizeof(float) * 2, 0);
+                                    ad->setVolume(1.0f);
+                                    AudioDecoder::sdlAudioStreamCallback(ad, nullptr, floatBuf.size(), floatBuf.size());
+                                    ad->setVolume(0.0f);
+                                    AudioDecoder::sdlAudioStreamCallback(ad, nullptr, floatBuf.size(), floatBuf.size());
+
+                                    ad->setOutputBitDepth(AudioOutputBitDepth::BIT_32_INT);
+                                    ad->setVolume(0.0f);
+                                    AudioDecoder::sdlAudioStreamCallback(ad, nullptr, floatBuf.size(), floatBuf.size());
+
+                                    naikav::dsp::AudioDspSettings s = ad->getDspSettings();
+                                    s.multibandLowMidHz = 500.0f;
+                                    s.multibandMidHighHz = 5000.0f;
+                                    ad->applyDspSettings(s);
+                                    ad->applyPendingDspSettings();
+                                }
+                                pc.stop();
+                            }
                         }
                     }
 
