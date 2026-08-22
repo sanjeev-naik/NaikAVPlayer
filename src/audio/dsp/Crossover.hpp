@@ -70,6 +70,8 @@ public:
         m_mainLowpassStage1.assign(static_cast<size_t>(channels), Biquad{});
         m_mainLowpassStage2.assign(static_cast<size_t>(channels), Biquad{});
         m_fade.configure(sampleRate);
+        m_lfeGlide.configure(sampleRate, m_lfeGain);
+        m_redirectMix.configure(sampleRate, m_bassRedirectEnabled ? 1.0f : 0.0f);
         rebuildCoefficients();
         reset();
     }
@@ -83,7 +85,19 @@ public:
     void reserveBlock(int maxFrames) { m_dry.reserve(maxFrames, m_channels); }
 
     // See the class comment above. No effect unless setEnabled(true) too.
-    void setBassRedirectEnabled(bool enabled) { m_bassRedirectEnabled = enabled; }
+    //
+    // Crossfaded, not switched. This is its own signal-path change on top
+    // of the stage's enable flag -- every non-LFE channel swaps between
+    // full-range and highpassed, and the LFE gains or loses the whole
+    // redirected sum -- so flipping it outright stepped the waveform on
+    // every channel at once: measured at 56x its own per-sample slope,
+    // the largest single discontinuity in the folder. It got missed
+    // because the stage's setEnabled() *was* crossfaded, and this reads
+    // like a sub-option of it rather than a second switch.
+    void setBassRedirectEnabled(bool enabled) {
+        m_bassRedirectEnabled = enabled;
+        m_redirectMix.setTarget(enabled ? 1.0f : 0.0f);
+    }
     bool isBassRedirectEnabled() const { return m_bassRedirectEnabled; }
 
     // Level trim for the LFE/subwoofer channel, in dB, applied to whatever
@@ -97,6 +111,12 @@ public:
         m_lfeGainDb = std::clamp(db, -24.0f, 12.0f);
         m_lfeGain = (m_lfeGainDb == 0.0f) ? 1.0f
                                           : std::pow(10.0f, m_lfeGainDb / 20.0f);
+        // Glided rather than applied outright: this is a dragged trim and
+        // it multiplies the LFE channel directly, so a bare assignment
+        // stepped that channel once per UI frame of the drag -- measured
+        // at 20x the waveform's own per-sample slope for a single 12 dB
+        // change.
+        m_lfeGlide.setTarget(m_lfeGain);
     }
     float getLfeGainDb() const { return m_lfeGainDb; }
 
@@ -119,6 +139,8 @@ public:
 
     void reset() {
         m_fade.reset();
+        m_lfeGlide.reset();
+        m_redirectMix.reset();
         m_lfeLowpassStage1.reset();
         m_lfeLowpassStage2.reset();
         for (auto& f : m_mainHighpassStage1) f.reset();
@@ -135,6 +157,8 @@ public:
             return;
         }
         m_fade.markPrimed(); // live even while bypassed -- see DspChain
+        m_lfeGlide.markPrimed();
+        m_redirectMix.markPrimed();
         if (m_fade.isInactive()) {
             return;
         }
@@ -153,24 +177,31 @@ public:
             lfeSample = m_lfeLowpassStage2.process(lfeSample);
 
             float redirectedBass = 0.0f;
-            if (m_bassRedirectEnabled) {
+            // Advanced every frame whether or not the redirect is running,
+            // so the glide keeps time with the audio rather than with how
+            // often this branch happens to be taken.
+            const float redirect = m_redirectMix.next();
+            if (redirect > 0.0f) {
+                const float direct = 1.0f - redirect;
                 for (int ch = 0; ch < m_channels; ++ch) {
                     if (ch == m_targetChannel) continue;
                     const float original = frame[ch];
 
                     float low = m_mainLowpassStage1[ch].process(original);
                     low = m_mainLowpassStage2[ch].process(low);
-                    redirectedBass += low;
+                    redirectedBass += low * redirect;
 
                     float high = m_mainHighpassStage1[ch].process(original);
                     high = m_mainHighpassStage2[ch].process(high);
-                    frame[ch] = high;
+                    // Blend toward the untouched channel rather than
+                    // swapping to the highpassed one outright.
+                    frame[ch] = high * redirect + original * direct;
                 }
             }
 
-            // Unity sum -- see the class comment. m_lfeGain is exactly
-            // 1.0f unless the user has dialled in a trim.
-            frame[m_targetChannel] = (lfeSample + redirectedBass) * m_lfeGain;
+            // Unity sum -- see the class comment. The glided gain is
+            // exactly 1.0f unless the user has dialled in a trim.
+            frame[m_targetChannel] = (lfeSample + redirectedBass) * m_lfeGlide.next();
         }
         if (fading) {
             m_fade.blend(interleaved, m_dry.data(), numFrames, m_channels);
@@ -216,10 +247,12 @@ private:
     BypassCrossfade m_fade;
     BypassScratch m_dry;
     bool m_bassRedirectEnabled = false;
+    SmoothedParam m_redirectMix;
     double m_cutoffHz = 120.0;
     double m_sampleRate = 48000.0;
     float m_lfeGainDb = 0.0f;
     float m_lfeGain = 1.0f;
+    SmoothedParam m_lfeGlide;
 };
 
 } // namespace naikav::dsp

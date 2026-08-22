@@ -521,6 +521,7 @@ bool AudioDecoder::init() {
     m_widener.configure(m_outChannels);
     m_widener.configureFade(m_outSampleRate);
     m_balance.configure(m_outChannels);
+    m_balance.configureFade(m_outSampleRate); // glide length for the L/R trim
     m_spectrum.configure(m_outChannels, m_outSampleRate);
     // Deliberately NOT enabled here. AudioDspSettings defaults it to
     // false, and applyDspSettings() is what honours that -- forcing it on
@@ -685,6 +686,7 @@ void AudioDecoder::decodeAndResample() {
         m_spatialDownmixer.reset();
         m_surround3d.reset();
         m_widener.reset();
+        m_balance.reset();
         m_spectrum.reset();
         m_finalSafetyLimiter.reset();
         m_audioBufferIndex = 0;
@@ -1304,8 +1306,15 @@ void AudioDecoder::applyPendingDspSettings() {
     m_dsp.multiband.high.setThresholdDb(settings.multibandHighThresholdDb);
     m_dsp.multiband.high.setRatio(settings.multibandHighRatio);
 
-    // Same idea: 0dB ceiling is the Limiter's inert state.
-    m_dsp.limiter.setCeilingDb(settings.limiterEnabled ? settings.limiterCeilingDb : 0.0f);
+    // Same idea: 0dB ceiling is the Limiter's inert state. Gated on
+    // dspEnabled as well, because DspChain runs this limiter
+    // unconditionally now -- it is outside the master bypass crossfade so
+    // that its lookahead delay line never freezes mid-stream (see
+    // DspChain's class comment). A master-disabled chain must still be
+    // gain-transparent, and 0 dBFS is what makes it so.
+    m_dsp.limiter.setCeilingDb((settings.dspEnabled && settings.limiterEnabled)
+                                   ? settings.limiterCeilingDb
+                                   : 0.0f);
     m_dsp.crossover.setEnabled(settings.crossoverEnabled);
     if (first || prev.crossoverCutoffHz != settings.crossoverCutoffHz) {
         m_dsp.crossover.setCutoffHz(settings.crossoverCutoffHz);
@@ -1327,19 +1336,21 @@ void AudioDecoder::applyPendingDspSettings() {
     m_spectrum.setEnabled(settings.spectrumAnalyzerEnabled);
 
     // Tracks the user's actual effective Limiter ceiling -- "effective"
-    // meaning dspEnabled must also be true, since DspChain::process() (and
-    // therefore m_dsp.limiter) is skipped entirely when dspEnabled is
-    // false, same as m_dsp.setEnabled() above. Falls back to a plain
-    // 0dBFS backstop otherwise; see m_finalSafetyLimiter's doc comment.
+    // meaning dspEnabled must also be true, since m_dsp.limiter is held at
+    // an inert 0dBFS whenever the chain is master-disabled (see the
+    // setCeilingDb call above), same as m_dsp.setEnabled(). Falls back to
+    // a plain 0dBFS backstop otherwise; see m_finalSafetyLimiter's doc
+    // comment.
     m_finalSafetyLimiter.setCeilingDb((settings.dspEnabled && settings.limiterEnabled) ? settings.limiterCeilingDb : 0.0f);
 
     m_currentDspSettings = settings;
     m_appliedMailboxSeq = seq;
     m_hasAppliedDspSettings = true;
 
-    // Enabling/disabling the chain adds or removes its limiter's
-    // lookahead, which changes total output latency -- recompute so
-    // getAudioClock() stays correct across the toggle.
+    // Chain latency no longer changes with the master bypass -- the
+    // limiter's lookahead is now constant across a toggle, deliberately
+    // (see DspChain::getLatencyFrames()). Still recomputed here because a
+    // sample-rate change reaches this path too.
     updateDspLatency();
 }
 

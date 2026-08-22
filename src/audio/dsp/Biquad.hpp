@@ -147,6 +147,18 @@ public:
         return static_cast<float>(y);
     }
 
+    // Clears the running state (x/y history) without touching the
+    // coefficients or the primed flag.
+    //
+    // For a filter being taken out of the signal path: its history is
+    // about to become arbitrarily old, and at the near-identity
+    // coefficients such a filter is parked at, stale y[n-1]/y[n-2] in the
+    // feedback terms would burst on the first sample it is switched back
+    // in. reset() would do this too, but it also unprimes -- which would
+    // make the next set*() snap rather than ramp, reintroducing exactly
+    // the discontinuity the parking is there to avoid.
+    void clearState() { m_x1 = m_x2 = m_y1 = m_y2 = 0.0; }
+
     // Forces any in-flight coefficient ramp to complete immediately.
     // Callers reconfiguring a stopped filter (or reset()) want the new
     // response from the very first sample, not a ramp in from the old one.

@@ -58,12 +58,23 @@ public:
     void configure(int channels, double sampleRate) {
         m_channels = channels;
         m_sampleRate = sampleRate;
+        m_ceilingGlide.configure(sampleRate, m_ceilingDb);
         updateTimeConstants();
         updateLookaheadBuffer();
         reset();
     }
 
-    void setCeilingDb(float db) { m_ceilingDb = std::min(0.0f, db); }
+    void setCeilingDb(float db) {
+        if (!std::isfinite(db)) return;
+        m_ceilingDb = std::min(0.0f, db);
+        // Glided, not stepped. The ceiling drives the hard clamp as well
+        // as the gain computer, and the clamp has no smoothing of its own
+        // -- so lowering it applied instantly chopped the 3ms of audio
+        // already sitting in the delay line, whose gain envelope had been
+        // computed against the *old* ceiling. Measured at 19x the
+        // waveform's own per-sample slope for a single 12 dB change.
+        m_ceilingGlide.setTarget(m_ceilingDb);
+    }
     void setReleaseMs(float ms) {
         m_releaseMs = std::max(0.01f, ms);
         updateTimeConstants();
@@ -83,6 +94,7 @@ public:
 
     void reset() {
         m_envelopeDb = 0.0f;
+        m_ceilingGlide.reset();
         std::fill(m_delayBuffer.begin(), m_delayBuffer.end(), 0.0f);
         m_writePos = 0;
         m_frameCounter = 0;
@@ -92,10 +104,21 @@ public:
 
     void process(float* interleaved, int numFrames) {
         if (m_channels <= 0 || numFrames <= 0) return;
+        m_ceilingGlide.markPrimed();
 
-        const float ceilingLinear = fastDbToLinear(m_ceilingDb);
+        // Hoisted while the ceiling is not moving, which is the overwhelming
+        // majority of blocks -- this limiter runs unconditionally (both the
+        // chain's and AudioDecoder's always-on safety one), so a needless
+        // per-sample conversion here is paid on every frame of playback.
+        const bool ceilingMoving = !m_ceilingGlide.isSteady();
+        float ceilingDb = m_ceilingGlide.current();
+        float ceilingLinear = fastDbToLinear(ceilingDb);
 
         for (int f = 0; f < numFrames; ++f) {
+            if (ceilingMoving) {
+                ceilingDb = m_ceilingGlide.next();
+                ceilingLinear = fastDbToLinear(ceilingDb);
+            }
             float* frame = interleaved + static_cast<size_t>(f) * m_channels;
 
             // 1. Measure this incoming (pre-delay) frame's peak and fold
@@ -131,7 +154,7 @@ public:
             // 2. Brick-wall gain computer, driven by the future-inclusive
             //    window peak rather than only the current sample.
             const float levelDb = fastLinearToDb(windowPeak + 1e-9f);
-            const float targetReductionDb = std::min(0.0f, m_ceilingDb - levelDb);
+            const float targetReductionDb = std::min(0.0f, ceilingDb - levelDb);
             const float coeff = (targetReductionDb < m_envelopeDb) ? m_attackCoeff : m_releaseCoeff;
             m_envelopeDb = coeff * m_envelopeDb + (1.0f - coeff) * targetReductionDb;
             // Exactly 1.0 when no reduction is called for, so an inert
@@ -199,6 +222,7 @@ private:
     double m_sampleRate = 48000.0;
 
     float m_ceilingDb = 0.0f; // 0 dBFS = inert by default
+    SmoothedParam m_ceilingGlide;
     float m_attackMs = 1.0f;  // deliberately very fast; not user-configurable (this is a limiter, not a compressor)
     float m_releaseMs = 50.0f;
     float m_attackCoeff = 0.0f;
@@ -223,12 +247,21 @@ private:
     // Fixed-capacity monotonic deque over [n - lookahead, n]. m_head and
     // m_tail grow monotonically and are masked on use, so no wrap
     // bookkeeping is needed beyond the mask.
+    //
+    // int64_t, not int, for the same reason m_frameCounter is: these only
+    // ever increment, once per frame, and are never rebased. As int they
+    // overflow after 2^31 frames -- 12.4 hours at 48kHz -- which is signed
+    // overflow (UB), and the masked index derived from a negative value
+    // indexes outside the ring. reset() zeroes them on every seek and
+    // track change, so the chain's own limiter would rarely reach it, but
+    // AudioDecoder::m_finalSafetyLimiter runs unconditionally for as long
+    // as playback continues. At 64 bits the wrap is ~6 million years away.
     int64_t m_frameCounter = 0;
     std::vector<float> m_maxVal;
     std::vector<int64_t> m_maxIdx;
-    int m_head = 0;
-    int m_tail = 0;
-    int m_mask = 0;
+    int64_t m_head = 0;
+    int64_t m_tail = 0;
+    int64_t m_mask = 0;
 };
 
 } // namespace naikav::dsp

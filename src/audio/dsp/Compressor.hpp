@@ -37,6 +37,8 @@ public:
         m_channels = channels;
         m_sampleRate = sampleRate;
         m_detector.configure(sampleRate);
+        m_makeupGlide.configure(sampleRate, m_makeupGainDb);
+        m_bypassGlide.configure(sampleRate);
         updateTimeConstants();
         reset();
     }
@@ -48,7 +50,15 @@ public:
     void setThresholdDb(float db) { m_thresholdDb = db; }
     void setRatio(float ratio) { m_ratio = std::max(1.0f, ratio); }
     void setKneeDb(float db) { m_kneeDb = std::max(0.0f, db); }
-    void setMakeupGainDb(float db) { m_makeupGainDb = db; }
+    void setMakeupGainDb(float db) {
+        if (!std::isfinite(db)) return;
+        m_makeupGainDb = db;
+        // Glided in dB rather than assigned: makeup is a dragged slider
+        // applied straight to every sample, so a bare assignment stepped
+        // the output once per UI frame of the drag -- measured at 7x the
+        // waveform's own per-sample slope for a single 6 dB change.
+        m_makeupGlide.setTarget(db);
+    }
     void setAttackMs(float ms) {
         m_attackMs = std::max(0.01f, ms);
         updateTimeConstants();
@@ -68,16 +78,24 @@ public:
     void reset() {
         m_envelopeDb = 0.0f; // 0 dB = no gain reduction, i.e. the inert/idle state
         m_detector.reset();
+        m_makeupGlide.reset();
+        m_bypassGlide.reset();
     }
 
     // In-place processing of an interleaved float buffer.
     void process(float* interleaved, int numFrames) {
         if (m_channels <= 0 || numFrames <= 0) return;
+        m_makeupGlide.markPrimed();
         if (isInert()) {
             // Keep the envelope and detector at rest so re-enabling the
             // stage starts from a known state rather than a stale one.
             m_envelopeDb = 0.0f;
             m_detector.reset();
+            // ...but glide whatever reduction was in force back to unity
+            // first. Returning outright dropped it in a single sample --
+            // 43x the waveform's own slope on a ratio change from 8:1 to
+            // 1:1. See BypassGainGlide.
+            m_bypassGlide.applyGlide(interleaved, numFrames, m_channels);
             return;
         }
 
@@ -95,11 +113,14 @@ public:
             const float coeff = (gr < m_envelopeDb) ? m_attackCoeff : m_releaseCoeff;
             m_envelopeDb = coeff * m_envelopeDb + (1.0f - coeff) * gr;
 
-            const float totalDb = m_envelopeDb + m_makeupGainDb;
+            const float totalDb = m_envelopeDb + m_makeupGlide.next();
             const float gainLinear = (totalDb == 0.0f) ? 1.0f : fastDbToLinear(totalDb);
             for (int ch = 0; ch < m_channels; ++ch) {
                 frame[ch] *= gainLinear;
             }
+            // Remembered so that if the next block finds this stage inert,
+            // it has somewhere to glide down from rather than snapping.
+            m_bypassGlide.track(gainLinear);
         }
     }
 
@@ -136,6 +157,8 @@ private:
     float m_releaseCoeff = 0.0f;
 
     LevelDetector m_detector;
+    SmoothedParam m_makeupGlide;
+    BypassGainGlide m_bypassGlide;
     float m_envelopeDb = 0.0f; // 0 dB = no gain reduction, i.e. the inert/idle state
 };
 

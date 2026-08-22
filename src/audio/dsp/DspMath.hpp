@@ -334,6 +334,143 @@ private:
     bool m_primed = false;
 };
 
+// Per-sample glide for a scalar parameter -- the companion to
+// BypassCrossfade above, for the controls it does not cover.
+//
+// That crossfade was added for every stage's enable/disable *flag*, and
+// Biquad ramps every *filter coefficient*, but the plain scalar
+// parameters in between were left stepping on the next sample: balance,
+// stereo width, 3D intensity, LFE trim, compressor makeup, limiter
+// ceiling. Those are exactly the controls a user drags rather than
+// clicks, so they emit not one discontinuity but one per UI frame for as
+// long as the drag lasts. Measured against the waveform's own per-sample
+// slope, a single balance change of 0.8 stepped 38x, a width sweep 16x,
+// an LFE trim 20x -- all of them audible, and all of them the same fault
+// the enable flags had already been fixed for.
+//
+// Glides linearly to the target over kGlideMs, recomputing the step per
+// setTarget() so the glide takes the same time regardless of how far it
+// has to travel -- a slider dragged in small increments then tracks the
+// hand smoothly instead of arriving in a series of 8ms jumps.
+//
+// Same primed idiom as Biquad and BypassCrossfade: a stage configured
+// before any audio has run snaps, so the first block already carries the
+// full setting rather than gliding in from a default.
+class SmoothedParam {
+public:
+    void configure(double sampleRate, float initial) {
+        m_glideSamples = (sampleRate > 0.0)
+            ? std::max(1, static_cast<int>(std::lround(sampleRate * (kGlideMs / 1000.0))))
+            : 1;
+        m_current = m_target = initial;
+        m_step = 0.0f;
+        m_primed = false;
+    }
+
+    void setTarget(float target) {
+        if (!std::isfinite(target) || target == m_target) return;
+        m_target = target;
+        if (!m_primed) {
+            m_current = m_target;
+            m_step = 0.0f;
+            return;
+        }
+        m_step = std::fabs(m_target - m_current) / static_cast<float>(m_glideSamples);
+        if (m_step <= 0.0f) m_current = m_target;
+    }
+
+    float target() const { return m_target; }
+    float current() const { return m_current; }
+
+    // Snap to the target and forget that audio ever ran, so a stage
+    // reconfigured while stopped applies its setting from the first sample.
+    void reset() {
+        m_current = m_target;
+        m_step = 0.0f;
+        m_primed = false;
+    }
+
+    void markPrimed() { m_primed = true; }
+
+    // True when the value has arrived, so a stage that is inert at the
+    // target can skip its per-sample work entirely.
+    bool isSteady() const { return m_current == m_target; }
+
+    // Advances one frame and returns the value to use for it.
+    inline float next() {
+        if (m_current != m_target) {
+            m_current = (m_current < m_target) ? std::min(m_target, m_current + m_step)
+                                               : std::max(m_target, m_current - m_step);
+        }
+        return m_current;
+    }
+
+private:
+    static constexpr float kGlideMs = 8.0f; // matches BypassCrossfade
+    int m_glideSamples = 1;
+    float m_current = 0.0f;
+    float m_target = 0.0f;
+    float m_step = 0.0f;
+    bool m_primed = false;
+};
+
+// Glides a stage's applied gain back to exactly unity when the stage goes
+// inert, instead of dropping it between one sample and the next.
+//
+// The stages whose whole effect reduces to one scalar gain --
+// LoudnessNormalizer, Compressor, NoiseGate -- each return early the
+// moment their parameters make them a no-op. Whatever correction was in
+// force at that instant (8 dB of loudness normalization, a compressor's
+// accumulated gain reduction) then vanished in a single sample: measured
+// at up to 43x the waveform's own per-sample slope, the loudest clicks
+// left in the pipeline.
+//
+// None of them need BypassCrossfade's dry-copy scratch to fix it.
+// Blending gain g against dry at mix m is algebraically the single gain
+// 1 + m*(g-1), so gliding the gain back to unity *is* the crossfade, at
+// no memory cost and with no second buffer to keep in sync.
+//
+// The owning stage calls track() with whatever gain it applied on its
+// active path, and applyGlide() on its inert path; once settled() is true
+// the stage is a genuine no-op again and can return immediately.
+class BypassGainGlide {
+public:
+    void configure(double sampleRate) {
+        m_fadeSamples = (sampleRate > 0.0)
+            ? std::max(1.0f, static_cast<float>(sampleRate) * (kFadeMs / 1000.0f))
+            : 1.0f;
+        m_gain = 1.0f;
+    }
+
+    void reset() { m_gain = 1.0f; }
+    void track(float appliedGain) { m_gain = appliedGain; }
+    bool settled() const { return m_gain == 1.0f; }
+    // Where the glide has got to, for a stage that keeps its own copy of
+    // the applied gain and needs the two to stay in step.
+    float gain() const { return m_gain; }
+
+    void applyGlide(float* interleaved, int numFrames, int channels) {
+        if (settled() || channels <= 0 || numFrames <= 0) return;
+        // Approached from either side: a stage can be cutting (loudness
+        // normalizing a hot track, a compressor reducing) or boosting.
+        const float step = (1.0f - m_gain) / m_fadeSamples;
+        float g = m_gain;
+        for (int f = 0; f < numFrames; ++f) {
+            g = (step > 0.0f) ? std::min(1.0f, g + step) : std::max(1.0f, g + step);
+            float* frame = interleaved + static_cast<size_t>(f) * channels;
+            for (int c = 0; c < channels; ++c) {
+                frame[c] *= g;
+            }
+        }
+        m_gain = g;
+    }
+
+private:
+    static constexpr float kFadeMs = 8.0f; // matches BypassCrossfade
+    float m_fadeSamples = 1.0f;
+    float m_gain = 1.0f;
+};
+
 // Scratch buffer a stage keeps for its bypass crossfade, sized once by
 // reserveBlock() so process() never reaches the allocator. When it is too
 // small (only possible if reserveBlock was never called for the block size

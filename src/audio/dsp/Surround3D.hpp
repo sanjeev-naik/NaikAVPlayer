@@ -79,6 +79,7 @@ public:
         m_longRing.assign(static_cast<size_t>(longCap), 0.0f);
 
         m_fade.configure(m_sampleRate);
+        m_wetGlide.configure(m_sampleRate, m_intensity);
         m_shortLowpass.setLowpass(kShortLowpassHz, 0.70710678118, m_sampleRate);
         m_longLowpass.setLowpass(kLongLowpassHz, 0.70710678118, m_sampleRate);
         updateMixGains();
@@ -104,6 +105,7 @@ public:
 
     void reset() {
         m_fade.reset();
+        m_wetGlide.reset();
         std::fill(m_shortRing.begin(), m_shortRing.end(), 0.0f);
         std::fill(m_longRing.begin(), m_longRing.end(), 0.0f);
         m_shortPos = 0;
@@ -119,7 +121,12 @@ public:
             return;
         }
         m_fade.markPrimed(); // live even while bypassed -- see DspChain
-        if (m_fade.isInactive() || m_intensity <= 0.0f) {
+        m_wetGlide.markPrimed();
+        // Zero intensity *and* settled. A glide still on its way down to
+        // zero has ambience left to fade out; cutting it off here is the
+        // step this glide exists to remove.
+        if (m_fade.isInactive() || (m_intensity <= 0.0f && m_wetGlide.isSteady())) {
+            feedDelaysOnly(interleaved, numFrames);
             return;
         }
         const size_t total = static_cast<size_t>(numFrames) * 2u;
@@ -130,8 +137,12 @@ public:
             m_fade.snap();
         }
         const float dry = m_dryGain;
-        const float wet = m_wetGain;
         for (int f = 0; f < numFrames; ++f) {
+            // Glided per sample: intensity is a dragged slider and it
+            // scales the injected ambience directly, so assigning it
+            // outright stepped the output once per UI frame of the drag
+            // -- measured at 9x the waveform's own per-sample slope.
+            const float wet = m_wetGlide.next();
             float* frame = interleaved + static_cast<size_t>(f) * 2;
             const float side = 0.5f * (frame[0] - frame[1]);
 
@@ -161,12 +172,40 @@ public:
     }
 
 private:
+    // Advances both early-reflection rings while the stage emits nothing,
+    // so their contents stay contiguous with the signal actually playing.
+    //
+    // Returning outright instead froze the rings mid-stream. Re-enabling
+    // then injected ~15ms and ~35ms of ambience built from side content
+    // captured during the *previous* enabled period -- after a track
+    // change, from a different file -- and then stepped to live content
+    // once the taps caught up. Measured at 10x the waveform's own
+    // per-sample slope, at exactly +15ms (the short tap) after each
+    // re-enable: the same frozen-delay-line fault DspChain's limiter had,
+    // for the same reason.
+    //
+    // Kept deliberately minimal: a subtract and two stores per frame, no
+    // filtering and no output. The two lowpasses are left idle because
+    // they resume from zero state into a correct tap signal, which is a
+    // few samples of natural filter attack rather than a discontinuity --
+    // and it happens while the crossfade is still near fully dry.
+    void feedDelaysOnly(const float* interleaved, int numFrames) {
+        for (int f = 0; f < numFrames; ++f) {
+            const float* frame = interleaved + static_cast<size_t>(f) * 2;
+            const float side = 0.5f * (frame[0] - frame[1]);
+            m_shortRing[static_cast<size_t>(m_shortPos)] = side;
+            m_shortPos = (m_shortPos + 1) & m_shortMask;
+            m_longRing[static_cast<size_t>(m_longPos)] = side;
+            m_longPos = (m_longPos + 1) & m_longMask;
+        }
+    }
+
     // Dry passes untouched; the ambience is added at the intensity the
     // user asked for. See the class comment for why there is no
     // compensating attenuation on the dry path.
     void updateMixGains() {
         m_dryGain = 1.0f;
-        m_wetGain = m_intensity;
+        m_wetGlide.setTarget(m_intensity);
     }
 
     static constexpr double kShortDelayMs = 15.0, kLongDelayMs = 35.0;
@@ -190,7 +229,7 @@ private:
     BypassScratch m_dry;
     float m_intensity = 1.0f;
     float m_dryGain = 1.0f;
-    float m_wetGain = 1.0f;
+    SmoothedParam m_wetGlide;
 };
 
 } // namespace naikav::dsp

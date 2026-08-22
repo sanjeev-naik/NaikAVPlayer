@@ -49,7 +49,10 @@ public:
 
     // Sample rate is only needed for the bypass crossfade's length; the
     // width transform itself is stateless.
-    void configureFade(double sampleRate) { m_fade.configure(sampleRate); }
+    void configureFade(double sampleRate) {
+        m_fade.configure(sampleRate);
+        m_glidingWidth.configure(sampleRate, m_width);
+    }
 
     // Sizes the crossfade's dry-copy scratch so process() never allocates.
     void reserveBlock(int maxFrames) { m_dry.reserve(maxFrames, 2); }
@@ -63,15 +66,22 @@ public:
     void setWidth(float width) {
         if (!std::isfinite(width)) return;
         m_width = std::clamp(width, 0.0f, 4.0f);
+        // Glided, not stepped -- width is a dragged slider, and the side
+        // component is scaled by it directly, so a bare assignment steps
+        // the waveform once per UI frame of the drag. Measured at 16x the
+        // signal's own per-sample slope across a 1.0 -> 3.0 sweep.
+        m_glidingWidth.setTarget(m_width);
     }
     float getWidth() const { return m_width; }
 
-    // Intentionally empty: this stage is stateless (mid-side width is a
-    // per-sample computation with no history to clear). Kept as a non-static
-    // member so every DSP stage exposes the same reset() interface for
-    // callers that reset the chain uniformly.
-    // cppcheck-suppress functionStatic
-    void reset() { m_fade.reset(); }
+    // The width transform itself is stateless (a per-sample computation
+    // with no history), so all there is to clear is the bypass crossfade
+    // and the width glide -- both snapped to their targets, so a stage
+    // reset while stopped resumes at full effect from the first sample.
+    void reset() {
+        m_fade.reset();
+        m_glidingWidth.reset();
+    }
 
     // In-place processing of an interleaved float buffer. No-op unless
     // enabled and configured for exactly 2 channels. Also skipped at
@@ -81,7 +91,10 @@ public:
             return;
         }
         m_fade.markPrimed(); // live even while bypassed -- see DspChain
-        if (m_fade.isInactive() || m_width == 1.0f) {
+        m_glidingWidth.markPrimed();
+        // Unity *and* settled: a width glide still travelling back toward
+        // 1.0 has work left to do, and abandoning it here would step.
+        if (m_fade.isInactive() || (m_width == 1.0f && m_glidingWidth.isSteady())) {
             return;
         }
         const size_t total = static_cast<size_t>(numFrames) * 2u;
@@ -91,8 +104,8 @@ public:
         } else if (m_fade.isFading()) {
             m_fade.snap();
         }
-        const float w = m_width;
         for (int f = 0; f < numFrames; ++f) {
+            const float w = m_glidingWidth.next();
             float* frame = interleaved + static_cast<size_t>(f) * 2;
             const float mid = 0.5f * (frame[0] + frame[1]);
             const float side = 0.5f * (frame[0] - frame[1]) * w;
@@ -109,6 +122,7 @@ private:
     BypassCrossfade m_fade;
     BypassScratch m_dry;
     float m_width = 1.0f;
+    SmoothedParam m_glidingWidth;
 };
 
 } // namespace naikav::dsp

@@ -28,6 +28,36 @@ namespace naikav::dsp {
 // present in the delivered output, while costing full CPU (over half the
 // entire inert chain's budget at 7.1) for no effect at all. Skipping is
 // both bit-exact and free.
+//
+// But a band may only *leave* the path once it has already ramped down to
+// unity, and must be back in the path before it ramps up again. Dropping
+// it the instant its gain crossed the threshold took a filter carrying
+// 12 dB of boost -- and 12 dB of accumulated state -- out of the signal
+// in a single sample: measured at 54x the waveform's own per-sample slope
+// for a 5-band preset change, and 29x in the other direction. Note the
+// click is there even though the band is algebraically unity at the
+// crossing point; what steps is the filter's *state*, not its gain, which
+// is exactly what Biquad's coefficient ramp exists to handle and what
+// skipping went around.
+//
+// So an inactive band is designed at 0 dB rather than torn out, which
+// lets the existing ramp glide it toward unity, and its contribution is
+// additionally faded out before it leaves the path. Both are needed.
+// Ramping the coefficients alone is not enough, and the reason is worth
+// stating: at 0 dB the coefficients are an identity *transfer function*,
+// but a filter only realises that identity in steady state. Its stored
+// y[n-1]/y[n-2] still describe the boost it was applying a moment ago, so
+// its output is converging toward its input rather than equal to it, and
+// how long that takes is set by the pole radius -- tens of milliseconds
+// for a low-frequency, high-Q band. Dropping the band at the instant the
+// coefficient ramp ended therefore still stepped, by 23x the waveform's
+// own per-sample slope, now at exactly kRampSamples after the change.
+//
+// The per-band fade bounds that: the band's contribution is crossfaded
+// back to its own input over a fixed few milliseconds regardless of pole
+// radius, and only then does it leave the list. Steady state is unchanged
+// -- once faded out the band is dropped and the EQ is bit-exact and free
+// again, exactly as above.
 class ParametricEQ {
 public:
     static constexpr int kNumBands = 5;
@@ -53,6 +83,9 @@ public:
         m_channels = channels;
         m_sampleRate = sampleRate;
         m_filters.assign(static_cast<size_t>(kNumBands) * channels, Biquad{});
+        for (int b = 0; b < kNumBands; ++b) {
+            m_bandMix[b].configure(sampleRate, bandIsActive(m_bands[b]) ? 1.0f : 0.0f);
+        }
         // Re-clamp every band against the new Nyquist limit before
         // rebuilding, so a rate change cannot leave a band above it.
         for (int b = 0; b < kNumBands; ++b) {
@@ -102,16 +135,42 @@ public:
         return (band >= 0 && band < kNumBands) ? m_bands[band].q : 0.0;
     }
 
-    // True when every band sits at 0 dB, so the whole stage is skipped.
+    // True when no band is doing anything and none is still ramping down,
+    // so the whole stage is skipped.
     bool isInert() const { return m_activeCount == 0; }
 
     // In-place processing of an interleaved float buffer (numFrames *
     // m_channels samples).
     void process(float* interleaved, int numFrames) {
-        if (m_channels <= 0 || numFrames <= 0 || m_activeCount == 0) return;
+        if (m_channels <= 0 || numFrames <= 0) return;
+
+        // Every filter, not only the ones about to run, and *before* the
+        // flat-EQ early return below. Audio is flowing through this stage
+        // even when every band sits at 0 dB, so the filters count as live
+        // from here -- same reasoning as BypassCrossfade::markPrimed().
+        // Priming only the bands being processed meant a flat EQ never
+        // primed at all, so the first band the user touched snapped in at
+        // full strength instead of ramping: 29x the waveform's own
+        // per-sample slope, and the fix for the other direction did not
+        // help because this path never reached it.
+        for (auto& f : m_filters) {
+            f.markPrimed();
+        }
+        for (auto& m : m_bandMix) {
+            m.markPrimed();
+        }
+        if (m_activeCount == 0) return;
 
         const int active = m_activeCount;
+        std::array<float, kNumBands> mix{};
         for (int f = 0; f < numFrames; ++f) {
+            // Advanced once per frame, before the channel loop -- every
+            // channel of a frame must see the same mix, and the glide has
+            // to keep time with the audio rather than with the channel
+            // count.
+            for (int i = 0; i < active; ++i) {
+                mix[static_cast<size_t>(i)] = m_bandMix[m_activeBands[i]].next();
+            }
             float* frame = interleaved + static_cast<size_t>(f) * m_channels;
             for (int ch = 0; ch < m_channels; ++ch) {
                 float sample = frame[ch];
@@ -122,21 +181,26 @@ public:
                 // dependency and the mutation.
                 for (int i = 0; i < active; ++i) {
                     // cppcheck-suppress useStlAlgorithm
-                    sample = filterAt(m_activeBands[i], ch).process(sample);
+                    const float wet = filterAt(m_activeBands[i], ch).process(sample);
+                    const float m = mix[static_cast<size_t>(i)];
+                    // Fully wet is the overwhelmingly common case -- a band
+                    // sitting at its setting -- and must stay bit-exact, so
+                    // it is taken as an exact branch rather than as a blend
+                    // that happens to evaluate to the same thing.
+                    sample = (m == 1.0f) ? wet : (wet * m + sample * (1.0f - m));
                 }
                 frame[ch] = sample;
             }
         }
 
-        for (int i = 0; i < active; ++i) {
-            for (int ch = 0; ch < m_channels; ++ch) {
-                filterAt(m_activeBands[i], ch).markPrimed();
-            }
-        }
+        // A band that has finished ramping down to unity can now leave the
+        // path, which is what restores the bit-exact/zero-cost steady state.
+        refreshActiveBands();
     }
 
     void reset() {
         for (auto& f : m_filters) f.reset();
+        for (int b = 0; b < kNumBands; ++b) m_bandMix[b].reset();
         rebuildAllCoefficients();
     }
 
@@ -157,22 +221,24 @@ private:
     }
 
     void rebuildBandCoefficients(int band) {
-        refreshActiveBands();
-        if (m_channels <= 0 || m_sampleRate <= 0.0) return;
-        if (!bandIsActive(m_bands[band])) {
-            // Nothing to design: the band is skipped in process(). Clear
-            // its state so re-enabling it later starts clean rather than
-            // resuming from history that is now arbitrarily old.
-            for (int ch = 0; ch < m_channels; ++ch) {
-                filterAt(band, ch).reset();
-            }
+        if (m_channels <= 0 || m_sampleRate <= 0.0) {
+            refreshActiveBands();
             return;
         }
+        // An inactive band is designed at 0 dB -- algebraically unity --
+        // rather than left undesigned, so a filter that has already
+        // processed audio *ramps* to unity through the same machinery a
+        // gain change uses, instead of being yanked out of the path. See
+        // the class comment.
+        const bool activeNow = bandIsActive(m_bands[band]);
+        const float gainDb = activeNow ? m_bands[band].gainDb : 0.0f;
         Biquad reference;
-        reference.setPeaking(m_bands[band].freqHz, m_bands[band].q, m_bands[band].gainDb, m_sampleRate);
+        reference.setPeaking(m_bands[band].freqHz, m_bands[band].q, gainDb, m_sampleRate);
         for (int ch = 0; ch < m_channels; ++ch) {
             filterAt(band, ch).copyCoefficientsFrom(reference);
         }
+        m_bandMix[band].setTarget(activeNow ? 1.0f : 0.0f);
+        refreshActiveBands();
     }
 
     void rebuildAllCoefficients() {
@@ -181,18 +247,39 @@ private:
         }
     }
 
-    // Compacts the indices of the non-flat bands, so process()'s inner
-    // loop iterates only over bands that actually do something.
+    // True while any of this band's per-channel filters is still gliding
+    // toward its new coefficients.
+    bool bandIsRamping(int band) {
+        for (int ch = 0; ch < m_channels; ++ch) {
+            if (filterAt(band, ch).isRamping()) return true;
+        }
+        return false;
+    }
+
+    // Compacts the indices of the bands process()'s inner loop must run:
+    // the non-flat ones, plus any still ramping down to unity after being
+    // flattened. A band that is neither has its state cleared as it leaves
+    // the path, so switching it back on later cannot resume from history
+    // that is by then arbitrarily old.
     void refreshActiveBands() {
         m_activeCount = 0;
         for (int b = 0; b < kNumBands; ++b) {
-            if (bandIsActive(m_bands[b])) {
+            // Kept in the path until it is flat, has finished ramping, and
+            // has finished fading -- all three, or the drop itself steps.
+            if (bandIsActive(m_bands[b]) || bandIsRamping(b) || !m_bandMix[b].isSteady()) {
                 m_activeBands[static_cast<size_t>(m_activeCount++)] = b;
+            } else {
+                for (int ch = 0; ch < m_channels; ++ch) {
+                    filterAt(b, ch).clearState();
+                }
             }
         }
     }
 
     std::array<BandConfig, kNumBands> m_bands;
+    // Per-band wet/dry mix, so a band entering or leaving the processing
+    // list does so over a few milliseconds instead of in one sample.
+    std::array<SmoothedParam, kNumBands> m_bandMix;
     std::vector<Biquad> m_filters; // [band * channels + channel]
     std::array<int, kNumBands> m_activeBands{};
     int m_activeCount = 0;

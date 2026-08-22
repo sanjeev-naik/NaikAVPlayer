@@ -5538,10 +5538,27 @@ int main(int argc, char* argv[]) {
                 naikav::dsp::DspChain chain;
                 chain.configure(2, kSR, -1); // no LFE channel
                 test_assert(!chain.isEnabled(), "DspChain: disabled by default");
+
+                // A disabled chain is gain-transparent, not bit-identical:
+                // the Limiter runs unconditionally (it sits outside the
+                // master bypass crossfade so its lookahead delay line can
+                // never freeze mid-stream -- see DspChain's class comment),
+                // so the output is the input shifted by that fixed
+                // lookahead and nothing else.
+                const int bypassLookahead = chain.limiter.getLookaheadFrames();
                 auto buf = genSine(1000.0, 1000, 2, 0.5f);
                 auto original = buf;
-                chain.process(buf.data(), 1000); // no-op while disabled
-                test_assert(buf == original, "DspChain: process() is a true no-op while disabled");
+                chain.process(buf.data(), 1000);
+                double bypassDiff = 0.0;
+                for (int f = bypassLookahead; f < 1000; ++f) {
+                    for (int ch = 0; ch < 2; ++ch) {
+                        bypassDiff = std::max(bypassDiff, static_cast<double>(std::fabs(
+                            buf[static_cast<size_t>(f) * 2 + ch] -
+                            original[static_cast<size_t>(f - bypassLookahead) * 2 + ch])));
+                    }
+                }
+                test_assert(bypassDiff == 0.0,
+                            "DspChain: process() while disabled is gain-transparent (input delayed by the Limiter's fixed lookahead, unaltered)");
 
                 chain.setEnabled(true); // all sub-components still at their inert defaults
                 // The chain's Limiter stage still holds a fixed lookahead
@@ -5562,6 +5579,282 @@ int main(int argc, char* argv[]) {
                     }
                 }
                 test_assert(maxDiff < 0.01, "DspChain: enabled with all-default (flat/unity/inert) settings is near-identity, aside from the Limiter's fixed lookahead delay");
+
+                // Latency must not move when the master bypass is toggled.
+                // When it did, the crossfade was blending the dry snapshot
+                // at frame n against a wet path at n - lookahead, and the
+                // seam where the delay line ran out was an audible click.
+                naikav::dsp::DspChain latencyChain;
+                latencyChain.configure(2, kSR, -1);
+                const int latencyOff = latencyChain.getLatencyFrames();
+                latencyChain.setEnabled(true);
+                const int latencyOn = latencyChain.getLatencyFrames();
+                test_assert(latencyOff == latencyOn && latencyOn == latencyChain.limiter.getLookaheadFrames(),
+                            "DspChain: reported latency is constant across a master bypass toggle");
+
+                // Regression: toggling the master bypass mid-stream must not
+                // introduce a waveform discontinuity. Measured against the
+                // signal's own per-sample slope, so the bound is a property
+                // of the waveform rather than a magic number. Before the
+                // limiter was moved outside the crossfade this reached 57x
+                // that slope, always at exactly +lookahead frames after each
+                // toggle -- the point where the (frozen, and therefore
+                // stale) delay line ran out and stepped to the live signal.
+                {
+                    constexpr double kToggleFreq = 97.0;
+                    constexpr float kToggleAmp = 0.5f;
+                    constexpr int kBlock = 480;
+                    constexpr int kBlocks = 80;
+                    const double naturalSlope =
+                        kToggleAmp * 2.0 * M_PI * kToggleFreq / kSR;
+
+                    naikav::dsp::DspChain toggleChain;
+                    toggleChain.configure(2, kSR, -1);
+                    toggleChain.reserveBlock(kBlock);
+
+                    auto source = genSine(kToggleFreq, kBlock * kBlocks, 2, kToggleAmp);
+                    std::vector<float> processed;
+                    processed.reserve(source.size());
+                    for (int b = 0; b < kBlocks; ++b) {
+                        // Off for the first quarter, on for the second, off
+                        // again, then back on -- the re-enable is the case
+                        // that replayed audio from the previous enabled run.
+                        if (b == kBlocks / 4) toggleChain.setEnabled(true);
+                        if (b == kBlocks / 2) toggleChain.setEnabled(false);
+                        if (b == (3 * kBlocks) / 4) toggleChain.setEnabled(true);
+                        std::vector<float> block(
+                            source.begin() + static_cast<size_t>(b) * kBlock * 2,
+                            source.begin() + static_cast<size_t>(b + 1) * kBlock * 2);
+                        toggleChain.process(block.data(), kBlock);
+                        processed.insert(processed.end(), block.begin(), block.end());
+                    }
+
+                    double worstStep = 0.0;
+                    const int totalFrames = kBlock * kBlocks;
+                    // Skip the leading lookahead: the delay line starts full
+                    // of zeros, so the very first real sample is a legitimate
+                    // (and unavoidable) step out of silence.
+                    for (int f = toggleChain.limiter.getLookaheadFrames() + 1; f < totalFrames; ++f) {
+                        worstStep = std::max(worstStep, static_cast<double>(std::fabs(
+                            processed[static_cast<size_t>(f) * 2] -
+                            processed[static_cast<size_t>(f - 1) * 2])));
+                    }
+                    test_assert(worstStep < naturalSlope * 3.0,
+                                "DspChain: toggling the master bypass mid-stream produces no waveform discontinuity");
+                }
+            }
+
+            // --- Parameter glides: dragged controls must not step ---
+            //
+            // BypassCrossfade covers every *enable flag* and Biquad ramps
+            // every *filter coefficient*, but the plain scalar parameters
+            // in between were left applying on the next sample. Those are
+            // exactly the controls a user drags rather than clicks, so
+            // each emitted a discontinuity per UI frame for the whole
+            // drag, not merely one at the end. Measured against the
+            // waveform's own per-sample slope before the fix: balance 38x,
+            // LFE trim 20x, limiter ceiling 19x, width 16x, 3D intensity
+            // 9x, compressor makeup 7x, and the compressor/gate inert
+            // transitions 43x and 36x.
+            {
+                constexpr int kBlock = 480;
+                constexpr int kBlocks = 60;
+                constexpr float kAmp = 0.4f;
+                constexpr double kLeftHz = 97.0, kRightHz = 151.0;
+                const double naturalSlope = kAmp * 2.0 * M_PI * kRightHz / kSR;
+                const double bound = naturalSlope * 3.0;
+
+                // Runs a control-mutating callback across a decorrelated
+                // stereo (or multichannel) stream and returns the worst
+                // per-sample step left anywhere in the output.
+                auto worstStepUnder = [&](int channels,
+                                          const std::function<void(int, float*, int)>& runBlock) {
+                    std::vector<float> out;
+                    out.reserve(static_cast<size_t>(kBlock) * kBlocks * channels);
+                    for (int b = 0; b < kBlocks; ++b) {
+                        std::vector<float> buf(static_cast<size_t>(kBlock) * channels);
+                        for (int i = 0; i < kBlock; ++i) {
+                            const int n = b * kBlock + i;
+                            const float l = kAmp * static_cast<float>(std::sin(2.0 * M_PI * kLeftHz * n / kSR));
+                            const float r = kAmp * static_cast<float>(std::sin(2.0 * M_PI * kRightHz * n / kSR));
+                            for (int c = 0; c < channels; ++c) {
+                                buf[static_cast<size_t>(i) * channels + c] = (c % 2 == 0) ? l : r;
+                            }
+                        }
+                        runBlock(b, buf.data(), kBlock);
+                        out.insert(out.end(), buf.begin(), buf.end());
+                    }
+                    double worst = 0.0;
+                    for (size_t f = 1; f < out.size() / channels; ++f) {
+                        for (int c = 0; c < channels; ++c) {
+                            worst = std::max(worst, static_cast<double>(std::fabs(
+                                out[f * channels + c] - out[(f - 1) * channels + c])));
+                        }
+                    }
+                    return worst;
+                };
+
+                {
+                    naikav::dsp::BalanceControl bal;
+                    bal.configure(2);
+                    bal.configureFade(kSR);
+                    test_assert(worstStepUnder(2, [&](int b, float* p, int n) {
+                                    if (b == 20) bal.setBalance(-0.8f);
+                                    if (b == 40) bal.setBalance(0.0f);
+                                    bal.process(p, n);
+                                }) < bound,
+                                "BalanceControl: a balance change glides instead of stepping the gain");
+                }
+                {
+                    naikav::dsp::StereoWidener wid;
+                    wid.configure(2);
+                    wid.configureFade(kSR);
+                    wid.reserveBlock(kBlock);
+                    wid.setEnabled(true);
+                    test_assert(worstStepUnder(2, [&](int b, float* p, int n) {
+                                    if (b % 10 == 0) wid.setWidth(1.0f + (b / 10) * 0.4f);
+                                    wid.process(p, n);
+                                }) < bound,
+                                "StereoWidener: a width sweep glides instead of stepping the side gain");
+                }
+                {
+                    naikav::dsp::Surround3D s3d;
+                    s3d.configure(2, kSR);
+                    s3d.reserveBlock(kBlock);
+                    s3d.setEnabled(true);
+                    test_assert(worstStepUnder(2, [&](int b, float* p, int n) {
+                                    if (b % 10 == 0) s3d.setIntensity((b / 10) * 0.4f);
+                                    s3d.process(p, n);
+                                }) < bound,
+                                "Surround3D: an intensity sweep glides instead of stepping the ambience gain");
+                }
+                {
+                    naikav::dsp::DspChain chain;
+                    chain.configure(6, kSR, 3); // 5.1 with a discrete LFE
+                    chain.reserveBlock(kBlock);
+                    chain.setEnabled(true);
+                    chain.crossover.setEnabled(true);
+                    chain.crossover.setBassRedirectEnabled(true);
+                    test_assert(worstStepUnder(6, [&](int b, float* p, int n) {
+                                    if (b == 20) chain.crossover.setLfeGainDb(-12.0f);
+                                    if (b == 40) chain.crossover.setLfeGainDb(0.0f);
+                                    chain.process(p, n);
+                                }) < bound,
+                                "Crossover: an LFE trim change glides instead of stepping that channel");
+                }
+                {
+                    naikav::dsp::DspChain chain;
+                    chain.configure(2, kSR, -1);
+                    chain.reserveBlock(kBlock);
+                    chain.setEnabled(true);
+                    chain.compressor.setThresholdDb(-30.0f);
+                    test_assert(worstStepUnder(2, [&](int b, float* p, int n) {
+                                    if (b == 20) chain.compressor.setRatio(8.0f);
+                                    if (b == 40) chain.compressor.setRatio(1.0f); // back to inert
+                                    chain.process(p, n);
+                                }) < bound,
+                                "Compressor: going inert glides the gain reduction out instead of dropping it");
+                }
+                {
+                    naikav::dsp::DspChain chain;
+                    chain.configure(2, kSR, -1);
+                    chain.reserveBlock(kBlock);
+                    chain.setEnabled(true);
+                    chain.compressor.setThresholdDb(-30.0f);
+                    chain.compressor.setRatio(4.0f);
+                    test_assert(worstStepUnder(2, [&](int b, float* p, int n) {
+                                    if (b == 20) chain.compressor.setMakeupGainDb(6.0f);
+                                    if (b == 40) chain.compressor.setMakeupGainDb(0.0f);
+                                    chain.process(p, n);
+                                }) < bound,
+                                "Compressor: a makeup gain change glides instead of stepping");
+                }
+                {
+                    naikav::dsp::DspChain chain;
+                    chain.configure(2, kSR, -1);
+                    chain.reserveBlock(kBlock);
+                    chain.setEnabled(true);
+                    chain.noiseGate.setThresholdDb(-6.0f);
+                    test_assert(worstStepUnder(2, [&](int b, float* p, int n) {
+                                    if (b == 20) chain.noiseGate.setRatio(8.0f);
+                                    if (b == 40) chain.noiseGate.setRatio(1.0f); // back to inert
+                                    chain.process(p, n);
+                                }) < bound,
+                                "NoiseGate: going inert glides the attenuation out instead of releasing it in one sample");
+                }
+                {
+                    naikav::dsp::DspChain chain;
+                    chain.configure(2, kSR, -1);
+                    chain.reserveBlock(kBlock);
+                    chain.setEnabled(true);
+                    test_assert(worstStepUnder(2, [&](int b, float* p, int n) {
+                                    if (b == 20) chain.limiter.setCeilingDb(-12.0f);
+                                    if (b == 40) chain.limiter.setCeilingDb(0.0f);
+                                    chain.process(p, n);
+                                }) < bound,
+                                "Limiter: a ceiling change glides instead of stepping the clamp");
+                }
+                {
+                    // Bass redirect is a second signal-path switch on top of
+                    // the stage's own enable flag -- it swaps every non-LFE
+                    // channel between full-range and highpassed at once --
+                    // and it was the only one that never got crossfaded.
+                    naikav::dsp::DspChain chain;
+                    chain.configure(6, kSR, 3);
+                    chain.reserveBlock(kBlock);
+                    chain.setEnabled(true);
+                    chain.crossover.setEnabled(true);
+                    test_assert(worstStepUnder(6, [&](int b, float* p, int n) {
+                                    if (b == 20) chain.crossover.setBassRedirectEnabled(true);
+                                    if (b == 40) chain.crossover.setBassRedirectEnabled(false);
+                                    chain.process(p, n);
+                                }) < bound,
+                                "Crossover: toggling bass redirect crossfades instead of swapping the signal path");
+                }
+                {
+                    // A band crossing the activity threshold enters or leaves
+                    // the processing list. Both directions used to step: on
+                    // the way in the filter snapped to full strength, on the
+                    // way out it was dropped while its output was still
+                    // converging toward its input, kRampSamples after the
+                    // change. Exercised at both ends of the range and across
+                    // a whole-preset jump.
+                    naikav::dsp::DspChain chain;
+                    chain.configure(2, kSR, -1);
+                    chain.reserveBlock(kBlock);
+                    chain.setEnabled(true);
+                    test_assert(worstStepUnder(2, [&](int b, float* p, int n) {
+                                    if (b == 15) for (int i = 0; i < naikav::dsp::ParametricEQ::kNumBands; ++i)
+                                        chain.eq.setBandGainDb(i, 12.0f);   // all bands become active
+                                    if (b == 30) for (int i = 0; i < naikav::dsp::ParametricEQ::kNumBands; ++i)
+                                        chain.eq.setBandGainDb(i, -12.0f);  // preset jump, stays active
+                                    if (b == 45) for (int i = 0; i < naikav::dsp::ParametricEQ::kNumBands; ++i)
+                                        chain.eq.setBandGainDb(i, 0.0f);    // all bands go inactive
+                                    chain.process(p, n);
+                                }) < bound,
+                                "ParametricEQ: bands entering and leaving the processing list fade rather than snap");
+
+                    // The skip optimisation must survive the fade: once a
+                    // flattened band has faded out the stage is bit-exact
+                    // again, which is the whole reason for skipping.
+                    naikav::dsp::ParametricEQ settledEq;
+                    settledEq.configure(2, kSR);
+                    settledEq.setBandGainDb(2, 12.0f);
+                    std::vector<float> warm(static_cast<size_t>(kBlock) * 2, 0.25f);
+                    settledEq.process(warm.data(), kBlock);
+                    settledEq.setBandGainDb(2, 0.0f);
+                    for (int b = 0; b < 8; ++b) { // well past both the ramp and the fade
+                        std::vector<float> drain(static_cast<size_t>(kBlock) * 2, 0.1f);
+                        settledEq.process(drain.data(), kBlock);
+                    }
+                    test_assert(settledEq.isInert(),
+                                "ParametricEQ: a flattened band still leaves the processing list once faded out");
+                    std::vector<float> exact(static_cast<size_t>(kBlock) * 2, 0.3f);
+                    auto exactOriginal = exact;
+                    settledEq.process(exact.data(), kBlock);
+                    test_assert(exact == exactOriginal,
+                                "ParametricEQ: a fully flat EQ is bit-exact, not merely near-identity");
+                }
             }
 
             std::cout << "DSP chain unit tests passed!" << std::endl;
@@ -5805,6 +6098,55 @@ int main(int argc, char* argv[]) {
                 auto multiOriginal = multiBuf;
                 s3dMulti.process(multiBuf.data(), 2);
                 test_assert(multiBuf == multiOriginal, "Surround3D: no-op for channel counts other than 2");
+
+                // Regression: toggling the effect mid-stream must not
+                // leave a waveform discontinuity. The early-reflection
+                // rings used to freeze while bypassed, so re-enabling
+                // injected ambience built from the *previous* enabled
+                // period and then stepped to live content once the taps
+                // caught up -- measured at 10x the waveform's own
+                // per-sample slope, at exactly +15ms (the short tap).
+                {
+                    constexpr int kBlock = 480;
+                    constexpr int kBlocks = 80;
+                    constexpr float kAmp = 0.4f;
+                    // Decorrelated L/R, so there is real side energy for
+                    // the ambience taps to act on; the steeper of the two
+                    // sets the slope the transitions are judged against.
+                    constexpr double kLeftHz = 97.0, kRightHz = 151.0;
+                    const double naturalSlope = kAmp * 2.0 * M_PI * kRightHz / kSR;
+
+                    naikav::dsp::Surround3D toggle3d;
+                    toggle3d.configure(2, kSR);
+                    toggle3d.reserveBlock(kBlock);
+                    toggle3d.setIntensity(1.0f);
+
+                    std::vector<float> rendered;
+                    rendered.reserve(static_cast<size_t>(kBlock) * kBlocks * 2);
+                    for (int b = 0; b < kBlocks; ++b) {
+                        if (b == kBlocks / 4) toggle3d.setEnabled(true);
+                        if (b == kBlocks / 2) toggle3d.setEnabled(false);
+                        if (b == (3 * kBlocks) / 4) toggle3d.setEnabled(true);
+                        std::vector<float> block(static_cast<size_t>(kBlock) * 2);
+                        for (int i = 0; i < kBlock; ++i) {
+                            const int n = b * kBlock + i;
+                            block[static_cast<size_t>(i) * 2] =
+                                kAmp * static_cast<float>(std::sin(2.0 * M_PI * kLeftHz * n / kSR));
+                            block[static_cast<size_t>(i) * 2 + 1] =
+                                kAmp * static_cast<float>(std::sin(2.0 * M_PI * kRightHz * n / kSR));
+                        }
+                        toggle3d.process(block.data(), kBlock);
+                        rendered.insert(rendered.end(), block.begin(), block.end());
+                    }
+
+                    double worstStep = 0.0;
+                    for (size_t f = 1; f < rendered.size() / 2; ++f) {
+                        worstStep = std::max(worstStep, static_cast<double>(std::fabs(
+                            rendered[f * 2] - rendered[(f - 1) * 2])));
+                    }
+                    test_assert(worstStep < naturalSlope * 3.0,
+                                "Surround3D: toggling mid-stream produces no waveform discontinuity (delay rings stay fed while bypassed)");
+                }
             }
 
             // --- Post-limiter overshoot / final safety backstop ---
@@ -6027,6 +6369,61 @@ int main(int argc, char* argv[]) {
 
                 norm.clearPrescan();
                 test_assert(!norm.hasPrescannedLoudness(), "LoudnessNormalizer: clearPrescan() reverts to real-time-only measurement");
+
+                // Regression: switching the stage off used to drop the
+                // correction in force -- 8 dB here -- to unity between one
+                // sample and the next, measured at 29x the waveform's own
+                // per-sample slope. It is the only stage in the folder that
+                // never crossfaded its bypass; it now glides the gain back
+                // to unity instead. See LoudnessNormalizer::glideToUnity().
+                {
+                    constexpr double kSampleRate = 48000.0;
+                    constexpr int kBlock = 480;
+                    constexpr float kAmp = 0.4f;
+                    constexpr double kToneHz = 151.0;
+                    const double naturalSlope = kAmp * 2.0 * M_PI * kToneHz / kSampleRate;
+
+                    naikav::dsp::LoudnessNormalizer bypassNorm;
+                    bypassNorm.configure(2, kSampleRate);
+                    bypassNorm.setTargetLufs(-16.0f);
+                    bypassNorm.primeWithPrescannedLufs(-8.0); // wants about -8 dB
+                    bypassNorm.setEnabled(true);
+
+                    auto renderBlock = [&](int blockIndex, std::vector<float>& into) {
+                        std::vector<float> block(static_cast<size_t>(kBlock) * 2);
+                        for (int i = 0; i < kBlock; ++i) {
+                            const int n = blockIndex * kBlock + i;
+                            const float v = kAmp * static_cast<float>(
+                                std::sin(2.0 * M_PI * kToneHz * n / kSampleRate));
+                            block[static_cast<size_t>(i) * 2] = v;
+                            block[static_cast<size_t>(i) * 2 + 1] = v;
+                        }
+                        bypassNorm.process(block.data(), kBlock);
+                        into.insert(into.end(), block.begin(), block.end());
+                    };
+
+                    std::vector<float> rendered;
+                    for (int b = 0; b < 6; ++b) renderBlock(b, rendered);
+                    bypassNorm.setEnabled(false);   // the transition under test
+                    for (int b = 6; b < 12; ++b) renderBlock(b, rendered);
+
+                    double worstStep = 0.0;
+                    for (size_t f = 1; f < rendered.size() / 2; ++f) {
+                        worstStep = std::max(worstStep, static_cast<double>(std::fabs(
+                            rendered[f * 2] - rendered[(f - 1) * 2])));
+                    }
+                    test_assert(worstStep < naturalSlope * 3.0,
+                                "LoudnessNormalizer: disabling mid-stream glides the gain back to unity instead of stepping");
+
+                    // ...and it really does reach unity, so the stage is a
+                    // genuine no-op once the glide has finished rather than
+                    // leaving a residual trim on the signal forever.
+                    std::vector<float> settled(static_cast<size_t>(kBlock) * 2, 0.25f);
+                    auto settledOriginal = settled;
+                    bypassNorm.process(settled.data(), kBlock);
+                    test_assert(settled == settledOriginal,
+                                "LoudnessNormalizer: once the bypass glide reaches unity the stage is bit-transparent");
+                }
             }
 
             // --- LoudnessPrescan: decodes a real file's whole audio

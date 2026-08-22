@@ -66,6 +66,7 @@ public:
         m_channels = channels;
         m_sampleRate = sampleRate;
         m_detector.configure(sampleRate);
+        m_bypassGlide.configure(sampleRate);
         updateTimeConstants();
         reset();
     }
@@ -100,6 +101,7 @@ public:
     void reset() {
         m_envelopeDb = 0.0f; // 0 dB = fully open/no reduction, i.e. the inert/idle state
         m_detector.reset();
+        m_bypassGlide.reset();
     }
 
     // In-place processing of an interleaved float buffer.
@@ -108,6 +110,11 @@ public:
         if (isInert()) {
             m_envelopeDb = 0.0f;
             m_detector.reset();
+            // Glide whatever attenuation the gate was holding back to
+            // unity rather than releasing it in one sample -- measured at
+            // 36x the waveform's own slope on a ratio change from 8:1 to
+            // 1:1. Same reasoning as Compressor; see BypassGainGlide.
+            m_bypassGlide.applyGlide(interleaved, numFrames, m_channels);
             return;
         }
 
@@ -129,6 +136,9 @@ public:
             for (int ch = 0; ch < m_channels; ++ch) {
                 frame[ch] *= gainLinear;
             }
+            // Remembered so a later inert block has somewhere to glide
+            // down from rather than snapping to unity.
+            m_bypassGlide.track(gainLinear);
         }
     }
 
@@ -171,6 +181,7 @@ private:
     float m_releaseCoeff = 0.0f;
 
     LevelDetector m_detector;
+    BypassGainGlide m_bypassGlide;
     float m_envelopeDb = 0.0f; // 0 dB = fully open, i.e. the inert/idle state
 };
 

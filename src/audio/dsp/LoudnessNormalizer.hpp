@@ -64,6 +64,7 @@ public:
         m_meter.configure(channels, static_cast<int>(sampleRate));
         m_channels = channels;
         m_sampleRate = sampleRate;
+        m_bypassGlide.configure(sampleRate);
 
         // Half a second of audio. serviceMetering() is driven at UI frame
         // rate (~16 ms), so this is ~30x the headroom a normal service
@@ -223,9 +224,29 @@ public:
 
     // In-place processing of an interleaved float buffer. No-op (not even
     // measuring) while disabled, matching the rest of this DSP pipeline's
-    // "disabled = truly zero cost" convention.
+    // "disabled = truly zero cost" convention -- but only once the gain
+    // has actually glided back to unity, see below.
     void process(float* interleaved, int numFrames) {
-        if (!m_enabled || numFrames <= 0 || m_channels <= 0) {
+        if (numFrames <= 0 || m_channels <= 0) {
+            return;
+        }
+        if (!m_enabled) {
+            // Switching off used to return here unconditionally, which
+            // dropped whatever correction was in force -- commonly 8 dB or
+            // more on a loud track -- to unity between one sample and the
+            // next. Measured at 29x the waveform's own per-sample slope:
+            // a click, and the largest one left in the pipeline once
+            // DspChain's was fixed. Every other stage in this folder
+            // crossfades its bypass (see BypassCrossfade in DspMath.hpp);
+            // this one never did.
+            //
+            // Shared with Compressor and NoiseGate, which return early on
+            // the same kind of inert condition -- see BypassGainGlide.
+            m_bypassGlide.track(m_appliedGainLinear);
+            m_bypassGlide.applyGlide(interleaved, numFrames, m_channels);
+            // Keep this stage's own record in step, so re-enabling ramps
+            // from the gain actually in force rather than from a stale one.
+            m_appliedGainLinear = m_bypassGlide.gain();
             return;
         }
 
@@ -356,6 +377,9 @@ private:
     // Gain actually applied to the last sample of the previous block, so
     // this block can ramp from it instead of stepping.
     float m_appliedGainLinear = 1.0f;
+    // Walks m_appliedGainLinear back to unity when the stage is switched
+    // off, instead of dropping the correction in a single sample.
+    BypassGainGlide m_bypassGlide;
 };
 
 } // namespace naikav::dsp
