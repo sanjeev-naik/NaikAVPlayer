@@ -1,14 +1,39 @@
-# NaikAVPlayer
+# NaikAVPlayer — High-Performance Cross-Platform C++ Media Engine & Video Player
 
+[![GitHub Repository](https://img.shields.io/badge/GitHub-NaikAVPlayer-181717?style=flat&logo=github)](https://github.com/sanjeev-naik/NaikAVPlayer)
+[![GitHub Releases](https://img.shields.io/github/v/release/sanjeev-naik/NaikAVPlayer?logo=github&label=Release)](https://github.com/sanjeev-naik/NaikAVPlayer/releases)
 [![CI/CD Pipeline](https://github.com/sanjeev-naik/NaikAVPlayer/actions/workflows/ci.yml/badge.svg)](https://github.com/sanjeev-naik/NaikAVPlayer/actions/workflows/ci.yml)
 [![Coverage Status](https://codecov.io/gh/sanjeev-naik/NaikAVPlayer/graph/badge.svg)](https://codecov.io/gh/sanjeev-naik/NaikAVPlayer)
+[![C++ Standard](https://img.shields.io/badge/C%2B%2B-20%2F17-00599C?style=flat&logo=c%2B%2B)](https://en.cppreference.com/)
+[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-blue?style=flat&logo=linux)](https://github.com/sanjeev-naik/NaikAVPlayer)
+[![FFmpeg](https://img.shields.io/badge/FFmpeg-n8.1.2-007808?style=flat&logo=ffmpeg)](https://ffmpeg.org/)
+[![SDL3](https://img.shields.io/badge/SDL-3.4.0-darkblue?style=flat)](https://www.libsdl.org/)
+[![ImGui](https://img.shields.io/badge/Dear%20ImGui-1.91.9-purple?style=flat)](https://github.com/ocornut/imgui)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-NaikAVPlayer is a native, multi-threaded C++17 media engine and video player built using raw FFmpeg APIs, SDL3, and Dear ImGui. It performs container parsing, hardware/software video decoding, sample-accurate audio resampling, and clock synchronization directly using GPU-mapped texture updates without intermediate heavy frameworks. It achieves low-latency seeking and sub-10ms audio-video clock synchronization using dedicated worker threads coordinated through bounded blocking queues and a lock-free Single Producer Single Consumer (SPSC) ring for hot-path telemetry.
+**[NaikAVPlayer](https://github.com/sanjeev-naik/NaikAVPlayer)** is an ultra-fast, native multi-threaded **C++20/C++17 media player and audio-video processing engine** engineered with direct [FFmpeg](https://ffmpeg.org/) libavcodec/libavformat APIs, [SDL3](https://www.libsdl.org/), and [Dear ImGui](https://github.com/ocornut/imgui). Designed for low-latency media rendering and professional audio processing, NaikAVPlayer bypasses bloated middleware frameworks in favor of direct GPU-mapped texture streaming, sub-10ms audio-video synchronization, hardware-accelerated video decoding (D3D11VA, DXVA2, QSV, NVDEC/CUVID, VAAPI, V4L2M2M), and a full 64-bit real-time digital signal processing (DSP) pipeline with [EBU R128](https://tech.ebu.ch/loudness) loudness normalization.
 
-![NaikAVPlayer Screenshot](assets/screenshot.png)
+🔗 **Official Links & Resources:**
+- **Source Code & Repository:** [https://github.com/sanjeev-naik/NaikAVPlayer](https://github.com/sanjeev-naik/NaikAVPlayer)
+- **Binary Releases & Downloads:** [https://github.com/sanjeev-naik/NaikAVPlayer/releases](https://github.com/sanjeev-naik/NaikAVPlayer/releases)
+- **Issue Tracker & Discussions:** [https://github.com/sanjeev-naik/NaikAVPlayer/issues](https://github.com/sanjeev-naik/NaikAVPlayer/issues)
+- **Developer Profile:** [Sanjeev Naik (@sanjeev-naik)](https://github.com/sanjeev-naik)
+
 ---
-![NaikAVPlayer Screenshot](assets/screenshot2.png)
+
+## 📑 Table of Contents
+
+- [Overview & Architecture](#architecture)
+- [Key Features](#key-features)
+- [Hardware Video Acceleration](#dynamic-hardware-decoder-fallback)
+- [Real-Time Audio DSP & Loudness Pipeline](#audio-dsp--loudness-pipeline)
+- [Dedicated Audio-Only Playback & Visualizer](#dedicated-audio-only-playback--real-time-visualizer)
+- [Multiple Audio Tracks & Subtitles](#multiple-audio-track-switching--external-audio)
+- [Building from Source](#build-instructions)
+- [Usage Guide & Hotkeys](#usage-guide)
+- [Frequently Asked Questions (FAQ)](#frequently-asked-questions-faq)
+- [External References & Standards](#external-references--standards)
+- [License & Attributions](#license--attributions)
 
 ---
 
@@ -532,7 +557,37 @@ Every published release package archive includes:
 - **Documentation**: `README.md` and `help.md`
 - **Assets**: Fonts and icons in `assets/`
 
-Automated CI package compliance verification asserts that the executable, `LICENSE`, `README.md`, `help.md`, and non-empty `licenses/` **and** `LICENSES/` directories are all present before publishing artifacts.
+---
+
+## Frequently Asked Questions (FAQ)
+
+### What makes NaikAVPlayer different from standard media players like VLC or MPV?
+NaikAVPlayer is designed as both a standalone, lightweight media player and a high-performance **native C++ reference engine**. It avoids heavy scripting layers and multi-process overhead by utilizing direct [FFmpeg](https://ffmpeg.org/) C APIs, direct GPU texture memory streaming via [SDL3](https://www.libsdl.org/), and an in-process 64-bit float DSP audio processing architecture with zero-allocation real-time loops.
+
+### How does NaikAVPlayer achieve sub-10ms Audio/Video synchronization?
+NaikAVPlayer utilizes an **Audio-Master Clock Reference**. The playback clock is reconstructed sample-accurately directly from the SDL3 audio stream consumer offset, accounting for hardware queue depth and resampling latency. The video thread drops or paces frames against this microsecond-accurate timebase.
+
+### How does EBU R128 loudness normalization work?
+Instead of simple peak normalization that distorts dynamics, NaikAVPlayer implements standard **ITU-R BS.1770-4 / EBU R128** loudness measurement. It supports both real-time gated LUFS tracking and whole-file prescan (`prescanIntegratedLufs()`), instantly applying smooth gain corrections to match your target loudness (e.g. -23 LUFS / -16 LUFS) without clipping or distortion.
+
+### Does NaikAVPlayer support hardware video acceleration on my system?
+Yes. NaikAVPlayer dynamically probes and utilizes platform-specific hardware acceleration:
+- **Windows:** Direct3D 11 Video Acceleration (`D3D11VA`), `DXVA2`, Intel Quick Sync Video (`QSV`), and NVIDIA `NVDEC`/`CUVID`.
+- **Linux:** Video Acceleration API (`VA-API`), `V4L2M2M`, Intel `QSV`, and NVIDIA `NVDEC`.
+If hardware context allocation fails or a codec is unsupported, it automatically falls back to multithreaded software decoding without dropping playback state.
+
+---
+
+## External References & Standards
+
+- **Official Project Repository:** [GitHub - sanjeev-naik/NaikAVPlayer](https://github.com/sanjeev-naik/NaikAVPlayer)
+- **Multimedia Engine Core:** [FFmpeg Official Documentation](https://ffmpeg.org/documentation.html)
+- **Windowing & Audio Backend:** [Simple DirectMedia Layer 3 (SDL3)](https://wiki.libsdl.org/SDL3/FrontPage)
+- **Graphical User Interface:** [Dear ImGui Repository](https://github.com/ocornut/imgui)
+- **Loudness Standards:** [EBU Recommendation R128](https://tech.ebu.ch/loudness) & [ITU-R BS.1770-4](https://www.itu.int/rec/R-REC-BS.1770)
+- **Audio Resampling Engine:** [SoX Resampler Library (libsoxr)](https://sourceforge.net/projects/soxr/)
+- **Microsoft Direct3D Video:** [Direct3D 11 Video APIs (Microsoft Learn)](https://learn.microsoft.com/en-us/windows/win32/medfound/direct3d-11-video-apis)
+- **Linux Video Acceleration:** [Intel VA-API Linux Drivers & Specification](https://github.com/intel/libva)
 
 ---
 

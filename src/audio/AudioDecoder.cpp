@@ -1,4 +1,5 @@
 #include "audio/AudioDecoder.hpp"
+#include "audio/dsp/DspMath.hpp"
 #include <iostream>
 #include <algorithm>
 #include <cstring>
@@ -245,6 +246,60 @@ bool AudioDecoder::init() {
         return false;
     }
 
+    // Resolve the configured device *name* (see setOutputDeviceName()) to
+    // whatever SDL_AudioDeviceID currently maps to it -- empty name (the
+    // default) resolves to SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, identical to
+    // this project's behavior before device selection existed.
+    const SDL_AudioDeviceID targetDeviceId = resolveOutputDeviceId(m_outputDeviceName);
+
+    // Query the target device's native channel count before opening
+    // anything. This is purely diagnostic (see getDeviceNativeChannels()) --
+    // SDL_OpenAudioDeviceStream below will still happily accept a
+    // higher-channel request regardless, since Windows/Linux audio APIs
+    // transparently downmix in shared mode. That means a successful open()
+    // with N channels does NOT by itself prove N-channel hardware is
+    // actually connected; this query is what lets the UI tell the user
+    // when their "5.1" output is silently being downmixed by the OS to
+    // whatever their real device supports.
+    {
+        SDL_AudioSpec deviceSpec = {};
+        int sampleFrames = 0;
+        if (SDL_GetAudioDeviceFormat(targetDeviceId, &deviceSpec, &sampleFrames)) {
+            m_deviceNativeChannels = deviceSpec.channels;
+            m_deviceNativeSampleRate = deviceSpec.freq;
+        } else {
+            m_deviceNativeChannels = 0; // unknown -- query failed (e.g. no device present)
+            m_deviceNativeSampleRate = 0;
+        }
+    }
+
+    // Resolve the output sample rate instead of forcing 48kHz.
+    //
+    // The rate used to be a constructor constant, so every 44.1kHz source
+    // -- which is most music -- went through a 147:160 soxr conversion
+    // nothing asked for, and 96/192kHz sources were silently downsampled.
+    // Sample-rate conversion is the most expensive operation in this path
+    // (its latency is why decodeAndResample() carries a dedicated
+    // workaround for swr_convert() returning 0), and however good the
+    // filter is it still adds passband ripple and stopband images. For a
+    // 44.1kHz file on a 44.1-capable device it is pure loss.
+    //
+    // Preference order: the source's own rate when the device reports it
+    // can take it (no conversion at all), else the device's native rate
+    // (one conversion, at the rate the OS mixer runs anyway, rather than
+    // two), else the previous 48kHz default. Every DSP stage already takes
+    // its rate at configure() time, so nothing downstream needs changing.
+    {
+        const int sourceRate = m_codecCtx->sample_rate;
+        if (sourceRate > 0 && m_deviceNativeSampleRate > 0 && sourceRate == m_deviceNativeSampleRate) {
+            m_outSampleRate = sourceRate;
+        } else if (m_deviceNativeSampleRate >= 8000 && m_deviceNativeSampleRate <= 384000) {
+            m_outSampleRate = m_deviceNativeSampleRate;
+        }
+        // else: keep the 48000 default set in the constructor.
+    }
+
+
     // Set input channel layout fallback if missing, resolve the output
     // layout from it (preserving surround where we can drive it directly),
     // and configure resampling context accordingly.
@@ -383,31 +438,6 @@ bool AudioDecoder::init() {
         return false;
     }
 
-    // Resolve the configured device *name* (see setOutputDeviceName()) to
-    // whatever SDL_AudioDeviceID currently maps to it -- empty name (the
-    // default) resolves to SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, identical to
-    // this project's behavior before device selection existed.
-    const SDL_AudioDeviceID targetDeviceId = resolveOutputDeviceId(m_outputDeviceName);
-
-    // Query the target device's native channel count before opening
-    // anything. This is purely diagnostic (see getDeviceNativeChannels()) --
-    // SDL_OpenAudioDeviceStream below will still happily accept a
-    // higher-channel request regardless, since Windows/Linux audio APIs
-    // transparently downmix in shared mode. That means a successful open()
-    // with N channels does NOT by itself prove N-channel hardware is
-    // actually connected; this query is what lets the UI tell the user
-    // when their "5.1" output is silently being downmixed by the OS to
-    // whatever their real device supports.
-    {
-        SDL_AudioSpec deviceSpec = {};
-        int sampleFrames = 0;
-        if (SDL_GetAudioDeviceFormat(targetDeviceId, &deviceSpec, &sampleFrames)) {
-            m_deviceNativeChannels = deviceSpec.channels;
-        } else {
-            m_deviceNativeChannels = 0; // unknown -- query failed (e.g. no device present)
-        }
-    }
-
     m_outputBytesPerSample = outputBytesPerSampleFor(m_outputBitDepth);
 
     // Configure SDL3 audio spec
@@ -454,7 +484,25 @@ bool AudioDecoder::init() {
         return false;
     }
 
-    m_audioBuffer.resize(0); // Initial size 0 to trigger dynamic resize on first frame
+    // Preallocate every buffer the audio callback touches, so neither the
+    // callback nor decodeAndResample() ever calls into the allocator on
+    // the real-time thread.
+    //
+    // kMaxBlockFrames is generous on purpose: it covers the largest audio
+    // frame any common codec emits (AAC 1024, MP3 1152, AC3 1536, DTS
+    // 4096...), the resampler's own delay-driven expansion when upsampling
+    // (bounded by the ratio, at most ~4.4x for 44.1k -> 192k), and any
+    // block SDL is likely to request. decodeAndResample() still grows the
+    // buffer if something exceeds it -- correctness first -- but in normal
+    // playback that path is never taken.
+    constexpr int kMaxBlockFrames = 32768;
+    m_audioBuffer.assign(static_cast<size_t>(kMaxBlockFrames) * m_dspChannels * sizeof(float), 0);
+    m_downmixBuffer.assign(static_cast<size_t>(kMaxBlockFrames) * 2, 0.0f);
+    m_callbackBuffer.assign(static_cast<size_t>(kMaxBlockFrames) * m_outChannels *
+                                static_cast<size_t>(m_outputBytesPerSample), 0);
+    m_audioBufferSize = 0;
+    m_audioBufferIndex = 0;
+    m_appliedVolume = m_volume.load(std::memory_order_relaxed);
 
     // Resolve the LFE channel's index (if any) in the final output layout,
     // for the DSP chain's optional bass crossover. -1 if there is no
@@ -471,10 +519,25 @@ bool AudioDecoder::init() {
     m_loudness.configure(m_dspChannels, m_outSampleRate);
     m_surround3d.configure(m_outChannels, m_outSampleRate);
     m_widener.configure(m_outChannels);
+    m_widener.configureFade(m_outSampleRate);
     m_balance.configure(m_outChannels);
+    m_balance.configureFade(m_outSampleRate); // glide length for the L/R trim
     m_spectrum.configure(m_outChannels, m_outSampleRate);
-    m_spectrum.setEnabled(true);
+    // Deliberately NOT enabled here. AudioDspSettings defaults it to
+    // false, and applyDspSettings() is what honours that -- forcing it on
+    // at init meant the analyzer ran until the first applyDspSettings()
+    // call, and forever on any path that never makes one.
     m_finalSafetyLimiter.configure(m_outChannels, m_outSampleRate);
+
+    // Size the DSP chain's internal scratch for the same worst-case block,
+    // so MultibandCompressor::process() cannot allocate mid-playback.
+    m_dsp.reserveBlock(kMaxBlockFrames);
+    // Same for the stages that live outside DspChain but also crossfade
+    // their bypass -- see BypassCrossfade in DspMath.hpp.
+    m_surround3d.reserveBlock(kMaxBlockFrames);
+    m_widener.reserveBlock(kMaxBlockFrames);
+
+    updateDspLatency();
 
     if (m_playbackSpeed.load() != 1.0f) {
         SDL_SetAudioStreamFrequencyRatio(m_audioStream, m_playbackSpeed.load());
@@ -544,9 +607,38 @@ double AudioDecoder::getAudioClock() {
         return baseClock;
     }
 
-    int64_t playedFrames = static_cast<int64_t>(m_audioBufferIndex) / internalBytesPerFrame;
+    // m_clockFrameOffset is published under this same mutex alongside
+    // m_clock, so the two always describe the same instant. Reading
+    // m_audioBufferIndex directly here instead let a caller observe a
+    // freshly-reset offset next to the previous frame's base PTS.
+    int64_t playedFrames = m_clockFrameOffset;
     int64_t queuedFrames = static_cast<int64_t>(queuedBytes) / outputBytesPerFrame;
     playedFrames -= queuedFrames;
+
+    // NOT compensated for the DSP chain's lookahead latency, deliberately.
+    //
+    // The limiters downstream of this clock do delay the audio by
+    // getLatencyFrames() without delaying its timestamp, so in principle
+    // the clock runs that far ahead of what is audible. Subtracting it
+    // here made video playback drop frames, and the mechanism is specific
+    // to how this offset is built: m_clockFrameOffset restarts at 0 for
+    // every decoded buffer, so once queuedFrames and the lookahead are
+    // both subtracted the result spends longer clamped at zero -- the
+    // clock sits perfectly still at baseClock for an extra few
+    // milliseconds of every buffer, then jumps.
+    //
+    // main.cpp presents at most one frame per render iteration and frees
+    // any others whose PTS has already passed, so a clock that stalls and
+    // jumps turns evenly-paced frames into bursts and silently discards
+    // the ones in between. Trading 3ms of AV-sync accuracy for that is a
+    // bad deal, and the correct fix (deriving the clock from frames
+    // actually consumed, so it advances smoothly and can absorb a latency
+    // offset) is a bigger change than the accuracy is worth here.
+    //
+    // getLatencyFrames()/getLookaheadFrames() remain available for a
+    // caller that wants the figure. m_dspLatencyFrames is still tracked
+    // and exposed via getDspLatencyFrames() for diagnostics.
+
     if (playedFrames < 0) {
         playedFrames = 0;
     }
@@ -575,30 +667,34 @@ void AudioDecoder::decodeAndResample() {
         }
     } tracker_guard(m_decodeTimeTracker);
 
+    // Pick up anything the control thread published since the last block,
+    // before any of it could matter to the audio below. Wait-free: worst
+    // case it finds nothing and costs one relaxed atomic load.
+    applyPendingDspSettings();
+
     if (m_flushRequested) {
         avcodec_flush_buffers(m_codecCtx);
         if (m_swrCtx) {
             swr_init(m_swrCtx);
         }
-        {
-            // Locked against applyDspSettings(), which the UI thread can
-            // call concurrently with this -- these reset() calls mutate
-            // the same Biquad/Compressor/Limiter/Crossover/Surround3D/
-            // StereoWidener state that applyDspSettings() writes to under
-            // m_dspMutex, and this thread (the SDL audio callback thread,
-            // via a seek-triggered flush()) is not otherwise synchronized
-            // with it.
-            std::lock_guard<std::mutex> dspLock(m_dspMutex);
-            m_dsp.reset();
-            m_loudness.reset();
-            m_spatialDownmixer.reset();
-            m_surround3d.reset();
-            m_widener.reset();
-            m_spectrum.reset();
-            m_finalSafetyLimiter.reset();
-        }
+        // No lock: every one of these objects is now touched only by this
+        // thread. applyDspSettings() no longer reaches into them from the
+        // control thread -- it publishes a snapshot that
+        // applyPendingDspSettings() (above, same thread) applies.
+        m_dsp.reset();
+        m_loudness.reset();
+        m_spatialDownmixer.reset();
+        m_surround3d.reset();
+        m_widener.reset();
+        m_balance.reset();
+        m_spectrum.reset();
+        m_finalSafetyLimiter.reset();
         m_audioBufferIndex = 0;
         m_audioBufferSize = 0;
+        {
+            std::lock_guard<std::mutex> clockLock(m_clockMutex);
+            m_clockFrameOffset = 0;
+        }
         m_flushRequested = false;
     }
 
@@ -622,6 +718,14 @@ void AudioDecoder::decodeAndResample() {
             }
 
             if (pts < clockSnapshot - 0.050) {
+                // Dropping a whole frame is a hard waveform discontinuity
+                // -- a click -- and it also disturbs every stateful stage
+                // downstream (filter history, limiter delay lines, the
+                // loudness meter). It should be rare, but it was
+                // previously invisible: none of the silence counters cover
+                // this path, so there was no way to tell whether it was
+                // happening at all.
+                m_lateFrameDrops.fetch_add(1, std::memory_order_relaxed);
                 av_frame_unref(m_decodedFrame);
                 continue;
             }
@@ -643,7 +747,21 @@ void AudioDecoder::decodeAndResample() {
             // m_outChannels (2) afterward, below.
             int bufferNeeded = maxOutSamples * m_dspChannels * static_cast<int>(sizeof(float));
             if (m_audioBuffer.size() < static_cast<size_t>(bufferNeeded)) {
+                // Growing here is a heap allocation on the SDL audio
+                // callback thread, which is exactly what a real-time
+                // callback must not do. init() pre-sizes every buffer for
+                // kMaxBlockFrames precisely so this never runs; it survives
+                // only as a correctness backstop for a block larger than
+                // that (no supported decoder/resampler combination produces
+                // one). If it ever does fire, re-size *everything*
+                // downstream in the same step, so the cost is paid once
+                // rather than again in m_downmixBuffer and once more inside
+                // MultibandCompressor's per-band scratch.
                 m_audioBuffer.resize(bufferNeeded);
+                m_downmixBuffer.resize(static_cast<size_t>(maxOutSamples) * 2);
+                m_dsp.reserveBlock(maxOutSamples);
+                m_surround3d.reserveBlock(maxOutSamples);
+                m_widener.reserveBlock(maxOutSamples);
             }
 
             uint8_t* outData[1] = { m_audioBuffer.data() };
@@ -707,9 +825,12 @@ void AudioDecoder::decodeAndResample() {
             // read; this isn't blind reinterpretation of untrusted bytes.
             float* dspBuffer = reinterpret_cast<float*>(m_audioBuffer.data());
             {
-                // Locked against applyDspSettings(), which the UI thread can
-                // call concurrently with this (see m_dspMutex in the header).
-                std::lock_guard<std::mutex> dspLock(m_dspMutex);
+                // No lock. Every stage below is owned exclusively by this
+                // thread; the control thread reaches them only by
+                // publishing a snapshot that applyPendingDspSettings()
+                // drained at the top of this function. See the mailbox
+                // comment on m_mailboxSeq in the header for why a mutex
+                // here was a real-time hazard rather than a safety net.
                 m_dsp.process(dspBuffer, outSamples);
                 m_loudness.process(dspBuffer, outSamples);
 
@@ -723,12 +844,18 @@ void AudioDecoder::decodeAndResample() {
                 // this can't clobber data still needed elsewhere.
                 if (m_spatialDownmixActive) {
                     const size_t downmixSamples = static_cast<size_t>(outSamples) * 2;
-                    if (m_downmixBuffer.size() < downmixSamples) {
-                        m_downmixBuffer.resize(downmixSamples);
+                    // No resize here: init() sizes this for kMaxBlockFrames
+                    // and the growth path above re-sizes it in lockstep with
+                    // m_audioBuffer, so by construction it is already large
+                    // enough. Asserting that rather than silently allocating
+                    // keeps the audio thread allocation-free -- if the
+                    // invariant is ever broken, skip the downmix for this
+                    // block instead of calling into the allocator.
+                    if (m_downmixBuffer.size() >= downmixSamples) {
+                        m_spatialDownmixer.process(dspBuffer, outSamples, m_downmixBuffer.data());
+                        std::memcpy(m_audioBuffer.data(), m_downmixBuffer.data(),
+                                    downmixSamples * sizeof(float));
                     }
-                    m_spatialDownmixer.process(dspBuffer, outSamples, m_downmixBuffer.data());
-                    std::memcpy(m_audioBuffer.data(), m_downmixBuffer.data(),
-                                downmixSamples * sizeof(float));
                 }
 
                 // "3D Surround" ambience synthesis, then mid-side stereo
@@ -754,7 +881,11 @@ void AudioDecoder::decodeAndResample() {
             m_audioBufferSize = outSamples * m_outChannels * static_cast<int>(sizeof(float));
             m_audioBufferIndex = 0;
 
-            // Set internal clock to frame start PTS relative to the start of the stream
+            // Set internal clock to frame start PTS relative to the start
+            // of the stream. The buffer offset is reset to 0 here too, and
+            // both are published in the same critical section so
+            // getAudioClock() can never pair one frame's PTS with another
+            // frame's offset.
             {
                 std::lock_guard<std::mutex> lock(m_clockMutex);
                 double clockForUpdate = m_clock;
@@ -770,6 +901,7 @@ void AudioDecoder::decodeAndResample() {
                 }
 
                 m_clock = pts;
+                m_clockFrameOffset = 0;
             }
 
             av_frame_unref(m_decodedFrame);
@@ -784,6 +916,15 @@ void AudioDecoder::decodeAndResample() {
                 m_queueEmptyCount.fetch_add(1, std::memory_order_relaxed);
                 m_audioBufferSize = 0;
                 m_audioBufferIndex = 0;
+                // Keep the published clock offset in step with the buffer
+                // index it mirrors. Without this the offset would keep a
+                // stale, larger value across an underrun and the clock
+                // would read up to a full buffer AHEAD -- which presents
+                // video frames early and drops the ones skipped over.
+                {
+                    std::lock_guard<std::mutex> clockLock(m_clockMutex);
+                    m_clockFrameOffset = 0;
+                }
                 return;
             }
 
@@ -837,13 +978,34 @@ void AudioDecoder::sdlAudioStreamCallback(void* userdata, SDL_AudioStream* strea
     
     self->m_callbackCount.fetch_add(1, std::memory_order_relaxed);
 
+    // Flush-to-zero / denormals-are-zero for the duration of this
+    // callback. Every IIR stage downstream (EQ, crossovers, the multiband
+    // splits, the spatial delay lines) has state that decays into the
+    // denormal range whenever the input goes quiet, and denormal
+    // arithmetic traps to microcode: measured at 18x the cost of the same
+    // chain on normal programme material, and 54x for the EQ alone. That
+    // spike lands exactly on fade-outs, silent leaders and gaps between
+    // tracks. The guard is scoped, so the mode is restored on the way out
+    // and never leaks into SDL's or the UI thread's arithmetic.
+    //
+    // Never referenced by name on purpose: all of its work happens in the
+    // constructor and destructor, which is what cppcheck's unusedVariable
+    // check cannot see for an RAII type.
+    // cppcheck-suppress unusedVariable
+    naikav::dsp::ScopedDenormalGuard denormalGuard;
+
     int len = additional_amount;
     if (len <= 0) {
         len = 4096;
     }
-    
-    std::vector<uint8_t> tempBuffer(len);
-    uint8_t* destPtr = tempBuffer.data();
+
+    // Reuse the member buffer instead of allocating one per callback.
+    // Grows only if SDL ever asks for more than init() reserved, which
+    // should not happen but must not corrupt memory if it does.
+    if (static_cast<int>(self->m_callbackBuffer.size()) < len) {
+        self->m_callbackBuffer.resize(static_cast<size_t>(len));
+    }
+    uint8_t* destPtr = self->m_callbackBuffer.data();
     int bytesWritten = 0;
     
     {
@@ -882,7 +1044,25 @@ void AudioDecoder::sdlAudioStreamCallback(void* userdata, SDL_AudioStream* strea
             }
 
             const float* src = reinterpret_cast<const float*>(self->m_audioBuffer.data() + self->m_audioBufferIndex);
-            float volume = self->m_volume;
+
+            // Ramp the volume across this chunk instead of applying a new
+            // constant to every sample. A volume change between callbacks
+            // is otherwise a step discontinuity in the waveform -- an
+            // audible click on every keypress, and a hard cut on
+            // mute/unmute. The previous fast paths also snapped anything
+            // >= 0.99 to unity and anything <= 0.01 to digital silence,
+            // which made the control non-monotonic (0.989 applied 0.989,
+            // 0.990 applied 1.000) and the mute an instant drop.
+            const float targetVolume = self->m_volume.load(std::memory_order_relaxed);
+            const float startVolume = self->m_appliedVolume;
+            const bool volumeSteady = (startVolume == targetVolume);
+            // Per-sample increment, in interleaved-sample units. The ramp
+            // is intentionally spread over the whole chunk, which at a
+            // typical block size is a few milliseconds -- short enough to
+            // feel instant, long enough to be inaudible.
+            const float volumeStep = volumeSteady
+                ? 0.0f
+                : (targetVolume - startVolume) / static_cast<float>(samplesToCopy);
 
             switch (self->m_outputBitDepth) {
             case AudioOutputBitDepth::BIT_32_FLOAT: {
@@ -896,28 +1076,29 @@ void AudioDecoder::sdlAudioStreamCallback(void* userdata, SDL_AudioStream* strea
                 // callback API, not a representation mismatch.
                 // cppcheck-suppress invalidPointerCast
                 float* dest = reinterpret_cast<float*>(destPtr);
-                if (volume <= 0.01f) {
-                    std::memset(dest, 0, samplesToCopy * sizeof(float));
-                } else if (volume >= 0.99f) {
+                if (volumeSteady && targetVolume == 1.0f) {
+                    // Genuinely at rest at unity: the only bit-exact path.
                     std::memcpy(dest, src, samplesToCopy * sizeof(float));
+                } else if (volumeSteady && targetVolume == 0.0f) {
+                    std::memset(dest, 0, samplesToCopy * sizeof(float));
                 } else {
+                    float v = startVolume;
                     for (int i = 0; i < samplesToCopy; ++i) {
-                        dest[i] = src[i] * volume;
+                        dest[i] = src[i] * v;
+                        v += volumeStep;
                     }
                 }
                 break;
             }
             case AudioOutputBitDepth::BIT_32_INT: {
                 int32_t* dest = reinterpret_cast<int32_t*>(destPtr);
-                if (volume <= 0.01f) {
+                if (volumeSteady && targetVolume == 0.0f) {
                     std::memset(dest, 0, samplesToCopy * sizeof(int32_t));
-                } else if (volume >= 0.99f) {
-                    for (int i = 0; i < samplesToCopy; ++i) {
-                        dest[i] = floatToS32Dithered(src[i], self->m_ditherState);
-                    }
                 } else {
+                    float v = startVolume;
                     for (int i = 0; i < samplesToCopy; ++i) {
-                        dest[i] = floatToS32Dithered(src[i] * volume, self->m_ditherState);
+                        dest[i] = floatToS32Dithered(src[i] * v, self->m_ditherState);
+                        v += volumeStep;
                     }
                 }
                 break;
@@ -925,22 +1106,21 @@ void AudioDecoder::sdlAudioStreamCallback(void* userdata, SDL_AudioStream* strea
             case AudioOutputBitDepth::BIT_16:
             default: {
                 int16_t* dest = reinterpret_cast<int16_t*>(destPtr);
-                if (volume <= 0.01f) {
-                    // True digital silence for mute, rather than dithering
-                    // down to (inaudible but non-zero) noise for no benefit.
+                if (volumeSteady && targetVolume == 0.0f) {
+                    // True digital silence for a real mute, rather than
+                    // dithering down to (inaudible but non-zero) noise.
                     std::memset(dest, 0, samplesToCopy * sizeof(int16_t));
-                } else if (volume >= 0.99f) {
-                    for (int i = 0; i < samplesToCopy; ++i) {
-                        dest[i] = floatToS16Dithered(src[i], self->m_ditherState);
-                    }
                 } else {
+                    float v = startVolume;
                     for (int i = 0; i < samplesToCopy; ++i) {
-                        dest[i] = floatToS16Dithered(src[i] * volume, self->m_ditherState);
+                        dest[i] = floatToS16Dithered(src[i] * v, self->m_ditherState);
+                        v += volumeStep;
                     }
                 }
                 break;
             }
             }
+            self->m_appliedVolume = targetVolume;
 
             int internalBytesConsumed = samplesToCopy * kInternalBytesPerSample;
             int outputBytesWritten = samplesToCopy * outputBytesPerSample;
@@ -949,11 +1129,28 @@ void AudioDecoder::sdlAudioStreamCallback(void* userdata, SDL_AudioStream* strea
             len -= outputBytesWritten;
             bytesWritten += outputBytesWritten;
             self->m_audioBufferIndex += internalBytesConsumed;
+
+            // Publish how far into the current buffer we are, paired with
+            // the base PTS that describes it. decodeAndResample() writes
+            // both together under this same mutex when it loads a new
+            // buffer, so getAudioClock() always sees a consistent pair.
+            // Lock order here is m_audioMutex -> m_clockMutex, matching
+            // decodeAndResample()'s, so there is no inversion; the
+            // critical section is a single store.
+            {
+                const int bytesPerFrame = self->m_outChannels * static_cast<int>(sizeof(float));
+                if (bytesPerFrame > 0) {
+                    std::lock_guard<std::mutex> clockLock(self->m_clockMutex);
+                    self->m_clockFrameOffset =
+                        static_cast<int64_t>(self->m_audioBufferIndex.load(std::memory_order_relaxed))
+                        / bytesPerFrame;
+                }
+            }
         }
     }
     
     if (bytesWritten > 0) {
-        SDL_PutAudioStreamData(stream, tempBuffer.data(), bytesWritten);
+        SDL_PutAudioStreamData(stream, self->m_callbackBuffer.data(), bytesWritten);
     }
 }
 
@@ -996,14 +1193,96 @@ std::string AudioDecoder::getOutputChannelLayoutName() const {
 #endif
 }
 
-void AudioDecoder::applyDspSettings(const naikav::dsp::AudioDspSettings& settings) {
-    std::lock_guard<std::mutex> lock(m_dspMutex);
+void AudioDecoder::applyDspSettings(const naikav::dsp::AudioDspSettings& raw) {
+    // Clamp/repair before anything reaches a DSP setter. The settings file
+    // is parsed with std::stof and was previously stored verbatim, so a
+    // hand-edited or corrupted one could hand a biquad a cutoff above
+    // Nyquist or a literal "nan" -- and a poisoned IIR never recovers,
+    // because NaN propagates through its own feedback state forever.
+    naikav::dsp::AudioDspSettings settings = raw;
+    settings.sanitize();
+
+    // Publish, don't mutate. Bump the sequence to odd, write the snapshot,
+    // bump it back to even -- a reader that observes an odd count, or a
+    // count that moved across its copy, retries or gives up and tries
+    // again next block. The audio thread applies the snapshot itself in
+    // applyPendingDspSettings().
+    m_mailboxSeq.fetch_add(1, std::memory_order_release);            // -> odd
+    m_mailboxSettings = settings;
+    m_mailboxSeq.fetch_add(1, std::memory_order_release);            // -> even
+
+    // This thread's own record of what it published, for getDspSettings().
+    m_publishedSettings = settings;
+}
+
+// Seqlock read. Bounded retries so neither caller can spin indefinitely
+// behind a writer; the audio thread treats failure as "nothing new this
+// block", which is correct rather than merely tolerable -- the snapshot
+// it already applied stays in force.
+bool AudioDecoder::readMailboxSettings(naikav::dsp::AudioDspSettings* out, uint32_t* seq) const {
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        const uint32_t before = m_mailboxSeq.load(std::memory_order_acquire);
+        if (before & 1u) continue; // write in progress
+        *out = m_mailboxSettings;
+        if (m_mailboxSeq.load(std::memory_order_acquire) == before) {
+            *seq = before;
+            return true;
+        }
+    }
+    return false;
+}
+
+// Audio thread only. Drains the settings mailbox and any pending prescan
+// priming onto the DSP objects this thread owns.
+void AudioDecoder::applyPendingDspSettings() {
+    // Prescan priming first: it only writes the normalizer's gain state,
+    // and doing it before the settings snapshot means a snapshot that also
+    // toggles loudness on sees the primed value immediately.
+    if (m_pendingPrescan.load(std::memory_order_acquire)) {
+        m_pendingPrescan.store(false, std::memory_order_relaxed);
+        m_loudness.primeWithPrescannedLufs(m_pendingPrescanLufs.load(std::memory_order_relaxed));
+    }
+
+    const uint32_t published = m_mailboxSeq.load(std::memory_order_acquire);
+    // Even and unchanged means nothing new -- the common case, one load.
+    if (published == m_appliedMailboxSeq && m_hasAppliedDspSettings) {
+        return;
+    }
+
+    naikav::dsp::AudioDspSettings settings;
+    uint32_t seq = 0;
+    if (!readMailboxSettings(&settings, &seq)) {
+        return; // writer mid-update; try again next block
+    }
+    if (seq == m_appliedMailboxSeq && m_hasAppliedDspSettings) {
+        return;
+    }
+
+    // Only redesign filters whose parameters actually changed.
+    //
+    // applyDspSettings() is called on every UI frame in which any control
+    // moved, i.e. ~60Hz for the whole duration of a slider drag.
+    // Unconditionally calling all three EQ setters ran 15 full biquad
+    // redesigns (each a pow/cos/sin plus a copy to every channel) per
+    // call, plus four more for the multiband crossovers -- roughly 900
+    // coefficient designs a second. That mattered more when this ran under
+    // a mutex the audio callback needed; it still matters now, because
+    // this runs *on* the audio callback. Dragging one band's gain
+    // redesigns one band.
+    const bool first = !m_hasAppliedDspSettings;
+    const naikav::dsp::AudioDspSettings& prev = m_currentDspSettings;
 
     m_dsp.setEnabled(settings.dspEnabled);
     for (int i = 0; i < naikav::dsp::ParametricEQ::kNumBands; ++i) {
-        m_dsp.eq.setBandFrequencyHz(i, settings.eqBandFreqHz[i]);
-        m_dsp.eq.setBandQ(i, settings.eqBandQ[i]);
-        m_dsp.eq.setBandGainDb(i, settings.eqBandGainDb[i]);
+        if (first || prev.eqBandFreqHz[i] != settings.eqBandFreqHz[i]) {
+            m_dsp.eq.setBandFrequencyHz(i, settings.eqBandFreqHz[i]);
+        }
+        if (first || prev.eqBandQ[i] != settings.eqBandQ[i]) {
+            m_dsp.eq.setBandQ(i, settings.eqBandQ[i]);
+        }
+        if (first || prev.eqBandGainDb[i] != settings.eqBandGainDb[i]) {
+            m_dsp.eq.setBandGainDb(i, settings.eqBandGainDb[i]);
+        }
     }
     m_dsp.compressor.setThresholdDb(settings.compressorThresholdDb);
     // "Disabled" is ratio 1:1 -- a true no-op regardless of threshold (see
@@ -1013,9 +1292,13 @@ void AudioDecoder::applyDspSettings(const naikav::dsp::AudioDspSettings& setting
     // Same "ratio 1:1 = inert" convention as the compressor above.
     m_dsp.noiseGate.setThresholdDb(settings.noiseGateThresholdDb);
     m_dsp.noiseGate.setRatio(settings.noiseGateEnabled ? settings.noiseGateRatio : 1.0f);
+    m_dsp.noiseGate.setRangeDb(settings.noiseGateRangeDb);
 
     m_dsp.multiband.setEnabled(settings.multibandEnabled);
-    m_dsp.multiband.setCrossoverFrequencies(settings.multibandLowMidHz, settings.multibandMidHighHz);
+    if (first || prev.multibandLowMidHz != settings.multibandLowMidHz ||
+        prev.multibandMidHighHz != settings.multibandMidHighHz) {
+        m_dsp.multiband.setCrossoverFrequencies(settings.multibandLowMidHz, settings.multibandMidHighHz);
+    }
     m_dsp.multiband.low.setThresholdDb(settings.multibandLowThresholdDb);
     m_dsp.multiband.low.setRatio(settings.multibandLowRatio);
     m_dsp.multiband.mid.setThresholdDb(settings.multibandMidThresholdDb);
@@ -1023,11 +1306,21 @@ void AudioDecoder::applyDspSettings(const naikav::dsp::AudioDspSettings& setting
     m_dsp.multiband.high.setThresholdDb(settings.multibandHighThresholdDb);
     m_dsp.multiband.high.setRatio(settings.multibandHighRatio);
 
-    // Same idea: 0dB ceiling is the Limiter's inert state.
-    m_dsp.limiter.setCeilingDb(settings.limiterEnabled ? settings.limiterCeilingDb : 0.0f);
+    // Same idea: 0dB ceiling is the Limiter's inert state. Gated on
+    // dspEnabled as well, because DspChain runs this limiter
+    // unconditionally now -- it is outside the master bypass crossfade so
+    // that its lookahead delay line never freezes mid-stream (see
+    // DspChain's class comment). A master-disabled chain must still be
+    // gain-transparent, and 0 dBFS is what makes it so.
+    m_dsp.limiter.setCeilingDb((settings.dspEnabled && settings.limiterEnabled)
+                                   ? settings.limiterCeilingDb
+                                   : 0.0f);
     m_dsp.crossover.setEnabled(settings.crossoverEnabled);
-    m_dsp.crossover.setCutoffHz(settings.crossoverCutoffHz);
+    if (first || prev.crossoverCutoffHz != settings.crossoverCutoffHz) {
+        m_dsp.crossover.setCutoffHz(settings.crossoverCutoffHz);
+    }
     m_dsp.crossover.setBassRedirectEnabled(settings.crossoverBassRedirectEnabled);
+    m_dsp.crossover.setLfeGainDb(settings.crossoverLfeGainDb);
 
     m_loudness.setEnabled(settings.loudnessEnabled);
     m_loudness.setTargetLufs(settings.loudnessTargetLufs);
@@ -1043,31 +1336,71 @@ void AudioDecoder::applyDspSettings(const naikav::dsp::AudioDspSettings& setting
     m_spectrum.setEnabled(settings.spectrumAnalyzerEnabled);
 
     // Tracks the user's actual effective Limiter ceiling -- "effective"
-    // meaning dspEnabled must also be true, since DspChain::process() (and
-    // therefore m_dsp.limiter) is skipped entirely when dspEnabled is
-    // false, same as m_dsp.setEnabled() above. Falls back to a plain
-    // 0dBFS backstop otherwise; see m_finalSafetyLimiter's doc comment.
+    // meaning dspEnabled must also be true, since m_dsp.limiter is held at
+    // an inert 0dBFS whenever the chain is master-disabled (see the
+    // setCeilingDb call above), same as m_dsp.setEnabled(). Falls back to
+    // a plain 0dBFS backstop otherwise; see m_finalSafetyLimiter's doc
+    // comment.
     m_finalSafetyLimiter.setCeilingDb((settings.dspEnabled && settings.limiterEnabled) ? settings.limiterCeilingDb : 0.0f);
 
     m_currentDspSettings = settings;
+    m_appliedMailboxSeq = seq;
+    m_hasAppliedDspSettings = true;
+
+    // Chain latency no longer changes with the master bypass -- the
+    // limiter's lookahead is now constant across a toggle, deliberately
+    // (see DspChain::getLatencyFrames()). Still recomputed here because a
+    // sample-rate change reaches this path too.
+    updateDspLatency();
 }
 
+// Audio thread only, or init(), which runs before the audio device is
+// resumed and therefore before any callback can observe this.
+void AudioDecoder::updateDspLatency() {
+    const int frames = m_dsp.getLatencyFrames() + m_finalSafetyLimiter.getLookaheadFrames();
+    m_dspLatencyFrames.store(frames, std::memory_order_relaxed);
+}
+
+void AudioDecoder::serviceDeferredMaintenance() {
+    // Deliberately not routed through the audio thread: serviceMeterRebuild() only
+    // touches the meter's retired spare graph, which the audio thread
+    // provably does not look at while a rebuild is pending (see
+    // LoudnessMeter::serviceRebuild()). Taking the lock here would put a
+    // multi-millisecond graph construction directly in the audio
+    // callback's path -- exactly the stall this whole mechanism exists to
+    // avoid.
+    if (m_loudness.needsMeterRebuild()) {
+        m_loudness.serviceMeterRebuild();
+    }
+
+    // Drain whatever the audio callback queued for EBU R128 metering. This
+    // is where the libavfilter push and ebur128's per-frame allocations
+    // happen -- deliberately here, on the render thread, and not in
+    // LoudnessNormalizer::process(). See its class comment.
+    m_loudness.serviceMetering();
+}
+
+// Hands the value to the audio thread rather than writing the normalizer
+// directly: primeWithPrescannedLufs() mutates gain state that the audio
+// thread reads every block, so the control thread must not touch it.
 void AudioDecoder::primeLoudnessPrescan(double integratedLufs) {
-    std::lock_guard<std::mutex> lock(m_dspMutex);
-    m_loudness.primeWithPrescannedLufs(integratedLufs);
+    m_pendingPrescanLufs.store(integratedLufs, std::memory_order_relaxed);
+    m_pendingPrescan.store(true, std::memory_order_release);
 }
 
 naikav::dsp::AudioDspSettings AudioDecoder::getDspSettings() const {
-    std::lock_guard<std::mutex> lock(m_dspMutex);
-    return m_currentDspSettings;
+    // The control thread's own copy of what it last published -- not a
+    // read of the mailbox, so there is nothing to synchronize against and
+    // no failure case to handle.
+    return m_publishedSettings;
 }
 
 double AudioDecoder::getMeasuredIntegratedLufs() const {
-    std::lock_guard<std::mutex> lock(m_dspMutex);
+    // Lock-free: one atomic load inside the normalizer/meter.
     return m_loudness.getMeasuredIntegratedLufs();
 }
 
 float AudioDecoder::getCurrentLoudnessGainDb() const {
-    std::lock_guard<std::mutex> lock(m_dspMutex);
+    // Lock-free: one atomic load inside the normalizer.
     return m_loudness.getCurrentGainDb();
 }

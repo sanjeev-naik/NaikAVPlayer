@@ -2423,7 +2423,19 @@ void PlayerUI::drawAudioSettingsPanel(int windowWidth, int windowHeight) {
   }
   ImGui::BeginDisabled(!s.noiseGateEnabled);
   changed |= ImGui::SliderFloat("Gate Threshold", &s.noiseGateThresholdDb, -80.0f, -20.0f, "%.1f dB");
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("Peak level, not average. Material with sharp transients\n"
+                      "reaches a given peak at a lower average level, so the\n"
+                      "gate opens sooner than the number alone suggests.");
+  }
   changed |= ImGui::SliderFloat("Gate Ratio", &s.noiseGateRatio, 1.0f, 20.0f, "%.1f:1");
+  changed |= ImGui::SliderFloat("Gate Range", &s.noiseGateRangeDb, 6.0f, 96.0f, "%.0f dB");
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("How far the gate turns quiet passages down once closed.\n"
+                      "Also sets how quickly it reopens: a deeper range takes\n"
+                      "longer to climb back, so a very high value can soften\n"
+                      "the attack of the first note after a pause.");
+  }
   ImGui::EndDisabled();
 
   ImGui::Spacing();
@@ -2431,6 +2443,11 @@ void PlayerUI::drawAudioSettingsPanel(int windowWidth, int windowHeight) {
   changed |= ImGui::Checkbox("Enable Compressor", &s.compressorEnabled);
   ImGui::BeginDisabled(!s.compressorEnabled);
   changed |= ImGui::SliderFloat("Threshold", &s.compressorThresholdDb, -60.0f, 0.0f, "%.1f dB");
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("Peak level, not average. Material with sharp transients\n"
+                      "reaches a given peak at a lower average level, so the\n"
+                      "compressor engages earlier than the number alone suggests.");
+  }
   changed |= ImGui::SliderFloat("Ratio", &s.compressorRatio, 1.0f, 20.0f, "%.1f:1");
   ImGui::EndDisabled();
 
@@ -2480,6 +2497,14 @@ void PlayerUI::drawAudioSettingsPanel(int windowWidth, int windowHeight) {
   ImGui::BeginDisabled(!s.crossoverEnabled);
   changed |= ImGui::SliderFloat("Cutoff", &s.crossoverCutoffHz, 40.0f, 250.0f, "%.0f Hz");
   changed |= ImGui::Checkbox("Redirect Bass to Sub", &s.crossoverBassRedirectEnabled);
+  changed |= ImGui::SliderFloat("Sub Level", &s.crossoverLfeGainDb, -24.0f, 12.0f, "%.1f dB");
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("Level trim for the LFE/subwoofer channel.\n"
+                      "Bass redirect sums at unity because the bass is removed\n"
+                      "from the other speakers and has to go somewhere -- use\n"
+                      "this to match the sub to the mains, or to pull back a\n"
+                      "source with an unusually hot LFE track.");
+  }
   if (ImGui::IsItemHovered()) {
     ImGui::SetTooltip(
         "True bass management: highpasses every other channel at the\n"
