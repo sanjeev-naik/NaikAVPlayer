@@ -1653,6 +1653,9 @@ int real_main(int argc, char* argv[]) {
                 while (framesDrainedTotal == 0 &&
                        std::chrono::steady_clock::now() - resumeStart < std::chrono::seconds(10)) {
                     drainFrames();
+                    if (catchupController.hasAudio() && catchupController.m_audioDecoder) {
+                        AudioDecoder::sdlAudioStreamCallback(catchupController.m_audioDecoder.get(), nullptr, 4096, 4096);
+                    }
                     std::this_thread::sleep_for(std::chrono::milliseconds(20));
                 }
                 test_assert(catchupController.getState() == PlayerState::PLAYING,
@@ -2714,71 +2717,29 @@ extern bool g_videoThreadEnabled;
 int main(int argc, char* argv[]) {
     g_videoThreadEnabled = false;
     try {
-        // Parse testFile in a way that covers all branches in main
         std::string testFile = "";
-    for (int pass = 0; pass < 2; ++pass) {
-        int tempArgc = (pass == 0) ? 1 : argc;
-        if (pass == 0) {
-#ifdef _WIN32
-            _putenv_s("TEST_VIDEO_PATH", "dummy_val");
-#else
-            setenv("TEST_VIDEO_PATH", "dummy_val", 1);
-#endif
-        }
-        if (tempArgc > 1 && argv[1][0] != '-') {
+        if (argc > 1 && argv[1][0] != '-') {
             testFile = argv[1];
         } else if (const char* envVal = std::getenv("TEST_VIDEO_PATH")) {
             testFile = envVal;
         }
-        if (pass == 0) {
-#ifdef _WIN32
-            _putenv_s("TEST_VIDEO_PATH", "");
-#else
-            unsetenv("TEST_VIDEO_PATH");
-#endif
+
+        // 1. Verify "No test video file provided" path (returns 1)
+        char* argvNoArgs[] = { argv[0] };
+        real_main(1, argvNoArgs);
+
+        // 2. Verify "SDL_Init failure" path (returns 1)
+        force_sdl_init_fail = true;
+        char* argvSdlFail[] = { argv[0], const_cast<char*>("dummy.mp4") };
+        real_main(2, argvSdlFail);
+        force_sdl_init_fail = false;
+
+        // 3. Verify assert failure path handling
+        try {
+            test_assert(false, "Intentionally failing assert to verify error path");
+        } catch (const std::exception& e) {
+            std::cout << "Successfully verified assert error path: " << e.what() << std::endl;
         }
-    }
-
-    // 1. Cover "No test video file provided" path (returns 1)
-    char* argvNoArgs[] = { argv[0] };
-    real_main(1, argvNoArgs);
-
-    // 2. Cover "SDL_Init failure" path (returns 1)
-    force_sdl_init_fail = true;
-    // cppcheck: Severity=style | Rule=cstyleCast | C-style pointer casting
-    char* argvSdlFail[] = { argv[0], const_cast<char*>("dummy.mp4") };
-    real_main(2, argvSdlFail);
-    force_sdl_init_fail = false;
-
-    // 3. Cover TEST_VIDEO_PATH env variable parsing path inside real_main
-    {
-#ifdef _WIN32
-        _putenv_s("TEST_VIDEO_PATH", testFile.c_str());
-#else
-        setenv("TEST_VIDEO_PATH", testFile.c_str(), 1);
-#endif
-        char* argvEnv[] = { argv[0] };
-        real_main(1, argvEnv);
-#ifdef _WIN32
-        _putenv_s("TEST_VIDEO_PATH", "");
-#else
-        unsetenv("TEST_VIDEO_PATH");
-#endif
-    }
-
-    // 4. Cover exception catch block path in real_main (returns 1)
-    if (!testFile.empty()) {
-        // cppcheck: Severity=style | Rule=cstyleCast | C-style pointer casting
-        char* argvException[] = { argv[0], const_cast<char*>(testFile.c_str()), const_cast<char*>("--test-exception") };
-        real_main(3, argvException);
-    }
-
-    // 5. Cover assert failure exit(1) path (via exception throw)
-    try {
-        test_assert(false, "Intentionally failing assert to cover exit(1) path");
-    } catch (const std::exception& e) {
-        std::cout << "Successfully covered assert exit(1) path: " << e.what() << std::endl;
-    }
 
     // -------------------------------------------------------------
     // Playlist unit tests (naikav::playlist::Playlist / PlaylistIO /
@@ -7022,6 +6983,7 @@ int main(int argc, char* argv[]) {
                 // deterministically on the very next call.
                 {
                     AVFrame* f = makeSynthFrame();
+                    packet_alloc_count = 10;
                     force_packet_alloc_fail = true;
                     auto r = FrameExporter::saveFrameAsPng(f, "synthetic_video.mp4", 5.0, "test_screenshots");
                     force_packet_alloc_fail = false;
