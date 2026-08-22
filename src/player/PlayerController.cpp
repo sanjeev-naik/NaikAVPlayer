@@ -829,6 +829,19 @@ void PlayerController::prescanLoudnessForCurrentFile() {
 }
 
 void PlayerController::pollPendingLoudnessPrescan() {
+    // Service anything the audio callback deferred because it is not
+    // real-time safe -- currently rebuilding the loudness meter's retired
+    // filter graph after a seek swapped to its spare. This runs on the
+    // render/event thread, which is exactly where multi-millisecond
+    // FFmpeg graph construction belongs. Cheap when there is nothing
+    // pending (one relaxed atomic load).
+    {
+        std::lock_guard<std::mutex> audioLock(m_audioDecoderMutex);
+        if (m_hasAudio && m_audioDecoder) {
+            m_audioDecoder->serviceDeferredMaintenance();
+        }
+    }
+
     PendingLoudnessPrescanResult result;
     {
         std::lock_guard<std::mutex> lock(m_pendingPrescanMutex);
@@ -1155,6 +1168,8 @@ void PlayerController::loadSettings() {
                 m_audioDspSettings.crossoverCutoffHz = std::stof(value);
             } else if (key == "crossover_bass_redirect") {
                 m_audioDspSettings.crossoverBassRedirectEnabled = (std::stoi(value) != 0);
+            } else if (key == "crossover_lfe_gain") {
+                m_audioDspSettings.crossoverLfeGainDb = std::stof(value);
             } else if (key == "loudness_enabled") {
                 m_audioDspSettings.loudnessEnabled = (std::stoi(value) != 0);
             } else if (key == "loudness_target") {
@@ -1175,6 +1190,8 @@ void PlayerController::loadSettings() {
                 m_audioDspSettings.noiseGateThresholdDb = std::stof(value);
             } else if (key == "noise_gate_ratio") {
                 m_audioDspSettings.noiseGateRatio = std::stof(value);
+            } else if (key == "noise_gate_range") {
+                m_audioDspSettings.noiseGateRangeDb = std::stof(value);
             } else if (key == "multiband_enabled") {
                 m_audioDspSettings.multibandEnabled = (std::stoi(value) != 0);
             } else if (key == "multiband_low_mid_hz") {
@@ -1231,6 +1248,17 @@ void PlayerController::loadSettings() {
     while (std::getline(f, line)) {
         applyLine(line);
     }
+
+    // Clamp/repair everything that came off disk before it can reach a DSP
+    // setter. Each value above is parsed with std::stof and stored
+    // verbatim, so a hand-edited or truncated player_settings.txt could
+    // otherwise put a crossover cutoff above Nyquist -- or a literal
+    // "nan" -- straight into a biquad, whose feedback state then
+    // propagates Inf/NaN forever. (Verified: restoring a sane slider value
+    // does not recover it; only a seek does.) Sanitizing a file this app
+    // itself wrote is a no-op, since every clamp matches the UI's range.
+    m_audioDspSettings.sanitize();
+
     std::cout << "Loaded settings: ResolutionOption=" << static_cast<int>(m_resolutionOption.load())
               << ", AudioDspSettings.dspEnabled=" << m_audioDspSettings.dspEnabled
               << ", AudioDspSettings.loudnessEnabled=" << m_audioDspSettings.loudnessEnabled << std::endl;
@@ -1257,6 +1285,7 @@ void PlayerController::saveSettings() {
     f << "crossover_enabled=" << (s.crossoverEnabled ? 1 : 0) << "\n";
     f << "crossover_cutoff=" << s.crossoverCutoffHz << "\n";
     f << "crossover_bass_redirect=" << (s.crossoverBassRedirectEnabled ? 1 : 0) << "\n";
+    f << "crossover_lfe_gain=" << s.crossoverLfeGainDb << "\n";
     f << "loudness_enabled=" << (s.loudnessEnabled ? 1 : 0) << "\n";
     f << "loudness_target=" << s.loudnessTargetLufs << "\n";
     f << "widener_enabled=" << (s.widenerEnabled ? 1 : 0) << "\n";
@@ -1267,6 +1296,7 @@ void PlayerController::saveSettings() {
     f << "noise_gate_enabled=" << (s.noiseGateEnabled ? 1 : 0) << "\n";
     f << "noise_gate_threshold=" << s.noiseGateThresholdDb << "\n";
     f << "noise_gate_ratio=" << s.noiseGateRatio << "\n";
+    f << "noise_gate_range=" << s.noiseGateRangeDb << "\n";
     f << "multiband_enabled=" << (s.multibandEnabled ? 1 : 0) << "\n";
     f << "multiband_low_mid_hz=" << s.multibandLowMidHz << "\n";
     f << "multiband_mid_high_hz=" << s.multibandMidHighHz << "\n";

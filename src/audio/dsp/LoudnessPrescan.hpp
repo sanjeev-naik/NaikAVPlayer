@@ -160,6 +160,13 @@ inline double prescanIntegratedLufs(const std::string& filePath, int audioStream
     if (frame) av_frame_free(&frame);
     if (packet) av_packet_free(&packet);
 
+    // Push end-of-stream through the metering graph as well, not just the
+    // decoder. Without this the ebur128 filter never emits its final
+    // partial gating window, so the whole-file figure silently omits the
+    // last fraction of a second -- a small error, but this function exists
+    // precisely to be more accurate than the streaming measurement.
+    meter.flush();
+
     const double integratedLufs = meter.getIntegratedLufs();
 
     swr_free(&swrCtx);

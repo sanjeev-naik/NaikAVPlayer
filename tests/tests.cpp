@@ -3034,22 +3034,73 @@ int main(int argc, char* argv[]) {
             test_assert(entries[0].path == fileA, "loadM3U() still loads the local entry after skipping a URL");
         }
 
-        // SpectrumAnalyzer: the magnitudesDb size-mismatch recovery branch on
-        // computeSpectrum() (only reachable if the size was forced out of
-        // sync with configure()'s own sizing, which no normal call sequence
-        // does) and SpatialDownmixer's zero-routes early return, the
+        // SpectrumAnalyzer: the half-length real FFT, its untangling step
+        // and the Hann coherent-gain normalization, driven end to end. A
+        // full-scale sine parked exactly on a bin centre has to come back
+        // in exactly that bin at 0 dBFS, with its neighbours down at the
+        // floor -- that is the property the display depends on, and it is
+        // the one an error in the packing/untangling algebra would break.
+        //
+        // (This replaces a test that forced the magnitude vector out of
+        // sync with configure()'s sizing to reach a defensive recovery
+        // branch. The rewritten computeSpectrum() indexes fixed kNumBins
+        // storage directly and has no such branch, so the old poke would
+        // now overflow the buffer rather than exercise anything.)
+        //
+        // Then SpatialDownmixer's zero-routes early return, the
         // FIVEPOINT1_BACK route table (no AudioDecoder test drives an actual
         // 5.1-back source through VIRTUAL_SURROUND), and the impossible
         // (all enum values handled) default case in buildRoutes().
         {
+            constexpr int kFft = naikav::dsp::SpectrumAnalyzer::kFftSize;
+            constexpr int kBins = naikav::dsp::SpectrumAnalyzer::kNumBins;
+            constexpr double kRate = 48000.0;
+            constexpr int kTargetBin = 64;
+            const double toneHz = kTargetBin * kRate / kFft; // exact bin centre
+
             naikav::dsp::SpectrumAnalyzer analyzer;
-            analyzer.configure(1, 48000.0);
+            analyzer.configure(1, kRate);
             analyzer.setEnabled(true);
-            analyzer.m_magnitudesDb.resize(3); // force a mismatch vs. kNumBins
-            std::vector<float> samples(naikav::dsp::SpectrumAnalyzer::kFftSize, 0.1f);
-            analyzer.process(samples.data(), static_cast<int>(samples.size()));
-            test_assert(analyzer.getMagnitudesDb().size() == naikav::dsp::SpectrumAnalyzer::kNumBins,
-                        "SpectrumAnalyzer recovers from a magnitudesDb size mismatch on computeSpectrum()");
+
+            // Several blocks: the frame-to-frame exponential smoothing
+            // starts pinned at the -90 dB floor and takes a few FFT
+            // updates to converge on the real level.
+            std::vector<float> block(static_cast<size_t>(kFft));
+            long phase = 0;
+            for (int b = 0; b < 12; ++b) {
+                for (int i = 0; i < kFft; ++i, ++phase) {
+                    block[static_cast<size_t>(i)] = static_cast<float>(std::sin(
+                        2.0 * naikav::dsp::kPi * toneHz * static_cast<double>(phase) / kRate));
+                }
+                analyzer.process(block.data(), kFft);
+            }
+
+            std::vector<float> mags = analyzer.getMagnitudesDb();
+            test_assert(mags.size() == static_cast<size_t>(kBins),
+                        "SpectrumAnalyzer publishes exactly kNumBins magnitude values");
+
+            int peakBin = 0;
+            for (size_t i = 1; i < mags.size(); ++i) {
+                if (mags[i] > mags[static_cast<size_t>(peakBin)]) {
+                    peakBin = static_cast<int>(i);
+                }
+            }
+            test_assert(peakBin == kTargetBin,
+                        "SpectrumAnalyzer's real-input FFT puts a bin-centred tone in exactly that bin");
+            test_assert(std::fabs(mags[static_cast<size_t>(peakBin)]) < 1.0f,
+                        "SpectrumAnalyzer's window coherent-gain normalization reads a full-scale tone at 0 dBFS");
+            test_assert(mags[static_cast<size_t>(kTargetBin - 4)] < -60.0f &&
+                            mags[static_cast<size_t>(kTargetBin + 4)] < -60.0f,
+                        "SpectrumAnalyzer leaves bins away from the tone down at the noise floor");
+            test_assert(analyzer.getWaveformSamples().size() == static_cast<size_t>(kFft),
+                        "SpectrumAnalyzer publishes a full kFftSize waveform snapshot");
+
+            analyzer.reset();
+            std::vector<float> cleared = analyzer.getMagnitudesDb();
+            test_assert(cleared.size() == static_cast<size_t>(kBins) &&
+                            cleared[static_cast<size_t>(kTargetBin)] ==
+                                naikav::dsp::SpectrumAnalyzer::kFloorDb,
+                        "SpectrumAnalyzer::reset() republishes an all-floor spectrum");
         }
         {
             naikav::dsp::SpatialDownmixer downmixer;
@@ -5626,9 +5677,11 @@ int main(int argc, char* argv[]) {
                     test_assert(peakL > 0.3f, "SpatialDownmixer: center-channel source is audible in the output");
                 }
 
-                // Side-left-only signal should be delayed (silent for the
-                // first sample) and land louder in L than in R once the
-                // delay line fills.
+                // Side-left-only signal: the direct term arrives at frame 0
+                // (surrounds are no longer 100% diffuse -- that stripped
+                // their entire top end and added a slap-back), the delayed
+                // term adds on top once the delay line fills, and the whole
+                // thing lands louder in L than in R.
                 {
                     naikav::dsp::SpatialDownmixer dmSide;
                     dmSide.configure(SL::FIVEPOINT1_SIDE, kSR);
@@ -5640,8 +5693,13 @@ int main(int argc, char* argv[]) {
                     std::vector<float> out(static_cast<size_t>(n) * 2, 0.0f);
                     dmSide.process(in.data(), n, out.data());
 
-                    test_assert(out[0] == 0.0f && out[1] == 0.0f,
-                                "SpatialDownmixer: a surround channel's contribution is delayed (silent at frame 0)");
+                    // Frame 0 carries the direct term only: audible
+                    // immediately, and quieter than the settled level that
+                    // includes the delayed copy.
+                    test_assert(out[0] > 0.0f,
+                                "SpatialDownmixer: a surround channel's direct term reaches the output undelayed (audible at frame 0)");
+                    test_assert(out[0] > out[1],
+                                "SpatialDownmixer: the undelayed surround term is already panned toward its own side");
 
                     float tailPeakL = 0.0f, tailPeakR = 0.0f;
                     for (int f = n - 100; f < n; ++f) {
@@ -5652,6 +5710,8 @@ int main(int argc, char* argv[]) {
                                 "SpatialDownmixer: a side-left source lands louder in the left ear than the right");
                     test_assert(tailPeakR > 0.0f,
                                 "SpatialDownmixer: a side-left source still bleeds (quieter) into the right ear");
+                    test_assert(tailPeakL > out[0] + 1e-6f,
+                                "SpatialDownmixer: the delayed surround term arrives on top of the direct one, so the settled level exceeds frame 0");
                 }
 
                 // LFE-only signal should split evenly (non-directional).
@@ -5905,6 +5965,13 @@ int main(int argc, char* argv[]) {
                     int n = std::min(kChunk, total - start);
                     fillSine(buf, 1000.0, inputAmplitude, start, n);
                     norm.process(buf.data(), n);
+                    // Metering no longer happens inside process(): the
+                    // audio thread only queues, and a normal thread drains.
+                    // In the real player that drain is
+                    // AudioDecoder::serviceDeferredMaintenance(), polled
+                    // once per frame by PlayerController; here it stands in
+                    // for that. See LoudnessNormalizer's class comment.
+                    norm.serviceMetering();
                     if (start + kChunk >= total) {
                         lastOutputPeak = peakOf(buf, n);
                     }
@@ -6131,10 +6198,12 @@ int main(int argc, char* argv[]) {
             testSettings.surround3dEnabled = true;
             testSettings.surround3dIntensity = 1.35f; // distinctive, non-default value
             testSettings.crossoverBassRedirectEnabled = true; // distinctive, non-default value
+            testSettings.crossoverLfeGainDb = -3.5f; // distinctive, non-default value
             testSettings.balance = -0.4f; // distinctive, non-default value
             testSettings.noiseGateEnabled = true;
             testSettings.noiseGateThresholdDb = -35.0f;
             testSettings.noiseGateRatio = 6.0f;
+            testSettings.noiseGateRangeDb = 48.0f; // distinctive, non-default value
             testSettings.multibandEnabled = true;
             testSettings.multibandLowMidHz = 300.0f;
             testSettings.multibandMidHighHz = 3500.0f;

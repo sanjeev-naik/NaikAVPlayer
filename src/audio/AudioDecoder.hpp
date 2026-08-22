@@ -2,6 +2,7 @@
 
 #include <vector>
 #include <atomic>
+#include <cstdint>
 #include <mutex>
 #include <string>
 #include "core/ThreadSafeQueue.hpp"
@@ -101,6 +102,22 @@ private:
     // Audio Clock synchronization variables
     double m_clock; // Current audio clock (in seconds)
     std::mutex m_clockMutex;
+
+    // Frames of this buffer already handed to the device at the moment
+    // m_clock was last written. The clock and the buffer offset are two
+    // halves of one logical position, so they are published together
+    // under m_clockMutex: reading them separately let getAudioClock()
+    // observe a freshly-reset offset alongside the previous frame's base
+    // PTS, which showed up as up to one frame (~20ms) of A/V sync jitter
+    // that was not present in the audio itself.
+    int64_t m_clockFrameOffset = 0;
+
+    // Total output latency, in frames, introduced by lookahead stages
+    // downstream of the clock (the DSP chain's limiter when enabled, plus
+    // the always-on safety limiter). Tracked for diagnostics only -- see
+    // the long comment in getAudioClock() for why it is NOT subtracted
+    // from the clock. Written on the audio thread (or init()).
+    std::atomic<int> m_dspLatencyFrames{0};
     
     // Decoding temporary buffer. Holds interleaved AV_SAMPLE_FMT_FLT samples
     // (raw bytes; m_outSampleFmt controls what swr actually writes here) --
@@ -114,6 +131,19 @@ private:
     std::atomic<size_t> m_audioBufferIndex;
     size_t m_audioBufferSize;
     std::mutex m_audioMutex;
+
+    // Reusable scratch for sdlAudioStreamCallback's output block. Sized
+    // once in init() to the largest block SDL can ask for, so the callback
+    // never allocates -- it previously constructed a std::vector<uint8_t>
+    // on every single callback, on the real-time thread.
+    std::vector<uint8_t> m_callbackBuffer;
+
+    // Volume actually applied to the last sample handed to the device.
+    // A volume change is ramped from this toward m_volume across the block
+    // rather than applied as a step, which is a waveform discontinuity --
+    // an audible click on every volume keypress and on mute/unmute. Only
+    // touched from the audio callback thread.
+    float m_appliedVolume = 1.0f;
 
     // State for the TPDF dither applied when truncating float samples down
     // to the S16 device format. Per-instance (not global/static) so the
@@ -131,6 +161,10 @@ private:
     // Which decodeAndResample() exit path produced a silent block, so an
     // underrun can be attributed rather than guessed at.
     std::atomic<uint64_t> m_queueEmptyCount{0};
+    // Decoded frames discarded for arriving too far behind the clock (see
+    // decodeAndResample). Each one is a waveform discontinuity, so it
+    // belongs with the other glitch counters rather than being invisible.
+    std::atomic<uint64_t> m_lateFrameDrops{0};
     std::atomic<uint64_t> m_sendFailCount{0};
     std::atomic<uint64_t> m_receiveFailCount{0};
     std::atomic<int> m_lastFailReason{0};
@@ -167,6 +201,12 @@ private:
     // SDL_GetAudioDeviceFormat() in init() (0 if the query failed/unknown).
     // See getDeviceNativeChannels().
     int m_deviceNativeChannels = 0;
+
+    // The target device's native sample rate, from the same
+    // SDL_GetAudioDeviceFormat() query (0 if unknown). Used by init() to
+    // pick m_outSampleRate instead of forcing 48kHz -- see the comment
+    // there. The query already read this field and threw it away.
+    int m_deviceNativeSampleRate = 0;
 
     // Set via setChannelOption() before init(); see AudioChannelOption.
     AudioChannelOption m_channelOption = AudioChannelOption::AUTO;
@@ -274,17 +314,80 @@ private:
     // 0dBFS backstop -- see applyDspSettings().
     naikav::dsp::Limiter m_finalSafetyLimiter;
 
-    // Guards m_dsp/m_loudness against the one real cross-thread hazard in
-    // this class: applyDspSettings() is meant to be called live, from the
-    // UI thread, while decodeAndResample() concurrently reads/mutates the
-    // same filter/envelope state on the SDL audio callback thread. Held
-    // only briefly on both sides (a handful of float writes on the UI side,
-    // one process() call on the audio side), so contention is a non-issue
-    // in practice. The raw dsp()/loudness() accessors below are NOT
-    // protected by this -- they predate applyDspSettings() and remain
-    // correct only for single-threaded use (tests, init-time-only setup).
-    mutable std::mutex m_dspMutex;
+    // ---- Control-thread -> audio-thread settings mailbox --------------
+    //
+    // applyDspSettings() used to take a std::mutex that the SDL audio
+    // callback also took, around the entire DSP path. That is a blocking
+    // primitive on a real-time thread: if the control thread were
+    // preempted while holding it -- mid biquad redesign, say, or anywhere
+    // inside the filter designs a preset change runs -- the audio callback
+    // would block for an unbounded time and the device would underrun.
+    // Classic priority inversion, and "the critical section is short" does
+    // not fix it, because the hazard is the scheduler's timing rather than
+    // the section's length.
+    //
+    // So: no lock. The control thread publishes a plain settings snapshot
+    // through a seqlock, and the audio thread picks it up at the top of
+    // decodeAndResample() and applies it itself. The audio thread never
+    // blocks, never waits and never allocates, and every DSP object below
+    // is now touched by exactly one thread -- which is what actually makes
+    // them safe, rather than a mutex making concurrent access survivable.
+    //
+    // Single-producer/single-consumer by construction: PlayerController
+    // serializes every applyDspSettings()/primeLoudnessPrescan() call
+    // behind its own m_audioDecoderMutex on the render thread, and the
+    // sole consumer is the audio callback. AudioDspSettings is a flat
+    // aggregate of bools and floats with no pointers or heap state, so a
+    // torn read caught by the seqlock is discardable rather than dangerous.
+    //
+    // This is the same handshake SpectrumAnalyzer uses to publish spectrum
+    // frames in the other direction; see its readSnapshot().
+    naikav::dsp::AudioDspSettings m_mailboxSettings;
+    std::atomic<uint32_t> m_mailboxSeq{0};
+
+    // Control-thread-owned copy of the last published snapshot, so
+    // getDspSettings() answers without reaching across to the mailbox at
+    // all. The producer is also the only caller, so this needs no
+    // handshake -- and keeping the seqlock's cross-thread read confined to
+    // the audio side keeps the one unavoidable racy read in one place.
+    naikav::dsp::AudioDspSettings m_publishedSettings;
+
+    // Prescan priming rides the same one-way street, as its own one-shot
+    // flag: it arrives on the render thread (from the background scan
+    // thread's result, or from a loudness tag read inline) and it mutates
+    // LoudnessNormalizer state that the audio thread owns.
+    std::atomic<double> m_pendingPrescanLufs{-120.0};
+    std::atomic<bool> m_pendingPrescan{false};
+
+    // Audio-thread-owned. The last snapshot actually applied to the DSP
+    // objects, kept so applyPendingDspSettings() redesigns only the
+    // filters whose parameters really changed -- dragging one EQ band must
+    // not cost every filter design in the chain on the callback thread.
     naikav::dsp::AudioDspSettings m_currentDspSettings;
+    uint32_t m_appliedMailboxSeq = 0;
+    // False until a snapshot has been applied once, so the first one
+    // applies every parameter rather than diffing against a
+    // default-constructed struct that may coincidentally match.
+    bool m_hasAppliedDspSettings = false;
+
+    // Seqlock read of the mailbox. False if the writer was caught
+    // mid-update on every attempt, leaving *out untouched; the audio
+    // thread simply retries on the next block, which is invisible against
+    // a control surface that moves at UI frame rate.
+    bool readMailboxSettings(naikav::dsp::AudioDspSettings* out, uint32_t* seq) const;
+
+    // Drains the mailbox above onto the DSP objects, and applies any
+    // pending prescan priming. Audio thread only; called at the top of
+    // decodeAndResample(). Allocation-free: every DSP setter it reaches
+    // only rewrites existing coefficient storage (the vectors are sized in
+    // configure()), so the worst case is a bounded handful of
+    // transcendental calls, not an unbounded wait.
+    void applyPendingDspSettings();
+
+    // Recomputes m_dspLatencyFrames from the currently-active lookahead
+    // stages. Audio thread only, or init(), which runs before the device
+    // is resumed and therefore before any callback can observe it.
+    void updateDspLatency();
 
     // Live pointer to the demuxer's seek-generation counter. See
     // VideoDecoder's m_seekGeneration / Demuxer.hpp's m_seekGeneration
@@ -341,6 +444,9 @@ public:
     uint64_t getSilenceInjectionCount() const { return m_silenceInjections.load(std::memory_order_relaxed); }
     uint64_t getSilenceBytes() const { return m_silenceBytes.load(std::memory_order_relaxed); }
     uint64_t getQueueEmptyCount() const { return m_queueEmptyCount.load(std::memory_order_relaxed); }
+    // Decoded audio frames dropped for lateness. Non-zero means audible
+    // discontinuities that the silence counters above do NOT cover.
+    uint64_t getLateFrameDropCount() const { return m_lateFrameDrops.load(std::memory_order_relaxed); }
     uint64_t getSendFailCount() const { return m_sendFailCount.load(std::memory_order_relaxed); }
     uint64_t getReceiveFailCount() const { return m_receiveFailCount.load(std::memory_order_relaxed); }
     int getLastFailReason() const { return m_lastFailReason.load(std::memory_order_relaxed); }
@@ -389,6 +495,17 @@ public:
     // necessarily what's physically reproduced.
     int getDeviceNativeChannels() const { return m_deviceNativeChannels; }
 
+    // The resolved output sample rate. No longer always 48000: init()
+    // prefers the source's own rate when the device can take it, else the
+    // device's native rate, so the common 44.1kHz case need not be
+    // resampled at all.
+    int getOutputSampleRate() const { return m_outSampleRate; }
+
+    // Output latency in frames contributed by the lookahead limiters
+    // currently active. Diagnostic only: see getAudioClock() for why the
+    // audio clock deliberately does not compensate for it.
+    int getDspLatencyFrames() const { return m_dspLatencyFrames.load(std::memory_order_relaxed); }
+
     // Number of channels actually being sent to the audio device. Resolved
     // in init() from the source layout (see chooseOutputLayout in the .cpp);
     // may fall back to 2 (stereo) if the source layout isn't a directly
@@ -423,10 +540,16 @@ public:
     // for live control/diagnostics during playback instead.
     naikav::dsp::LoudnessNormalizer& loudness() { return m_loudness; }
 
-    // Thread-safe: applies every DSP/loudness parameter in one locked step,
-    // safe to call from the UI thread while decodeAndResample() is running
-    // concurrently on the SDL audio callback thread. This is the intended
-    // path for live GUI/preset control during playback.
+    // Thread-safe and wait-free against the audio callback: sanitizes the
+    // settings, then publishes them as one atomic snapshot that the audio
+    // thread picks up at the top of its next decodeAndResample(). Takes no
+    // lock, so it can never stall the callback -- see the mailbox comment
+    // on m_mailboxSeq. This is the intended path for live GUI/preset
+    // control during playback.
+    //
+    // Call from one thread only (PlayerController's render thread, which
+    // already serializes it behind m_audioDecoderMutex): the mailbox is
+    // single-producer.
     void applyDspSettings(const naikav::dsp::AudioDspSettings& settings);
 
     // Thread-safe: primes the loudness normalizer with a whole-file
@@ -435,22 +558,46 @@ public:
     // switching it into two-pass mode -- see
     // LoudnessNormalizer::primeWithPrescannedLufs(). Callers should run the
     // (blocking, decode-only) prescan on whatever thread they like before
-    // calling this; only this final priming step touches shared state and
-    // needs the lock.
+    // calling this; this final priming step just hands the value to the
+    // audio thread through the same wait-free mailbox applyDspSettings()
+    // uses, and the audio thread applies it to the normalizer it owns.
     void primeLoudnessPrescan(double integratedLufs);
 
-    // Thread-safe snapshot of whatever was last passed to applyDspSettings()
+    // Services deferred, non-real-time-safe maintenance the audio callback
+    // deliberately does not do itself -- currently rebuilding the loudness
+    // meter's retired filter graph after a seek swapped to its spare (see
+    // LoudnessMeter::serviceRebuild()). MUST be called from a normal
+    // thread; PlayerController does so once per frame. Cheap and safe to
+    // call when there is nothing to do.
+    void serviceDeferredMaintenance();
+
+    // Snapshot of whatever was last passed to applyDspSettings()
     // (default-constructed AudioDspSettings if it was never called).
+    // Lock-free and allocation-free. Call from the same thread that calls
+    // applyDspSettings(): it reads that thread's own copy, so it is a
+    // plain read rather than a cross-thread one.
+    //
+    // Returns by value on purpose. A const reference would alias
+    // m_publishedSettings, which applyDspSettings() overwrites in place,
+    // so a caller holding the reference across a later applyDspSettings()
+    // would silently start reading the new settings instead of the ones it
+    // asked for. AudioDspSettings is a couple of hundred bytes of PODs and
+    // this is called at most once per UI frame, so the copy buys immunity
+    // to that for nothing measurable.
+    // cppcheck-suppress returnByReference
     naikav::dsp::AudioDspSettings getDspSettings() const;
 
-    // Thread-safe live diagnostics, for HUD display.
+    // Thread-safe live diagnostics, for HUD display. Lock-free: both are
+    // single atomic loads of values the audio thread publishes, so the
+    // Audio Processing panel polling them every UI frame cannot contend
+    // with the callback.
     double getMeasuredIntegratedLufs() const;
     float getCurrentLoudnessGainDb() const;
 
     // Thread-safe snapshot of the current magnitude spectrum (dB per bin,
     // see SpectrumAnalyzer::kNumBins/binFrequencyHz()), for the Audio
     // Processing panel's visualizer. Self-synchronized inside
-    // SpectrumAnalyzer -- doesn't need/use m_dspMutex.
+    // SpectrumAnalyzer's own seqlock -- needs no external synchronization.
     std::vector<float> getSpectrumMagnitudesDb() const { return m_spectrum.getMagnitudesDb(); }
     std::vector<float> getWaveformSamples() const { return m_spectrum.getWaveformSamples(); }
     static int getSpectrumNumBins() { return naikav::dsp::SpectrumAnalyzer::kNumBins; }

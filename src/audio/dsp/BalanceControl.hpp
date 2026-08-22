@@ -19,7 +19,14 @@ class BalanceControl {
 public:
     void configure(int channels) { m_channels = channels; }
 
-    void setBalance(float balance) { m_balance = std::clamp(balance, -1.0f, 1.0f); }
+    void setBalance(float balance) {
+        // A non-finite value would silently multiply the whole output by
+        // NaN. Unlike the IIR stages this one has no state to poison, but
+        // rejecting it here keeps every DSP setter consistent about
+        // refusing input it cannot use.
+        if (!std::isfinite(balance)) return;
+        m_balance = std::clamp(balance, -1.0f, 1.0f);
+    }
     float getBalance() const { return m_balance; }
 
     // In-place processing of an interleaved float buffer. No-op unless

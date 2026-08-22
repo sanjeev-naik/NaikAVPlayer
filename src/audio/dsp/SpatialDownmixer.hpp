@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <vector>
 #include "audio/dsp/Biquad.hpp"
+#include "audio/dsp/DspMath.hpp"
 
 namespace naikav::dsp {
 
@@ -22,13 +23,27 @@ namespace naikav::dsp {
 //   1. Front left/right pass straight to their own ear, center splits
 //      evenly, LFE sums to both ears at a fixed low gain (bass has no
 //      useful directional information at this level of approximation).
-//   2. Surround/back channels are NOT panned directly. Instead each one
-//      is sent through its own short delay line and a gentle lowpass
-//      ("diffuse" path), then split unevenly between the ears (louder
-//      toward its own side). The delay + high-frequency rolloff
-//      approximates the head-shadow/distance cue that makes a source
-//      read as "behind you" rather than merely "off to the side" --
-//      amplitude panning alone can't distinguish those two.
+//   2. Surround/back channels are split between two paths: a direct,
+//      undelayed, unfiltered term, and a "diffuse" term sent through its
+//      own short delay line and a gentle lowpass. Both are then split
+//      unevenly between the ears (louder toward its own side). The
+//      delay + high-frequency rolloff approximates the head-shadow/
+//      distance cue that makes a source read as "behind you" rather than
+//      merely "off to the side" -- amplitude panning alone can't
+//      distinguish those two.
+//
+//      The direct term matters as much as the diffuse one. An earlier
+//      version routed surrounds through the diffuse path *only*, so
+//      100% of surround content was delayed 8-14 ms and lowpassed at
+//      5-6.5 kHz. Discrete surround effects -- a gunshot, a door slam,
+//      anything with real high-frequency content placed deliberately in
+//      a rear channel -- lost their entire top end and picked up an
+//      audible slap-back, because there was no un-delayed copy for the
+//      ear to fuse the reflection onto. Splitting
+//      kSurroundDirectFraction / kSurroundDiffuseFraction keeps the
+//      spectrum and the transient intact while the delayed, filtered
+//      copy still supplies the rear cue. The two fractions sum to 1, so
+//      a surround channel's overall contribution is unchanged.
 //
 // FFmpeg-agnostic by design (plain enum, not an AVChannelLayout), like
 // DspChain -- the caller (AudioDecoder) maps the real source layout to
@@ -49,11 +64,20 @@ public:
         const size_t n = m_routes.size();
         m_ring.assign(n, {});
         m_writePos.assign(n, 0);
+        m_delay.assign(n, 1);
+        m_mask.assign(n, 0);
         m_lowpass.assign(n, Biquad{});
         for (size_t i = 0; i < n; ++i) {
             const auto& route = m_routes[i];
-            int delaySamples = std::max(1, static_cast<int>(std::lround(route.diffuseDelayMs / 1000.0 * m_sampleRate)));
-            m_ring[i].assign(static_cast<size_t>(delaySamples), 0.0f);
+            const int delaySamples = std::max(1, static_cast<int>(std::lround(route.diffuseDelayMs / 1000.0 * m_sampleRate)));
+            // Power-of-two capacity so the ring wraps with a mask instead
+            // of an integer division, which this loop would otherwise pay
+            // once per surround channel per sample. Capacity exceeds the
+            // delay so the slot being read has not been overwritten yet.
+            const int cap = nextPowerOfTwo(delaySamples + 1);
+            m_delay[i] = delaySamples;
+            m_mask[i] = cap - 1;
+            m_ring[i].assign(static_cast<size_t>(cap), 0.0f);
             if (route.diffuseLowpassHz > 0.0) {
                 m_lowpass[i].setLowpass(route.diffuseLowpassHz, 0.70710678118, m_sampleRate);
             }
@@ -67,7 +91,7 @@ public:
         for (auto& ring : m_ring) {
             std::fill(ring.begin(), ring.end(), 0.0f);
         }
-        std::fill(m_writePos.begin(), m_writePos.end(), size_t{0});
+        std::fill(m_writePos.begin(), m_writePos.end(), 0);
         for (auto& lp : m_lowpass) {
             lp.reset();
         }
@@ -95,9 +119,11 @@ public:
 
                 if (route.diffuseGainL != 0.0f || route.diffuseGainR != 0.0f) {
                     std::vector<float>& ring = m_ring[ch];
-                    const float delayed = ring[m_writePos[ch]];
-                    ring[m_writePos[ch]] = x;
-                    m_writePos[ch] = (m_writePos[ch] + 1) % ring.size();
+                    const int mask = m_mask[ch];
+                    const int readPos = (m_writePos[ch] - m_delay[ch]) & mask;
+                    const float delayed = ring[static_cast<size_t>(readPos)];
+                    ring[static_cast<size_t>(m_writePos[ch])] = x;
+                    m_writePos[ch] = (m_writePos[ch] + 1) & mask;
 
                     float diffuse = delayed;
                     if (route.diffuseLowpassHz > 0.0) {
@@ -135,11 +161,26 @@ private:
         return r;
     }
 
+    // How a surround channel's level is split between the undelayed,
+    // full-bandwidth path and the delayed, lowpassed one. They sum to 1,
+    // so changing the balance re-weights the rear cue without changing
+    // how loud the surround channel is in the downmix. Direct-dominant:
+    // enough delayed energy to place the source behind the listener,
+    // not so much that the direct sound is masked by its own reflection.
+    static constexpr float kSurroundDirectFraction = 0.6f;
+    static constexpr float kSurroundDiffuseFraction = 0.4f;
+
     static ChannelRoute surroundRoute(float nearGain, float farGain, bool nearIsLeft,
                                        double delayMs, double lowpassHz) {
         ChannelRoute r;
-        r.diffuseGainL = nearIsLeft ? nearGain : farGain;
-        r.diffuseGainR = nearIsLeft ? farGain : nearGain;
+        const float nearDirect  = nearGain * kSurroundDirectFraction;
+        const float farDirect   = farGain  * kSurroundDirectFraction;
+        const float nearDiffuse = nearGain * kSurroundDiffuseFraction;
+        const float farDiffuse  = farGain  * kSurroundDiffuseFraction;
+        r.directGainL  = nearIsLeft ? nearDirect  : farDirect;
+        r.directGainR  = nearIsLeft ? farDirect   : nearDirect;
+        r.diffuseGainL = nearIsLeft ? nearDiffuse : farDiffuse;
+        r.diffuseGainR = nearIsLeft ? farDiffuse  : nearDiffuse;
         r.diffuseDelayMs = delayMs;
         r.diffuseLowpassHz = lowpassHz;
         return r;
@@ -182,9 +223,35 @@ private:
         return {};
     }
 
+    // Deliberately no output normalization.
+    //
+    // The route gains above are absolute, not relative: front left/right
+    // reach their own ear at unity, so a hard-panned source downmixes at
+    // exactly the level it had, and a 5.1 file sounds as loud as a stereo
+    // one. That property is the whole point of the direct path.
+    //
+    // A previous version scaled the entire matrix by 1/sqrt(sum of
+    // squares) of every channel's coefficients. That figure is the level
+    // reached only if every channel is simultaneously at full scale AND
+    // perfectly correlated -- and the resulting scalar was then applied to
+    // every route, the front direct path included, which never contributed
+    // to the problem. Measured cost on a front-left-only source: -4.2 dB
+    // on 5.1 and -5.3 dB on 7.1, i.e. an audible drop in loudness every
+    // time playback moved from a stereo file to a surround one, paid
+    // permanently to bound a peak that real programme material does not
+    // produce.
+    //
+    // The correlated worst case is real but rare, and it is exactly what a
+    // limiter is for: AudioDecoder runs m_finalSafetyLimiter after this
+    // stage unconditionally, precisely so summing stages like this one can
+    // be written for the common case. See its comment, which names this
+    // downmixer as one of the stages it exists to catch.
+
     std::vector<ChannelRoute> m_routes;
     std::vector<std::vector<float>> m_ring;
-    std::vector<size_t> m_writePos;
+    std::vector<int> m_writePos;
+    std::vector<int> m_delay;
+    std::vector<int> m_mask;
     std::vector<Biquad> m_lowpass;
     double m_sampleRate = 48000.0;
 };

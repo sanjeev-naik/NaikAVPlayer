@@ -1,9 +1,11 @@
 #pragma once
 
 #include "audio/dsp/ParametricEQ.hpp"
+#include "audio/dsp/NoiseGate.hpp"
 #include <string>
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 
 namespace naikav::dsp {
 
@@ -43,6 +45,11 @@ struct AudioDspSettings {
     // every non-LFE channel into the LFE channel instead of just taming
     // the LFE channel in isolation. See Crossover::setBassRedirectEnabled().
     bool crossoverBassRedirectEnabled = false;
+    // Level trim for the LFE/subwoofer channel. 0 dB is exactly unity --
+    // bass management sums at unity because it is energy-preserving; this
+    // is the visible control for trimming it, replacing a hidden 1/N that
+    // used to discard most of the redirected bass. See Crossover.hpp.
+    float crossoverLfeGainDb = 0.0f;
 
     bool loudnessEnabled = false;
     float loudnessTargetLufs = -16.0f; // streaming-style default
@@ -69,6 +76,9 @@ struct AudioDspSettings {
     bool noiseGateEnabled = false;
     float noiseGateThresholdDb = -50.0f;
     float noiseGateRatio = 4.0f;
+    // Maximum attenuation while the gate is closed. Also bounds how fast
+    // the gate reopens -- see NoiseGate.hpp's class comment.
+    float noiseGateRangeDb = NoiseGate::kDefaultRangeDb;
 
     // Multiband compression (low/mid/high) -- see MultibandCompressor.hpp.
     // Each band's "disabled" state is likewise ratio 1:1; multibandEnabled
@@ -106,6 +116,7 @@ struct AudioDspSettings {
             crossoverEnabled != other.crossoverEnabled ||
             crossoverCutoffHz != other.crossoverCutoffHz ||
             crossoverBassRedirectEnabled != other.crossoverBassRedirectEnabled ||
+            crossoverLfeGainDb != other.crossoverLfeGainDb ||
             loudnessEnabled != other.loudnessEnabled ||
             loudnessTargetLufs != other.loudnessTargetLufs ||
             widenerEnabled != other.widenerEnabled ||
@@ -116,6 +127,7 @@ struct AudioDspSettings {
             noiseGateEnabled != other.noiseGateEnabled ||
             noiseGateThresholdDb != other.noiseGateThresholdDb ||
             noiseGateRatio != other.noiseGateRatio ||
+            noiseGateRangeDb != other.noiseGateRangeDb ||
             multibandEnabled != other.multibandEnabled ||
             multibandLowMidHz != other.multibandLowMidHz ||
             multibandMidHighHz != other.multibandMidHighHz ||
@@ -137,6 +149,81 @@ struct AudioDspSettings {
         return true;
     }
     bool operator!=(const AudioDspSettings& other) const { return !(*this == other); }
+
+    // Clamps every field into the range its DSP stage can actually accept,
+    // replacing any non-finite value with that field's default.
+    //
+    // This is the first of three lines of defence, and the only one that
+    // sees the value before it is stored. The settings file is parsed with
+    // std::stof and previously stored the result verbatim, so a
+    // hand-edited or corrupted player_settings.txt could hand a crossover
+    // a cutoff above Nyquist (alpha goes negative, a0 approaches zero, the
+    // poles leave the unit circle) or a literal "nan". Because a biquad is
+    // a feedback structure, the resulting Inf/NaN propagates through its
+    // state forever: verified that dragging the slider back to a sane
+    // value did NOT recover it, and only reset() -- reached only from the
+    // seek/flush path -- did. The user hears permanent silence or
+    // full-scale noise with no obvious way out.
+    //
+    // The other two lines are the individual setters (Crossover::
+    // setCutoffHz, MultibandCompressor::setCrossoverFrequencies,
+    // ParametricEQ::setBand*) and Biquad::validParams(), which refuses to
+    // adopt coefficients it cannot compute safely.
+    //
+    // Ranges match the UI controls, widened where a preset legitimately
+    // goes further, so sanitizing a settings file the app itself wrote is
+    // always a no-op.
+    void sanitize() {
+        const AudioDspSettings d{};
+
+        auto fix = [](float v, float lo, float hi, float fallback) {
+            if (!std::isfinite(v)) return fallback;
+            return std::clamp(v, lo, hi);
+        };
+
+        for (int i = 0; i < ParametricEQ::kNumBands; ++i) {
+            eqBandGainDb[i] = fix(eqBandGainDb[i], -24.0f, 24.0f, d.eqBandGainDb[i]);
+            eqBandFreqHz[i] = fix(eqBandFreqHz[i], 20.0f, 20000.0f, d.eqBandFreqHz[i]);
+            eqBandQ[i]      = fix(eqBandQ[i], 0.1f, 10.0f, d.eqBandQ[i]);
+        }
+
+        compressorThresholdDb = fix(compressorThresholdDb, -60.0f, 0.0f, d.compressorThresholdDb);
+        compressorRatio       = fix(compressorRatio, 1.0f, 20.0f, d.compressorRatio);
+
+        limiterCeilingDb      = fix(limiterCeilingDb, -24.0f, 0.0f, d.limiterCeilingDb);
+
+        // 20 Hz .. 500 Hz: a bass-management crossover far outside that is
+        // not bass management, and the upper bound keeps the filter well
+        // clear of Nyquist at every supported output rate.
+        crossoverCutoffHz     = fix(crossoverCutoffHz, 20.0f, 500.0f, d.crossoverCutoffHz);
+        crossoverLfeGainDb    = fix(crossoverLfeGainDb, -24.0f, 12.0f, d.crossoverLfeGainDb);
+
+        loudnessTargetLufs    = fix(loudnessTargetLufs, -40.0f, 0.0f, d.loudnessTargetLufs);
+        widenerWidth          = fix(widenerWidth, 0.0f, 4.0f, d.widenerWidth);
+        surround3dIntensity   = fix(surround3dIntensity, 0.0f, 4.0f, d.surround3dIntensity);
+        balance               = fix(balance, -1.0f, 1.0f, d.balance);
+
+        noiseGateThresholdDb  = fix(noiseGateThresholdDb, -90.0f, 0.0f, d.noiseGateThresholdDb);
+        noiseGateRatio        = fix(noiseGateRatio, 1.0f, 20.0f, d.noiseGateRatio);
+        noiseGateRangeDb      = fix(noiseGateRangeDb, 6.0f, 96.0f, d.noiseGateRangeDb);
+
+        multibandLowMidHz     = fix(multibandLowMidHz, 20.0f, 2000.0f, d.multibandLowMidHz);
+        multibandMidHighHz    = fix(multibandMidHighHz, 200.0f, 16000.0f, d.multibandMidHighHz);
+        // MultibandCompressor enforces at least an octave of separation
+        // itself (below that, 24 dB/octave slopes overlap so heavily that
+        // the three-way sum notches the midrange). Doing it here too keeps
+        // what gets persisted consistent with what actually gets applied.
+        if (multibandMidHighHz < multibandLowMidHz * 2.0f) {
+            multibandMidHighHz = std::min(16000.0f, multibandLowMidHz * 2.0f);
+            multibandLowMidHz = std::min(multibandLowMidHz, multibandMidHighHz * 0.5f);
+        }
+        multibandLowThresholdDb  = fix(multibandLowThresholdDb, -60.0f, 0.0f, d.multibandLowThresholdDb);
+        multibandLowRatio        = fix(multibandLowRatio, 1.0f, 20.0f, d.multibandLowRatio);
+        multibandMidThresholdDb  = fix(multibandMidThresholdDb, -60.0f, 0.0f, d.multibandMidThresholdDb);
+        multibandMidRatio        = fix(multibandMidRatio, 1.0f, 20.0f, d.multibandMidRatio);
+        multibandHighThresholdDb = fix(multibandHighThresholdDb, -60.0f, 0.0f, d.multibandHighThresholdDb);
+        multibandHighRatio       = fix(multibandHighRatio, 1.0f, 20.0f, d.multibandHighRatio);
+    }
 };
 
 // Canned presets covering common listening scenarios. Each one sets

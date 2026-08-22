@@ -3,28 +3,48 @@
 #include <cmath>
 #include <algorithm>
 
+#include "audio/dsp/DspMath.hpp"
+
 namespace naikav::dsp {
 
-// Feedforward RMS-free (peak-per-frame) soft-knee compressor. Gain
-// reduction is computed once per frame from the loudest channel in that
-// frame ("linked" multichannel detection) and applied equally to every
-// channel, so multichannel/stereo content doesn't shift its image as the
-// gain moves. Uses the standard soft-knee gain computer from Giannoulis,
-// Massberg & Reiss, "Digital Dynamic Range Compressor Design -- A
-// Tutorial and Analysis" (2012), which is smooth (C1-continuous) across
-// the knee rather than kinking at threshold like a hard-knee compressor.
+// Feedforward soft-knee compressor. Gain reduction is computed once per
+// frame from the loudest channel in that frame ("linked" multichannel
+// detection) and applied equally to every channel, so multichannel/stereo
+// content doesn't shift its image as the gain moves. Uses the standard
+// soft-knee gain computer from Giannoulis, Massberg & Reiss, "Digital
+// Dynamic Range Compressor Design -- A Tutorial and Analysis" (2012),
+// which is smooth (C1-continuous) across the knee rather than kinking at
+// threshold like a hard-knee compressor.
 //
-// Defaults (ratio 1:1) are a true no-op regardless of threshold, so
-// enabling the DSP chain doesn't change the sound until configured.
+// The detected level is smoothed before it reaches the gain computer (see
+// LevelDetector in DspMath.hpp). A raw per-frame peak sees a sustained
+// tone cross zero twice per cycle, so the gain envelope ripples at twice
+// the signal frequency -- amplitude modulation, i.e. added harmonic and
+// intermodulation distortion, worst on low-frequency content where the
+// period is long relative to the attack time. NoiseGate already carried a
+// detector for exactly this reason; this one did not, and inherited the
+// problem into all three of MultibandCompressor's bands too. The shared
+// detector is asymmetric (instant attack, smoothed release) so it does
+// this without delaying genuine transients.
+//
+// Defaults (ratio 1:1) are a true no-op regardless of threshold, and
+// process() returns immediately in that state rather than computing a
+// gain it already knows is unity -- these stages run on the audio callback
+// thread, where "transparent" and "free" are not the same thing.
 class Compressor {
 public:
     void configure(int channels, double sampleRate) {
         m_channels = channels;
         m_sampleRate = sampleRate;
+        m_detector.configure(sampleRate);
         updateTimeConstants();
         reset();
     }
 
+    // Peak-referenced, not RMS -- see LevelDetector in DspMath.hpp. For
+    // continuous material this lands within a couple of dB of programme
+    // level; for transient-heavy material the stage engages at a lower
+    // average level than the number suggests.
     void setThresholdDb(float db) { m_thresholdDb = db; }
     void setRatio(float ratio) { m_ratio = std::max(1.0f, ratio); }
     void setKneeDb(float db) { m_kneeDb = std::max(0.0f, db); }
@@ -38,21 +58,34 @@ public:
         updateTimeConstants();
     }
 
+    // True when this stage provably cannot change the signal: at 1:1 the
+    // gain computer returns 0 dB for every input level, so the only
+    // remaining term is the makeup gain.
+    bool isInert() const {
+        return m_ratio <= 1.0f && m_makeupGainDb == 0.0f;
+    }
+
     void reset() {
         m_envelopeDb = 0.0f; // 0 dB = no gain reduction, i.e. the inert/idle state
+        m_detector.reset();
     }
 
     // In-place processing of an interleaved float buffer.
     void process(float* interleaved, int numFrames) {
-        if (m_channels <= 0) return;
+        if (m_channels <= 0 || numFrames <= 0) return;
+        if (isInert()) {
+            // Keep the envelope and detector at rest so re-enabling the
+            // stage starts from a known state rather than a stale one.
+            m_envelopeDb = 0.0f;
+            m_detector.reset();
+            return;
+        }
+
         for (int f = 0; f < numFrames; ++f) {
             float* frame = interleaved + static_cast<size_t>(f) * m_channels;
 
-            float peak = 0.0f;
-            for (int ch = 0; ch < m_channels; ++ch) {
-                peak = std::max(peak, std::fabs(frame[ch]));
-            }
-            const float levelDb = 20.0f * std::log10(peak + 1e-9f);
+            const float level = m_detector.process(framePeak(frame, m_channels));
+            const float levelDb = fastLinearToDb(level + 1e-9f);
 
             const float gr = staticGainReductionDb(levelDb);
 
@@ -62,7 +95,8 @@ public:
             const float coeff = (gr < m_envelopeDb) ? m_attackCoeff : m_releaseCoeff;
             m_envelopeDb = coeff * m_envelopeDb + (1.0f - coeff) * gr;
 
-            const float gainLinear = std::pow(10.0f, (m_envelopeDb + m_makeupGainDb) / 20.0f);
+            const float totalDb = m_envelopeDb + m_makeupGainDb;
+            const float gainLinear = (totalDb == 0.0f) ? 1.0f : fastDbToLinear(totalDb);
             for (int ch = 0; ch < m_channels; ++ch) {
                 frame[ch] *= gainLinear;
             }
@@ -101,6 +135,7 @@ private:
     float m_attackCoeff = 0.0f;
     float m_releaseCoeff = 0.0f;
 
+    LevelDetector m_detector;
     float m_envelopeDb = 0.0f; // 0 dB = no gain reduction, i.e. the inert/idle state
 };
 
