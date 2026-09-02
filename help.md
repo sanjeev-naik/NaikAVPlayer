@@ -327,10 +327,17 @@ The user interface uses Dear ImGui with frosted translucency overlay, high-DPI f
 - **4 Color Palettes**: `Cyberpunk` (Cyan/Magenta), `Sunset Fire` (Amber/Hot Pink), `Mint Emerald` (Mint/Emerald), and `Electric Violet` (Aqua/Purple).
 
 ### Diagnostics HUD & Telemetry Metrics
-- **Hotkey `D`** or CLI flag `--metrics`: Toggles real-time HUD displaying player states, playback clock drift, hardware/software decoder details, queue depths, frame pacing, and HDR/Colorimetry characteristics.
+- **Hotkey `D`** or CLI flag `--metrics`: Toggles real-time HUD displaying player states, playback clock drift, hardware/software decoder details, queue depths, frame pacing, and HDR/Colorimetry characteristics. The HDR section is read-only here -- it reports the tone mapping state; the controls that change it live in the HDR panel (`C`).
 
 ### Audio Processing & DSP Panel
 - **Hotkey `A`** or Dock `[EQ]` Button: Toggles the dedicated Audio Processing overlay for parametric 5-band EQ, noise gate, compressors, limiter, crossover, EBU R128 loudness, 3D surround, stereo widener, balance, channel routing, and live FFT spectrum visualizer.
+
+### HDR Tone Mapping Panel
+- **Hotkey `C`** or Dock `[HDR]` Button: Toggles the HDR -> SDR tone mapping panel. (`C` for *color*; `H` is already taken by the subtitle-delay increment.)
+- **Source / Status**: Reports the file's HDR standard and whether the pipeline is actually tone mapping it, including the source and display peak luminances it resolved.
+- **HDR -> SDR tone mapping**: Master on/off. Off shows the raw HDR signal, which a non-HDR display renders dark and desaturated -- useful for comparing the two side by side.
+- **Display peak**: Peak brightness of your display, 50-1000 nits. 100 nits is the SDR reference; raise it only for a brighter panel.
+- Both settings apply to the next decoded frame (no seek or reopen needed) and persist in `player_settings.txt` as `hdr_tone_map_enabled` and `hdr_target_peak_nits`. They remain adjustable while an SDR file is playing, in which case they apply to the next HDR file opened.
 
 ### Keyboard Shortcuts & Gestures
 
@@ -354,6 +361,7 @@ The user interface uses Dear ImGui with frosted translucency overlay, high-DPI f
 | **`Delete`** (in Playlist panel) | Remove selected item from playlist |
 | **`D`** | Toggle Diagnostics HUD overlay & Telemetry metrics |
 | **`A`** | Toggle Audio Processing panel (EQ, noise gate, compressor, multiband compressor, limiter, crossover, loudness, 3D surround, widener, balance, channel/device/format selection) |
+| **`C`** | Toggle HDR -> SDR Tone Mapping panel (on/off toggle, display peak luminance) |
 | **`Escape`** | Exit Fullscreen (if in fullscreen) or Exit application |
 
 ---

@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **HDR → SDR Tone Mapping (`naikav::video::ToneMapper`):** HDR10, HDR10+, Dolby Vision (base layer) and HLG sources are now converted for SDR display instead of being truncated to 8 bits with their transfer curve intact. Decodes the PQ (SMPTE ST 2084) or HLG (ARIB STD-B67, including its OOTF) transfer function to linear light, rolls highlights off with the ITU-R BT.2390 EETF, converts BT.2020 → BT.709 in linear light with out-of-gamut colors desaturated toward their own luminance, and re-encodes with the BT.709 OETF. Source peak is read from mastering-display metadata when present; display peak defaults to the 100-nit SDR reference and is adjustable. LUT-driven and split across worker threads.
+- **HDR tone mapping panel (`C` hotkey / controls-dock `[HDR]` button):** Reports the source's HDR standard and the live tone mapping status, and carries the HDR → SDR on/off toggle and the display-peak slider (50–1000 nits). Both settings persist to `player_settings.txt` (`hdr_tone_map_enabled`, `hdr_target_peak_nits`) and take effect on the next decoded frame.
+- **Tone mapping status in the diagnostics HUD:** `ColorPipelineInfo::toneMapped` reports whether the pipeline actually converted the frame, shown as a read-only line beside the rest of the color information. The HUD reports the pipeline; the HDR panel changes it.
+
+### Fixed
+
+- **HDR content no longer renders dark and desaturated.** The frame conversion path accepted only 8-bit `YUV420P`/`NV12` on its zero-copy route and sent everything else — including all 10-bit PQ content — through `sws_scale` to 8-bit `YUV420P`, which resamples the bit depth but leaves the PQ curve applied. The diagnostics HUD reported "HDR Standard: HDR10 (PQ)" over the resulting uncorrected picture. 100-nit reference white was reaching the display at code 130 of 255; it now reaches it at 213.
+
 ## [1.0.0] - 2026-07-19
 
 ### Added

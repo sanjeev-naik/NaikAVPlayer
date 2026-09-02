@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <atomic>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <numeric>
@@ -3229,6 +3230,295 @@ int main(int argc, char* argv[]) {
         std::filesystem::remove_all(tmpDir, rmEc);
 
         std::cout << "Playlist unit tests PASSED!" << std::endl;
+    }
+
+    // -------------------------------------------------------------
+    // HDR tone mapping unit tests (naikav::video::ToneMapper). Pure
+    // math on lookup tables -- no SDL, no FFmpeg, no media file --
+    // so these sit alongside the Playlist tests above rather than in
+    // the real-media block below.
+    // -------------------------------------------------------------
+    {
+        using naikav::video::HdrTransfer;
+        using naikav::video::ToneMapper;
+
+        std::cout << "Running HDR ToneMapper unit tests..." << std::endl;
+
+        // --- transfer functions round-trip ---
+        {
+            bool roundTrips = true;
+            for (double nits : {0.1, 1.0, 10.0, 100.0, 203.0, 1000.0, 4000.0, 10000.0}) {
+                const double code = naikav::video::pqInverseEotf(nits / 10000.0);
+                const double back = naikav::video::pqEotf(code) * 10000.0;
+                if (std::fabs(back - nits) > nits * 1e-4) roundTrips = false;
+            }
+            test_assert(roundTrips, "PQ EOTF and its inverse round-trip across the full 0.1..10000 nit range");
+            test_assert(naikav::video::pqEotf(0.0) == 0.0 && naikav::video::pqEotf(1.0) == 1.0,
+                        "PQ EOTF pins both endpoints exactly");
+            test_assert(naikav::video::hlgInverseOetf(0.0) == 0.0 &&
+                            std::fabs(naikav::video::hlgInverseOetf(1.0) - 1.0) < 1e-6,
+                        "HLG inverse OETF maps signal 0 and 1 to scene light 0 and 1");
+            // The two HLG segments must agree at the 0.5 join, or the
+            // ramp shows a visible step there.
+            test_assert(std::fabs(naikav::video::hlgInverseOetf(0.5 - 1e-9) -
+                                  naikav::video::hlgInverseOetf(0.5 + 1e-9)) < 1e-6,
+                        "HLG inverse OETF is continuous across its 0.5 segment boundary");
+        }
+
+        // --- BT.2390 EETF ---
+        {
+            test_assert(naikav::video::bt2390Eetf(0.0, 1000.0, 100.0) == 0.0,
+                        "BT.2390 EETF maps black to black");
+            test_assert(std::fabs(naikav::video::bt2390Eetf(1000.0, 1000.0, 100.0) - 100.0) < 0.5,
+                        "BT.2390 EETF maps the source peak onto the target peak");
+            // Below the knee the curve must be the identity, otherwise
+            // ordinary SDR-range detail gets needlessly darkened.
+            test_assert(std::fabs(naikav::video::bt2390Eetf(10.0, 1000.0, 100.0) - 10.0) < 0.1,
+                        "BT.2390 EETF leaves sub-knee luminance untouched");
+            test_assert(naikav::video::bt2390Eetf(500.0, 1000.0, 100.0) < 500.0,
+                        "BT.2390 EETF compresses highlights above the knee");
+            bool eetfMonotonic = true;
+            double prevOut = -1.0;
+            for (int i = 0; i <= 1000; ++i) {
+                const double out = naikav::video::bt2390Eetf(i * 1.0, 1000.0, 100.0);
+                if (out < prevOut - 1e-9) eetfMonotonic = false;
+                prevOut = out;
+            }
+            test_assert(eetfMonotonic, "BT.2390 EETF is monotonic across the source range");
+            // A target brighter than the source has nothing to roll off.
+            test_assert(std::fabs(naikav::video::bt2390Eetf(100.0, 100.0, 1000.0) - 100.0) < 1e-6,
+                        "BT.2390 EETF is a pass-through when the target peak exceeds the source peak");
+        }
+
+        // Every ToneMapper below is heap-allocated rather than declared as
+        // a plain local. It carries its four lookup tables inline (~53 KB
+        // per instance), which is what a long-lived VideoDecoder member
+        // wants -- no indirection in the per-pixel loop -- but far too
+        // much for a stack local here: MSVC reserves main()'s entire frame
+        // on entry, and seven of these added ~373 KB to a function that
+        // was already using ~561 KB, overflowing the 1 MB stack before a
+        // single test could run. (MinGW's 2 MB reserve happened to absorb
+        // it, so this only ever showed up on the MSVC build.)
+        auto newToneMapper = [] { return std::make_unique<ToneMapper>(); };
+
+        // --- configure() ---
+        {
+            auto tmOwner = newToneMapper();
+            ToneMapper& tm = *tmOwner;
+            test_assert(!tm.isReady(), "ToneMapper is not ready before configure()");
+            test_assert(!tm.configure(HdrTransfer::None, 1000.0f, 100.0f),
+                        "ToneMapper::configure() rejects an SDR (None) transfer");
+            test_assert(!tm.isReady(), "ToneMapper stays unready after a rejected configure()");
+            test_assert(tm.configure(HdrTransfer::PQ, 1000.0f, 100.0f),
+                        "ToneMapper::configure() accepts PQ");
+            test_assert(tm.isReady() && tm.transfer() == HdrTransfer::PQ,
+                        "ToneMapper reports the configured transfer");
+            test_assert(tm.targetPeakNits() == 100.0f, "ToneMapper retains the configured target peak");
+            // A zero/negative source peak must fall back rather than
+            // divide through by it.
+            auto defaultedOwner = newToneMapper();
+            ToneMapper& defaulted = *defaultedOwner;
+            test_assert(defaulted.configure(HdrTransfer::PQ, 0.0f, 100.0f) &&
+                            defaulted.sourcePeakNits() == naikav::video::kDefaultSourcePeakNits,
+                        "ToneMapper::configure() substitutes the default source peak for a zero peak");
+            // Source peak below target must not invert the curve.
+            auto invertedOwner = newToneMapper();
+            ToneMapper& inverted = *invertedOwner;
+            test_assert(inverted.configure(HdrTransfer::PQ, 50.0f, 100.0f) &&
+                            inverted.sourcePeakNits() > inverted.targetPeakNits(),
+                        "ToneMapper::configure() keeps the source peak above the target peak");
+        }
+
+        // --- the mapped picture itself ---
+        {
+            auto tmOwner = newToneMapper();
+            ToneMapper& tm = *tmOwner;
+            tm.configure(HdrTransfer::PQ, 1000.0f, 100.0f);
+
+            auto codeFor = [](double nits) {
+                return static_cast<uint16_t>(
+                    std::lround(naikav::video::pqInverseEotf(nits / 10000.0) * 65535.0));
+            };
+            auto grey = [&](double nits) {
+                uint8_t r = 0, g = 0, b = 0;
+                const uint16_t c = codeFor(nits);
+                tm.mapPixel(c, c, c, r, g, b);
+                return r;
+            };
+
+            uint8_t r = 0, g = 0, b = 0;
+            tm.mapPixel(0, 0, 0, r, g, b);
+            test_assert(r == 0 && g == 0 && b == 0, "ToneMapper maps code 0 to black");
+
+            const uint16_t peak = codeFor(1000.0);
+            tm.mapPixel(peak, peak, peak, r, g, b);
+            test_assert(r == 255 && g == 255 && b == 255,
+                        "ToneMapper maps the source peak to full-scale white");
+
+            tm.mapPixel(65535, 65535, 65535, r, g, b);
+            test_assert(r == 255, "ToneMapper clamps above-peak input rather than wrapping");
+
+            // The bug this whole path exists to fix: 100 nits is SDR
+            // reference white inside HDR content. Truncating the PQ code
+            // to 8 bits renders it at 130/255, which is what made HDR
+            // look dark. It must land far brighter than that.
+            const int oldTruncated = codeFor(100.0) >> 8;
+            test_assert(oldTruncated < 140,
+                        "PQ code truncation really does put 100-nit white near half scale");
+            test_assert(grey(100.0) > 200,
+                        "Tone mapping lifts 100-nit reference white to near display white");
+            test_assert(grey(100.0) > oldTruncated + 60,
+                        "Tone mapping is dramatically brighter than raw PQ truncation at reference white");
+
+            // Neutral in must stay neutral out: the BT.2020 -> BT.709
+            // matrix rows each sum to 1, and the gamut clip must not
+            // disturb that.
+            bool neutral = true, monotonic = true;
+            int prev = -1;
+            for (int i = 0; i <= 65535; i += 7) {
+                uint8_t rr = 0, gg = 0, bb = 0;
+                tm.mapPixel(static_cast<uint16_t>(i), static_cast<uint16_t>(i),
+                            static_cast<uint16_t>(i), rr, gg, bb);
+                if (rr != gg || gg != bb) neutral = false;
+                if (rr < prev) monotonic = false;
+                prev = rr;
+            }
+            test_assert(neutral, "ToneMapper keeps neutral greys neutral through the gamut conversion");
+            test_assert(monotonic, "ToneMapper's grey ramp is monotonic across the full 16-bit input range");
+
+            // Out-of-gamut BT.2020 primaries must desaturate into range,
+            // not wrap around or produce garbage.
+            const uint16_t hi = codeFor(100.0);
+            tm.mapPixel(hi, 0, 0, r, g, b);
+            test_assert(r > g && r > b, "ToneMapper keeps a saturated BT.2020 red dominated by red");
+            tm.mapPixel(0, 0, hi, r, g, b);
+            test_assert(b > r && b > g, "ToneMapper keeps a saturated BT.2020 blue dominated by blue");
+        }
+
+        // --- HLG ---
+        {
+            auto hlgOwner = newToneMapper();
+            ToneMapper& hlg = *hlgOwner;
+            test_assert(hlg.configure(HdrTransfer::HLG, 1000.0f, 100.0f),
+                        "ToneMapper::configure() accepts HLG");
+            uint8_t r = 0, g = 0, b = 0;
+            hlg.mapPixel(0, 0, 0, r, g, b);
+            test_assert(r == 0, "HLG maps signal 0 to black");
+            hlg.mapPixel(65535, 65535, 65535, r, g, b);
+            test_assert(r == 255, "HLG maps full signal to full-scale white");
+            bool monotonic = true;
+            int prev = -1;
+            for (int i = 0; i <= 65535; i += 13) {
+                uint8_t rr = 0, gg = 0, bb = 0;
+                hlg.mapPixel(static_cast<uint16_t>(i), static_cast<uint16_t>(i),
+                             static_cast<uint16_t>(i), rr, gg, bb);
+                if (rr < prev) monotonic = false;
+                if (rr != gg || gg != bb) monotonic = false;
+                prev = rr;
+            }
+            test_assert(monotonic, "HLG's grey ramp is monotonic and stays neutral");
+        }
+
+        // --- process(): block path must match the scalar reference ---
+        {
+            auto tmOwner = newToneMapper();
+            ToneMapper& tm = *tmOwner;
+            tm.configure(HdrTransfer::PQ, 1000.0f, 100.0f);
+
+            // Deliberately not a multiple of the internal block size, so
+            // the partial trailing block is exercised too.
+            const int w = 203;
+            const int h = 5;
+            std::vector<uint16_t> src(static_cast<size_t>(w) * h * 3);
+            for (size_t i = 0; i < src.size(); ++i) {
+                src[i] = static_cast<uint16_t>((i * 2654435761u) & 0xFFFF);
+            }
+            std::vector<uint8_t> got(static_cast<size_t>(w) * h * 3, 0);
+            tm.process(reinterpret_cast<const uint8_t*>(src.data()), w * 6,
+                       got.data(), w * 3, w, h);
+
+            bool matches = true;
+            for (int y = 0; y < h && matches; ++y) {
+                for (int x = 0; x < w; ++x) {
+                    const size_t o = (static_cast<size_t>(y) * w + x) * 3;
+                    uint8_t er = 0, eg = 0, eb = 0;
+                    tm.mapPixel(src[o], src[o + 1], src[o + 2], er, eg, eb);
+                    if (got[o] != er || got[o + 1] != eg || got[o + 2] != eb) {
+                        matches = false;
+                        break;
+                    }
+                }
+            }
+            test_assert(matches,
+                        "ToneMapper::process()'s blocked path matches mapPixel() exactly, including the partial tail block");
+
+            // Multi-threaded and single-threaded must agree bit for bit.
+            const int bigW = 640, bigH = 360;
+            std::vector<uint16_t> bigSrc(static_cast<size_t>(bigW) * bigH * 3);
+            for (size_t i = 0; i < bigSrc.size(); ++i) {
+                bigSrc[i] = static_cast<uint16_t>((i * 40503u + 7u) & 0xFFFF);
+            }
+            std::vector<uint8_t> mt(static_cast<size_t>(bigW) * bigH * 3, 0);
+            std::vector<uint8_t> st(static_cast<size_t>(bigW) * bigH * 3, 1);
+            tm.process(reinterpret_cast<const uint8_t*>(bigSrc.data()), bigW * 6,
+                       mt.data(), bigW * 3, bigW, bigH);
+            tm.process(reinterpret_cast<const uint8_t*>(bigSrc.data()), bigW * 6,
+                       st.data(), bigW * 3, bigW, bigH, 1);
+            test_assert(mt == st,
+                        "ToneMapper::process() produces identical output threaded and single-threaded");
+
+            // An unconfigured mapper must not write through the pointers.
+            auto unsetOwner = newToneMapper();
+            const ToneMapper& unset = *unsetOwner;
+            std::vector<uint8_t> untouched(32 * 3, 0xAB);
+            unset.process(reinterpret_cast<const uint8_t*>(src.data()), w * 6,
+                          untouched.data(), 32 * 3, 4, 1);
+            test_assert(untouched[0] == 0xAB, "ToneMapper::process() no-ops before configure()");
+            // Null/degenerate arguments must be rejected, not crash.
+            tm.process(nullptr, w * 6, got.data(), w * 3, w, h);
+            tm.process(reinterpret_cast<const uint8_t*>(src.data()), w * 6, nullptr, w * 3, w, h);
+            tm.process(reinterpret_cast<const uint8_t*>(src.data()), w * 6, got.data(), w * 3, 0, h);
+            test_assert(true, "ToneMapper::process() tolerates null buffers and zero dimensions");
+        }
+
+        // --- VideoDecoder's frame-level HDR classification ---
+        {
+            AVFrame* f = av_frame_alloc();
+            test_assert(f != nullptr, "Allocated a probe AVFrame for HDR classification");
+            f->color_trc = AVCOL_TRC_BT709;
+            test_assert(VideoDecoder::hdrTransferOf(f) == HdrTransfer::None,
+                        "hdrTransferOf() reports None for a BT.709 frame");
+            f->color_trc = AVCOL_TRC_SMPTE2084;
+            test_assert(VideoDecoder::hdrTransferOf(f) == HdrTransfer::PQ,
+                        "hdrTransferOf() reports PQ for an ST 2084 frame");
+            f->color_trc = AVCOL_TRC_ARIB_STD_B67;
+            test_assert(VideoDecoder::hdrTransferOf(f) == HdrTransfer::HLG,
+                        "hdrTransferOf() reports HLG for an ARIB STD-B67 frame");
+            // cppcheck-suppress knownConditionTrueFalse
+            // hdrTransferOf() returns None for null by its first branch, so
+            // cppcheck folds this to a constant. That is exactly the
+            // contract being pinned here -- the call must not dereference.
+            test_assert(VideoDecoder::hdrTransferOf(nullptr) == HdrTransfer::None,
+                        "hdrTransferOf() tolerates a null frame");
+            test_assert(VideoDecoder::masteringPeakNits(f) == 0.0f,
+                        "masteringPeakNits() returns 0 when the frame carries no mastering metadata");
+            test_assert(VideoDecoder::masteringPeakNits(nullptr) == 0.0f,
+                        "masteringPeakNits() tolerates a null frame");
+
+            AVMasteringDisplayMetadata* md = av_mastering_display_metadata_create_side_data(f);
+            if (md) {
+                md->has_luminance = 1;
+                md->max_luminance = av_make_q(4000, 1);
+                test_assert(std::fabs(VideoDecoder::masteringPeakNits(f) - 4000.0f) < 0.5f,
+                            "masteringPeakNits() reads the mastering display's peak luminance");
+                md->has_luminance = 0;
+                test_assert(VideoDecoder::masteringPeakNits(f) == 0.0f,
+                            "masteringPeakNits() ignores mastering metadata with no luminance set");
+            }
+            av_frame_free(&f);
+        }
+
+        std::cout << "HDR ToneMapper unit tests PASSED!" << std::endl;
     }
 
     // 7. Run additional coverage tests to hit remaining uncovered branches!

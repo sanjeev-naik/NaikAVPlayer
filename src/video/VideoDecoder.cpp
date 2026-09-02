@@ -36,6 +36,7 @@ VideoDecoder::VideoDecoder(AVCodecParameters* codecParams, AVRational timeBase,
 }
 
 VideoDecoder::~VideoDecoder() {
+  releaseHdrContexts();
   if (m_swsCtx) {
     sws_freeContext(m_swsCtx);
   }
@@ -414,7 +415,224 @@ bool VideoDecoder::decodeNextFrame() {
   }
 }
 
-bool VideoDecoder::convertFrame(ResolutionOption option) {
+naikav::video::HdrTransfer VideoDecoder::hdrTransferOf(const AVFrame *frame) {
+  if (!frame) {
+    return naikav::video::HdrTransfer::None;
+  }
+  switch (frame->color_trc) {
+  case AVCOL_TRC_SMPTE2084:
+    return naikav::video::HdrTransfer::PQ;
+  case AVCOL_TRC_ARIB_STD_B67:
+    return naikav::video::HdrTransfer::HLG;
+  default:
+    return naikav::video::HdrTransfer::None;
+  }
+}
+
+float VideoDecoder::masteringPeakNits(const AVFrame *frame) {
+  if (!frame) {
+    return 0.0f;
+  }
+  for (int i = 0; i < frame->nb_side_data; ++i) {
+    const AVFrameSideData *sd = frame->side_data[i];
+    if (!sd || sd->type != AV_FRAME_DATA_MASTERING_DISPLAY_METADATA ||
+        !sd->data) {
+      continue;
+    }
+    const auto *meta =
+        reinterpret_cast<const AVMasteringDisplayMetadata *>(sd->data);
+    // has_luminance guards against metadata that only carries primaries;
+    // a zero denominator would otherwise divide by zero in av_q2d.
+    if (!meta->has_luminance || meta->max_luminance.den == 0) {
+      continue;
+    }
+    const double nits = av_q2d(meta->max_luminance);
+    if (nits > 0.0) {
+      return static_cast<float>(nits);
+    }
+  }
+  return 0.0f;
+}
+
+void VideoDecoder::releaseHdrContexts() {
+  if (m_hdrToRgbCtx) {
+    sws_freeContext(m_hdrToRgbCtx);
+    m_hdrToRgbCtx = nullptr;
+  }
+  if (m_rgbToYuvCtx) {
+    sws_freeContext(m_rgbToYuvCtx);
+    m_rgbToYuvCtx = nullptr;
+  }
+  if (m_hdrRgbFrame) {
+    av_frame_free(&m_hdrRgbFrame);
+  }
+  if (m_sdrRgbFrame) {
+    av_frame_free(&m_sdrRgbFrame);
+  }
+  m_hdrSrcWidth = 0;
+  m_hdrSrcHeight = 0;
+  m_hdrSrcFormat = AV_PIX_FMT_NONE;
+  m_hdrSrcRange = AVCOL_RANGE_UNSPECIFIED;
+  m_hdrTargetWidth = 0;
+  m_hdrTargetHeight = 0;
+}
+
+// HDR -> SDR path. Runs instead of the plain sws_scale fallback whenever
+// the source carries a PQ or HLG transfer function.
+//
+// Three stages, because tone mapping only means anything in linear RGB:
+//   1. sws_scale unpacks (and rescales) the source's HDR YUV into 16-bit
+//      RGB, using BT.2020 matrix coefficients. Still HDR-encoded -- this
+//      stage only undoes the YUV packing, not the transfer function.
+//   2. ToneMapper converts transfer function and gamut, producing 8-bit
+//      BT.709 SDR RGB.
+//   3. sws_scale packs that back into YUV420P with BT.709 coefficients,
+//      which is exactly what the texture upload path already consumes.
+//
+// Scaling happens in stage 1, so selecting a lower playback resolution
+// also shrinks the per-pixel tone mapping work rather than adding to it.
+bool VideoDecoder::toneMapToYuv(const AVFrame *srcFrame, int targetW,
+                                int targetH,
+                                const naikav::video::HdrToneMapSettings &settings) {
+  if (!srcFrame || targetW <= 0 || targetH <= 0) {
+    return false;
+  }
+
+  const naikav::video::HdrTransfer transfer = hdrTransferOf(srcFrame);
+  if (transfer == naikav::video::HdrTransfer::None) {
+    return false;
+  }
+
+  // An explicit source peak in the settings wins; otherwise use what the
+  // file says it was mastered on, and fall back to the tone mapper's
+  // default when it says nothing.
+  float srcPeak = settings.sourcePeakNits;
+  if (srcPeak <= 0.0f) {
+    srcPeak = masteringPeakNits(srcFrame);
+  }
+  if (!m_toneMapper.configure(transfer, srcPeak, settings.targetPeakNits)) {
+    return false;
+  }
+
+  const AVPixelFormat srcFormat = static_cast<AVPixelFormat>(srcFrame->format);
+  const bool geometryChanged =
+      srcFrame->width != m_hdrSrcWidth || srcFrame->height != m_hdrSrcHeight ||
+      srcFormat != m_hdrSrcFormat || srcFrame->color_range != m_hdrSrcRange ||
+      targetW != m_hdrTargetWidth || targetH != m_hdrTargetHeight;
+
+  if (geometryChanged || !m_hdrToRgbCtx || !m_rgbToYuvCtx || !m_hdrRgbFrame ||
+      !m_sdrRgbFrame) {
+    releaseHdrContexts();
+
+    m_hdrToRgbCtx = sws_getContext(srcFrame->width, srcFrame->height, srcFormat,
+                                   targetW, targetH, AV_PIX_FMT_RGB48,
+                                   SWS_BICUBIC, nullptr, nullptr, nullptr);
+    m_rgbToYuvCtx =
+        sws_getContext(targetW, targetH, AV_PIX_FMT_RGB24, targetW, targetH,
+                       AV_PIX_FMT_YUV420P, SWS_BICUBIC, nullptr, nullptr,
+                       nullptr);
+    if (!m_hdrToRgbCtx || !m_rgbToYuvCtx) {
+      std::cerr << "Error: Could not allocate HDR tone mapping contexts"
+                << std::endl;
+      releaseHdrContexts();
+      return false;
+    }
+
+    // Without this, swscale would decode BT.2020 YUV with BT.601/709
+    // coefficients and skew every color before tone mapping ever sees
+    // the frame. sws_setColorspaceDetails is advisory -- it reports
+    // failure for format pairs it cannot retune -- so a failure here is
+    // logged and tolerated rather than aborting the conversion.
+    const int srcFullRange = (srcFrame->color_range == AVCOL_RANGE_JPEG) ? 1 : 0;
+    if (sws_setColorspaceDetails(
+            m_hdrToRgbCtx, sws_getCoefficients(SWS_CS_BT2020), srcFullRange,
+            sws_getCoefficients(SWS_CS_BT2020), 1, 0, 1 << 16, 1 << 16) < 0) {
+      std::cerr << "Warning: could not set BT.2020 coefficients on the HDR "
+                   "unpack context"
+                << std::endl;
+    }
+    // Output is tagged BT.709 limited range below, so encode it as such.
+    if (sws_setColorspaceDetails(
+            m_rgbToYuvCtx, sws_getCoefficients(SWS_CS_ITU709), 1,
+            sws_getCoefficients(SWS_CS_ITU709), 0, 0, 1 << 16, 1 << 16) < 0) {
+      std::cerr << "Warning: could not set BT.709 coefficients on the SDR "
+                   "repack context"
+                << std::endl;
+    }
+
+    m_hdrRgbFrame = av_frame_alloc();
+    m_sdrRgbFrame = av_frame_alloc();
+    if (!m_hdrRgbFrame || !m_sdrRgbFrame) {
+      releaseHdrContexts();
+      return false;
+    }
+    m_hdrRgbFrame->format = AV_PIX_FMT_RGB48;
+    m_hdrRgbFrame->width = targetW;
+    m_hdrRgbFrame->height = targetH;
+    m_sdrRgbFrame->format = AV_PIX_FMT_RGB24;
+    m_sdrRgbFrame->width = targetW;
+    m_sdrRgbFrame->height = targetH;
+    if (av_frame_get_buffer(m_hdrRgbFrame, 32) < 0 ||
+        av_frame_get_buffer(m_sdrRgbFrame, 32) < 0) {
+      std::cerr << "Error: Could not allocate HDR intermediate frames"
+                << std::endl;
+      releaseHdrContexts();
+      return false;
+    }
+
+    m_hdrSrcWidth = srcFrame->width;
+    m_hdrSrcHeight = srcFrame->height;
+    m_hdrSrcFormat = srcFormat;
+    m_hdrSrcRange = srcFrame->color_range;
+    m_hdrTargetWidth = targetW;
+    m_hdrTargetHeight = targetH;
+  }
+
+  // Stage 1: HDR YUV -> 16-bit RGB at the playback resolution.
+  sws_scale(m_hdrToRgbCtx, srcFrame->data, srcFrame->linesize, 0,
+            srcFrame->height, m_hdrRgbFrame->data, m_hdrRgbFrame->linesize);
+
+  // Stage 2: the actual tone map.
+  m_toneMapper.process(m_hdrRgbFrame->data[0], m_hdrRgbFrame->linesize[0],
+                       m_sdrRgbFrame->data[0], m_sdrRgbFrame->linesize[0],
+                       targetW, targetH);
+
+  // Stage 3: back to the YUV420P the texture upload consumes.
+  AVFrame *outFrame = av_frame_alloc();
+  if (!outFrame) {
+    return false;
+  }
+  outFrame->format = AV_PIX_FMT_YUV420P;
+  outFrame->width = targetW;
+  outFrame->height = targetH;
+  outFrame->pts = srcFrame->pts;
+  outFrame->pkt_dts = srcFrame->pkt_dts;
+  // Deliberately NOT copied from the source: after tone mapping this
+  // really is a BT.709 SDR frame, and mislabeling it BT.2020/PQ here
+  // would make the renderer apply a second, wrong conversion.
+  outFrame->color_range = AVCOL_RANGE_MPEG;
+  outFrame->colorspace = AVCOL_SPC_BT709;
+  outFrame->color_primaries = AVCOL_PRI_BT709;
+  outFrame->color_trc = AVCOL_TRC_BT709;
+
+  if (av_frame_get_buffer(outFrame, 32) < 0) {
+    std::cerr << "Error: Could not allocate tone mapped output frame"
+              << std::endl;
+    av_frame_free(&outFrame);
+    return false;
+  }
+
+  sws_scale(m_rgbToYuvCtx, m_sdrRgbFrame->data, m_sdrRgbFrame->linesize, 0,
+            targetH, outFrame->data, outFrame->linesize);
+
+  av_frame_unref(m_yuvFrame);
+  av_frame_move_ref(m_yuvFrame, outFrame);
+  av_frame_free(&outFrame);
+  return true;
+}
+
+bool VideoDecoder::convertFrame(ResolutionOption option,
+                                naikav::video::HdrToneMapSettings toneMap) {
   struct ConvertTimeTracker {
       std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
       MetricRing<256>& ring;
@@ -469,11 +687,48 @@ bool VideoDecoder::convertFrame(ResolutionOption option) {
 
   bool isTargetOriginal = (targetW == nativeW && targetH == nativeH);
 
-  bool useNative = isTargetOriginal &&
+  // An HDR source has to go through the tone mapper regardless of pixel
+  // format. This matters for the native-passthrough test below: 8-bit HLG
+  // exists, and without this check such a frame would be handed straight
+  // to the texture with its transfer function still applied.
+  const bool wantsToneMap =
+      toneMap.enabled &&
+      hdrTransferOf(srcFrame) != naikav::video::HdrTransfer::None;
+
+  bool useNative = isTargetOriginal && !wantsToneMap &&
                    (srcFrame->format == AV_PIX_FMT_YUV420P ||
                     srcFrame->format == AV_PIX_FMT_YUVJ420P ||
                     srcFrame->format == AV_PIX_FMT_NV12 ||
                     srcFrame->format == AV_PIX_FMT_NV21);
+
+  if (wantsToneMap) {
+    if (toneMapToYuv(srcFrame, targetW, targetH, toneMap)) {
+      // Report the source format, matching what the plain rescale path
+      // below records -- the diagnostics HUD is describing the incoming
+      // stream, not the intermediate buffers. Set only on success, since
+      // the fallback path keys its context rebuild off this same field.
+      m_allocatedFormat = static_cast<AVPixelFormat>(srcFrame->format);
+      m_allocatedWidth = srcFrame->width;
+      m_allocatedHeight = srcFrame->height;
+      m_allocatedTargetWidth = targetW;
+      m_allocatedTargetHeight = targetH;
+      m_lastFrameToneMapped = true;
+      if (tempCpuFrame) {
+        av_frame_free(&tempCpuFrame);
+      }
+      av_frame_unref(m_decodedFrame);
+      return true;
+    }
+
+    // Tone mapping failed (allocation, or an unsupported conversion).
+    // Fall through to the plain rescale rather than dropping the frame:
+    // a washed-out picture still beats no picture, and the HUD will say
+    // tone mapping is inactive.
+    std::cerr << "Warning: HDR tone mapping unavailable for this frame; "
+                 "falling back to direct conversion"
+              << std::endl;
+  }
+  m_lastFrameToneMapped = false;
 
   if (useNative) {
     // Keep track of the format/resolution for native frames
@@ -864,6 +1119,15 @@ ColorPipelineInfo VideoDecoder::getColorInfo() const {
         info.hdrType = "HDR10";
       }
     }
+  }
+
+  // 7. What the pipeline actually did with it. Reporting the source's HDR
+  //    standard without this says nothing about whether the picture on
+  //    screen was converted for an SDR display or just truncated.
+  info.toneMapped = m_lastFrameToneMapped;
+  if (m_lastFrameToneMapped && m_toneMapper.isReady()) {
+    info.toneMapSourceNits = m_toneMapper.sourcePeakNits();
+    info.toneMapTargetNits = m_toneMapper.targetPeakNits();
   }
 
   return info;

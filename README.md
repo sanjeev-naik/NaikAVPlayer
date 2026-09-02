@@ -42,6 +42,7 @@
 - **Symmetric Low-Latency Seeking:** Rapid keyframe seek operations flushing packet queues and decoding pipelines under 80ms.
 - **Stall-Proof Pipeline Backpressure:** Producer threads never block indefinitely on a full queue — bounded-wait pushes fall back to dropping the oldest queued item once a timeout elapses, so a paused audio device, a stalled render loop, or a wedged decoder can never freeze the single demuxer thread that feeds both the video and audio queues.
 - **Dynamic Hardware Decoder Fallback:** Tries platform-specific hardware decoders (D3D11VA, DXVA2, QSV, CUVID on Windows; V4L2M2M, VAAPI, QSV, CUVID on Linux), falling back dynamically to software H.264 decoding if hardware context allocation fails or encounters runtime surface mapping errors.
+- **HDR → SDR Tone Mapping (BT.2390):** HDR10, HDR10+, Dolby Vision (base layer) and HLG sources are converted for an SDR display rather than merely truncated to 8 bits. The transfer function is decoded to linear light (SMPTE ST 2084 PQ, or ARIB STD-B67 HLG including its luminance-dependent OOTF), highlights are rolled off with the ITU-R BT.2390 EETF toward the display's peak, the BT.2020 gamut is converted to BT.709 in linear light with out-of-gamut colors desaturated toward their own luminance rather than hard-clipped per channel, and the result is re-encoded with the BT.709 OETF. Source peak comes from the file's mastering-display metadata when present (1000 nits assumed otherwise); the display peak defaults to the 100-nit SDR reference and is adjustable. See `naikav::video::ToneMapper`. Without this step a PQ signal reaches the display still PQ-encoded, which renders it dark and desaturated — 100-nit reference white lands at code 130 of 255 instead of 213.
 - **Sub-10ms Audio-Video Synchronization:** Reconstructs the audio clock sample-accurately from PCM sample offsets to maintain A/V drift under 10ms.
 - **Fullscreen, Cursor Auto-Hide & Usability Gestures:** Fullscreen mode toggling via `F11`, `Alt+Enter`, or double-clicking anywhere on the video canvas; automatic cursor and controls dock hiding after 2.5 seconds of playback inactivity; instant volume adjustment via `Up`/`Down` arrow keys (±5%), mouse wheel over video, or mute toggle (`M`); and auto-pausing background playback during native file explorer dialogs.
 - **Lossless Video Frame Screenshot Export:** Capture and export the current video frame as a full-resolution PNG image (`S` hotkey) saved directly to the `screenshots/` directory with automatic timestamps (`NaikAVPlayer_<basename>_<YYYYMMDD_HHMMSS>_<time>.png`) using FFmpeg's native PNG encoder and `sws_scale` RGB24 conversion, accompanied by animated on-screen Toast feedback.
@@ -65,7 +66,8 @@
 - **Loop Playback:** Wraparound seek to 0.0 upon reaching end-of-file for continuous playback, toggleable via the controls dock `[Loop]` icon button and `L` hotkey.
 - **Playlist & Auto-Advance:** Build a queue of local media files — multi-select "Add Files" dialog, non-recursive "Add Folder" directory scan, or dropping more than one file onto the window at once — with drag-to-reorder, per-row removal, and double-click-to-play, via the `[Playlist]` button in the controls dock or the `P` hotkey. `Off` / `All` / `One` repeat modes plus a Shuffle toggle govern auto-advance once playback naturally reaches end-of-file, independent of the per-file `[Loop]` button above (which always just repeats the current file and takes priority while it's on). Playlist contents and repeat/shuffle state persist across restarts as standard M3U8 (`playlist.m3u8`).
 - **Native File Picker:** Cross-platform native file picker integration using `nativefiledialog-extended` (NFD) on Win32 and GTK3/Portal backends.
-- **Pipeline Diagnostics & System Info HUD:** Real-time overlay (`--metrics` or `D` key) displaying active player states, media telemetry (native vs. playback resolution, pixel format, hardware vs. software decoder type), Color & HDR pipeline characteristics (Color Space, Primaries, TRC, Range, Chroma Subsampling, Bit Depth, HDR10/HDR10+/Dolby Vision/HLG standard), pipeline queue depth levels, decode/render frame pacing budgets, and rolling clock synchronization offsets.
+- **Pipeline Diagnostics & System Info HUD:** Real-time overlay (`--metrics` or `D` key) displaying active player states, media telemetry (native vs. playback resolution, pixel format, hardware vs. software decoder type), Color & HDR pipeline characteristics (Color Space, Primaries, TRC, Range, Chroma Subsampling, Bit Depth, HDR10/HDR10+/Dolby Vision/HLG standard, plus a read-only line reporting whether tone mapping is actually active and between which peak luminances — the toggle and display-peak slider themselves live in the HDR panel, see below), pipeline queue depth levels, decode/render frame pacing budgets, and rolling clock synchronization offsets.
+- **HDR Tone Mapping Panel:** Dedicated overlay (`C` key or the controls-dock `[HDR]` button) reporting the source's HDR standard and the live tone mapping status, with the HDR → SDR on/off toggle and the display-peak slider (50–1000 nits). Both settings persist across restarts and take effect on the next decoded frame — no seek or reopen needed. Kept separate from the diagnostics HUD, which only reports the pipeline rather than changing it.
 - **Audio Processing Panel:** Dedicated overlay (`A` key) for the full DSP chain (EQ, noise gate, compressor, multiband compressor, limiter, crossover, loudness, 3D surround, widener, balance), a live FFT spectrum visualizer, plus channel/output-device/bit-depth/resampler-quality selection, separate from the diagnostics HUD.
 - **Translucent User Interface:** ImGui-based desktop interface using bundled Noto Sans typography.
 
@@ -90,7 +92,7 @@ src/
 ├── playlist/  header-only Playlist module (queue, repeat/shuffle, M3U8 I/O — see Playlist & Auto-Advance below)
 ├── subtitle/  SubtitleDecoder.{hpp,cpp}, SubtitleTrack.hpp — decoding, parsing, sync, sanitization
 ├── ui/        PlayerUI.{hpp,cpp} — ImGui controls dock, diagnostics HUD, audio panel, subtitle overlay
-└── video/     VideoDecoder.{hpp,cpp}, FrameExporter.hpp — HW/SW decode, frame conversion, PNG screenshot export
+└── video/     VideoDecoder.{hpp,cpp}, ToneMapper.hpp, FrameExporter.hpp — HW/SW decode, frame conversion, HDR→SDR tone mapping, PNG screenshot export
 ```
 
 
@@ -149,6 +151,36 @@ src/
 
 #### GPU-Mapped Planar YUV Uploads
 Instead of performing CPU-side YUV-to-RGB color space conversion, the video decoder pipeline extracts raw YUV 4:2:0 planar frame data directly. The main thread maps this data onto a hardware-accelerated SDL3 streaming texture (`SDL_PIXELFORMAT_IYUV`) using `SDL_UpdateYUVTexture`. This uploads plane segments directly to GPU texture memory, allowing graphics hardware to handle color space conversion and scaling efficiently.
+
+#### HDR → SDR Tone Mapping Pipeline
+HDR frames cannot go down the [GPU-mapped YUV path](#gpu-mapped-planar-yuv-uploads) above, because that path hands the decoded signal to the display unchanged — correct for BT.709 SDR, wrong for a PQ- or HLG-encoded one, which then renders dark and desaturated no matter how many bits it is carried in. `VideoDecoder::convertFrame()` routes any frame whose `color_trc` is `AVCOL_TRC_SMPTE2084` or `AVCOL_TRC_ARIB_STD_B67` through three stages instead:
+
+```text
+HDR YUV (10/12-bit, BT.2020, PQ or HLG)
+     │  sws_scale, BT.2020 coefficients, scaled to the playback resolution
+     ▼
+RGB48 (16-bit, BT.2020, still HDR-encoded)
+     │  naikav::video::ToneMapper
+     │    ├─ EOTF        PQ (ST 2084) or HLG (STD-B67 + its OOTF) → linear light
+     │    ├─ Tone curve  ITU-R BT.2390 EETF, driven by the brightest channel so
+     │    │              hue holds steady and nothing exceeds the display peak
+     │    ├─ Gamut       BT.2020 → BT.709 in linear light, with out-of-gamut
+     │    │              colors desaturated toward their own luminance
+     │    └─ OETF        BT.709 → 8-bit
+     ▼
+RGB24 (BT.709 SDR)
+     │  sws_scale, BT.709 coefficients
+     ▼
+YUV420P 8-bit, tagged BT.709 — the existing texture upload path, unchanged
+```
+
+- **Tables, not transcendentals:** every scalar stage (both EOTFs, the tone curve, the OETF) is precomputed into a lookup table once per `(transfer, source peak, target peak)` combination — in practice once per file. The per-pixel path is table reads plus a 3×3 matrix, with no `pow`, `exp` or `sqrt` in it.
+- **Scaling happens first:** the conversion to RGB48 also does the resolution scaling, so selecting a lower playback resolution shrinks the tone mapping work rather than adding to it.
+- **Correct by construction where it matters:** the BT.2020 → BT.709 matrix is applied as identity-plus-difference rather than as a plain 3×3 product. Both gamuts share a D65 white, so every row of the true matrix sums to exactly 1 and neutral greys must survive untouched; the published six-decimal coefficients sum to 1.000001 on the green row, which is enough to shift greys off neutral by a code value.
+- **Truthful reporting:** `ColorPipelineInfo::toneMapped` records what the pipeline actually did, not just what the source claimed. The diagnostics HUD (`D`) shows the source's HDR standard *and* whether it was converted, so "HDR10 (PQ)" can never again be displayed over an uncorrected picture.
+
+> [!NOTE]
+> **Cost.** This is a CPU conversion — SDL3's 2D renderer exposes no custom shader stage to do it on the GPU. Row ranges are split across up to 8 worker threads. Measured on a 4-core/8-thread desktop, the tone mapping stage alone runs at ~27 ns/pixel single-threaded and ~7 ns/pixel across 8 threads, which puts a 1080p HDR frame at roughly 16 ms and a 4K HDR frame at roughly 60 ms, before the two `sws_scale` passes that bracket it. 1080p HDR is comfortable; **4K HDR at full resolution will not sustain 24 fps on a 4-core machine** — drop the resolution selector to 1080p, which tone maps at 1080p cost, or turn tone mapping off in the diagnostics HUD and accept the uncorrected picture.
 
 #### Dynamic Hardware Decoder Fallback
 At initialization, the video decoder queries native hardware codecs (`h264_d3d11va`, `h264_dxva2`, `h264_qsv`, `h264_cuvid` on Windows; `h264_vaapi`, `h264_v4l2m2m` on Linux). If hardware initialization fails or encounters runtime frame mapping errors (e.g. running inside headless or virtualized environments), the system intercepts the error, releases the hardware context, configures software `h264`, and resubmits pending packets seamlessly.

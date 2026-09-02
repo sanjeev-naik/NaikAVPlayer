@@ -618,6 +618,10 @@ int main(int argc, char *argv[]) {
         case SDLK_P:
           playerUI.togglePlaylistPanel();
           break;
+        // `C` for color, since `H` is already the subtitle-delay increment.
+        case SDLK_C:
+          playerUI.toggleHdrPanel();
+          break;
         default:
           break;
         }

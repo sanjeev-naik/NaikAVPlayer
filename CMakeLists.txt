@@ -590,6 +590,17 @@ if(TARGET_PLATFORM_WINDOWS AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_link_options(NaikAVPlayer_tests PRIVATE -static-libgcc -static-libstdc++)
 endif()
 
+# The test suite is a handful of very long functions rather than many small
+# ones -- main() alone runs to several thousand lines, and it calls
+# real_main(), which is longer still. Built /Od for coverage, MSVC reuses no
+# stack slots between their disjoint scopes, so the two frames come to about
+# 1.2 MB together and MSVC reserves each one in full on entry. That overflows
+# the 1 MB default reserve in __chkstk, before main() prints a single line.
+# The MinGW build never hit it only because its default reserve is 2 MB.
+if(MSVC)
+    target_link_options(NaikAVPlayer_tests PRIVATE /STACK:16777216)
+endif()
+
 # Apply compiler warning flags to test suite target
 target_compile_options(NaikAVPlayer_tests PRIVATE ${PROJECT_WARNING_FLAGS})
 

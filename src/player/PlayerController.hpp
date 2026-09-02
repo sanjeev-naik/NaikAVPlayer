@@ -139,6 +139,12 @@ private:
 
     std::atomic<ResolutionOption> m_resolutionOption;
 
+    // HDR -> SDR tone mapping. Read on the video thread once per frame and
+    // written from the UI thread, hence atomic rather than mutex-guarded:
+    // a toggle that lands mid-frame simply takes effect on the next one.
+    std::atomic<bool> m_hdrToneMapEnabled{true};
+    std::atomic<float> m_hdrTargetPeakNits{100.0f};
+
     naikav::playlist::Playlist m_playlist;
 
     void loadSettings();
@@ -295,6 +301,19 @@ public:
     void setResolutionOption(ResolutionOption option);
     int getPlaybackWidth() const;
     int getPlaybackHeight() const;
+
+    // HDR -> SDR tone mapping. Takes effect on the next decoded frame, so
+    // unlike setResolutionOption() these need no seek to become visible.
+    bool isHdrToneMapEnabled() const { return m_hdrToneMapEnabled.load(); }
+    void setHdrToneMapEnabled(bool enabled);
+    float getHdrTargetPeakNits() const { return m_hdrTargetPeakNits.load(); }
+    void setHdrTargetPeakNits(float nits);
+    naikav::video::HdrToneMapSettings getHdrToneMapSettings() const {
+        naikav::video::HdrToneMapSettings s;
+        s.enabled = m_hdrToneMapEnabled.load();
+        s.targetPeakNits = m_hdrTargetPeakNits.load();
+        return s;
+    }
 
     // Audio DSP/loudness settings (EQ, compressor, limiter, crossover,
     // loudness target). Safe to call during playback -- see

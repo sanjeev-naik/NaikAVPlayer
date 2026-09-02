@@ -58,6 +58,7 @@ private:
     bool m_showDiagnostics;
     bool m_showAudioSettings = false;
     bool m_showPlaylistPanel = false;
+    bool m_showHdrPanel = false;
 
     struct ClockOffsetSample {
         double timeStamp;
@@ -137,6 +138,13 @@ private:
     // Playlist button and the `P` hotkey (see togglePlaylistPanel()).
     void drawPlaylistPanel(int windowWidth, int windowHeight);
 
+    // HDR -> SDR tone mapping controls, gated by m_showHdrPanel and toggled
+    // by the controls-bar HDR button and the `C` hotkey. These live here
+    // rather than in the diagnostics HUD because they change what is on
+    // screen: the HUD reports, this acts. The HUD keeps the matching
+    // read-only "Tone Mapping:" status line.
+    void drawHdrPanel(int windowWidth, int windowHeight);
+
     static bool drawIconButton(const char* str_id, IconType icon, ImVec2 size);
 
 public:
@@ -203,6 +211,9 @@ public:
     }
 
     void togglePlaylistPanel() { m_showPlaylistPanel = !m_showPlaylistPanel; }
+
+    void toggleHdrPanel() { m_showHdrPanel = !m_showHdrPanel; }
+    bool isHdrPanelVisible() const { return m_showHdrPanel; }
 
     // Draw the UI overlays. Called once per frame in the render loop.
     void draw(int windowWidth, int windowHeight, double currentSystemTime);

@@ -965,7 +965,8 @@ void PlayerController::videoThreadLoop() {
             if (m_videoDecoder && !m_seeking.load()) {
                 decoded = m_videoDecoder->decodeNextFrame();
                 if (decoded) {
-                    converted = m_videoDecoder->convertFrame(m_resolutionOption.load());
+                    converted = m_videoDecoder->convertFrame(m_resolutionOption.load(),
+                                                            getHdrToneMapSettings());
                     if (converted) {
                         srcFrame = m_videoDecoder->getYUVFrame();
                         if (srcFrame && srcFrame->data[0]) {
@@ -1092,6 +1093,8 @@ void PlayerController::finishCatchup(double resumePts) {
 
 void PlayerController::loadSettings() {
     m_resolutionOption.store(ResolutionOption::ORIGINAL);
+    m_hdrToneMapEnabled.store(true);
+    m_hdrTargetPeakNits.store(100.0f);
     m_audioDspSettings = naikav::dsp::AudioDspSettings{};
     m_channelOption = AudioChannelOption::AUTO;
     m_outputBitDepth = AudioOutputBitDepth::BIT_16;
@@ -1231,6 +1234,13 @@ void PlayerController::loadSettings() {
                 if (v >= 0 && v < static_cast<int>(ResamplerQuality::COUNT)) {
                     m_resamplerQuality = static_cast<ResamplerQuality>(v);
                 }
+            } else if (key == "hdr_tone_map_enabled") {
+                m_hdrToneMapEnabled.store(std::stoi(value) != 0);
+            } else if (key == "hdr_target_peak_nits") {
+                float v = std::stof(value);
+                if (v >= 50.0f && v <= 1000.0f) {
+                    m_hdrTargetPeakNits.store(v);
+                }
             } else if (key == "playlist_current_index") {
                 m_pendingPlaylistCurrentIndex = std::stoi(value);
             } else if (key == "playlist_repeat_mode") {
@@ -1312,6 +1322,8 @@ void PlayerController::saveSettings() {
     f << "output_bit_depth=" << static_cast<int>(m_outputBitDepth) << "\n";
     f << "output_device_name=" << m_outputDeviceName << "\n";
     f << "resampler_quality=" << static_cast<int>(m_resamplerQuality) << "\n";
+    f << "hdr_tone_map_enabled=" << (m_hdrToneMapEnabled.load() ? 1 : 0) << "\n";
+    f << "hdr_target_peak_nits=" << m_hdrTargetPeakNits.load() << "\n";
     f << "playlist_current_index=" << m_playlist.getCurrentIndex() << "\n";
     f << "playlist_repeat_mode=" << static_cast<int>(m_playlist.getRepeatMode()) << "\n";
     f << "playlist_shuffle=" << (m_playlist.isShuffle() ? 1 : 0) << "\n";
@@ -1340,6 +1352,28 @@ void PlayerController::savePlaylistState() {
 
 void PlayerController::setResolutionOption(ResolutionOption option) {
     m_resolutionOption.store(option);
+    saveSettings();
+    if (m_hasVideo && (m_state == PlayerState::OPENED || m_state == PlayerState::PAUSED)) {
+        seek(getCurrentTime());
+    }
+}
+
+void PlayerController::setHdrToneMapEnabled(bool enabled) {
+    m_hdrToneMapEnabled.store(enabled);
+    saveSettings();
+    // While paused, nothing decodes a fresh frame to make the change
+    // visible, so re-decode the current position -- the same nudge
+    // setResolutionOption() uses for the same reason.
+    if (m_hasVideo && (m_state == PlayerState::OPENED || m_state == PlayerState::PAUSED)) {
+        seek(getCurrentTime());
+    }
+}
+
+void PlayerController::setHdrTargetPeakNits(float nits) {
+    // Clamped to the range a display peak can sensibly take: below ~50
+    // nits the roll-off crushes everything, and beyond 1000 there is
+    // nothing left to map down to.
+    m_hdrTargetPeakNits.store(std::clamp(nits, 50.0f, 1000.0f));
     saveSettings();
     if (m_hasVideo && (m_state == PlayerState::OPENED || m_state == PlayerState::PAUSED)) {
         seek(getCurrentTime());
