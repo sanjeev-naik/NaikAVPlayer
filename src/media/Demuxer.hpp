@@ -14,6 +14,7 @@ extern "C" {
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
 #include <libavutil/channel_layout.h>
+#include <libavutil/mastering_display_metadata.h>
 }
 
 // Coordinates the seek catch-up phase between PlayerController and the
@@ -25,6 +26,11 @@ enum class SeekCatchupMode { NONE = 0, LANDING };
 class Demuxer {
 private:
     std::string m_filename;
+    std::string m_lastError;
+    double m_videoFrameRate = 0.0;
+    float m_probedMasteringNits = 0.0f;
+    float m_probedContentLightNits = 0.0f;
+    void probeHdrMetadata();
     AVFormatContext* m_formatCtx;
     
     std::atomic<int> m_videoStreamIdx;
@@ -93,6 +99,12 @@ public:
     ~Demuxer();
 
     bool open();
+
+    // Why the last open() returned false, in a form fit to show a user.
+    // Empty when open() succeeded. Demuxer::open() reports its failures on
+    // stderr, which the MSVC build has no console for -- without this a bad
+    // file leaves the welcome screen up with no explanation at all.
+    const std::string& getLastError() const { return m_lastError; }
     void start();
     void stop();
     
@@ -137,6 +149,19 @@ public:
     int64_t getSubtitleStartTime(int streamIdx) const;
 
     AVRational getVideoTimeBase() const { return m_videoTimeBase; }
+
+    // Frames per second of the video stream, or 0 when the container
+    // declares no usable rate. AVCodecParameters::framerate is frequently
+    // left unset by demuxers, so this comes off the stream itself.
+    double getVideoFrameRate() const { return m_videoFrameRate; }
+
+    // Static HDR metadata recovered from the video bitstream, in nits, or
+    // 0 when the stream carries none. Some containers (Matroska in
+    // particular) keep no stream-level copy, so the only place these
+    // exist is the codec's own SEI -- which a *hardware* decoder does not
+    // expose. Probed once at open(); see probeHdrMetadata().
+    float getProbedMasteringPeakNits() const { return m_probedMasteringNits; }
+    float getProbedContentLightNits() const { return m_probedContentLightNits; }
     AVRational getAudioTimeBase() const { return m_audioTimeBase; }
     int64_t getVideoStartTime() const { return m_videoStartTime; }
     int64_t getAudioStartTime() const { return m_audioStartTime; }

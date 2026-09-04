@@ -1,4 +1,5 @@
 #include "subtitle/SubtitleDecoder.hpp"
+#include "core/FFmpegCompat.hpp"
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -153,7 +154,7 @@ void SubtitleDecoder::processPacket(AVPacket* pkt) {
 
     if (m_seekGeneration) {
         uint64_t currentGen = m_seekGeneration->load(std::memory_order_relaxed);
-        uint64_t pktGen = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(pkt->opaque));
+        uint64_t pktGen = naikavPacketGeneration(pkt, currentGen);
         if (pktGen != currentGen) {
             return; // Drop packet from pre-seek stream
         }

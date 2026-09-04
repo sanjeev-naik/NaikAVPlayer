@@ -7,6 +7,7 @@
 #include <vector>
 #include <cstdlib>
 #include <cstdio>
+#include <fstream>
 #include <atomic>
 #include <memory>
 #include <mutex>
@@ -1252,6 +1253,30 @@ int real_main(int argc, char* argv[]) {
         // -------------------------------------------------------------
         bool invalidSuccess = controller.openFile("non_existent_file.xyz");
         test_assert(!invalidSuccess, "Loading non-existent file returns false");
+
+        // A failed open must say *why*. Returning false and printing to a
+        // stderr nobody sees is what made a truncated download look like a
+        // broken player once already.
+        test_assert(!controller.getLastOpenError().empty(),
+                    "A failed open reports a reason via getLastOpenError()");
+
+        // A file that exists but is not media: the reason must come from
+        // the demuxer rather than being the generic fallback, and a
+        // subsequent successful open must clear it.
+        {
+            const char* junkPath = "not_a_media_file.tmp";
+            {
+                std::ofstream junk(junkPath, std::ios::binary);
+                junk << "this is definitely not a media container";
+            }
+            bool junkOpened = controller.openFile(junkPath);
+            test_assert(!junkOpened, "Loading a non-media file returns false");
+            test_assert(!controller.getLastOpenError().empty(),
+                        "A non-media file reports a reason via getLastOpenError()");
+            std::cout << "  (open failure reason: \"" << controller.getLastOpenError()
+                      << "\")" << std::endl;
+            std::remove(junkPath);
+        }
 
         // -------------------------------------------------------------
         // C. Standard Lifecycle (Load -> Play -> Pause -> Resume)
@@ -3515,7 +3540,247 @@ int main(int argc, char* argv[]) {
                 test_assert(VideoDecoder::masteringPeakNits(f) == 0.0f,
                             "masteringPeakNits() ignores mastering metadata with no luminance set");
             }
+
+            // MaxCLL, the other half of what selectSourcePeakNits() weighs.
+            test_assert(VideoDecoder::contentLightPeakNits(f) == 0.0f,
+                        "contentLightPeakNits() returns 0 when the frame carries no content light metadata");
+            test_assert(VideoDecoder::contentLightPeakNits(nullptr) == 0.0f,
+                        "contentLightPeakNits() tolerates a null frame");
+
+            AVContentLightMetadata* cl = av_content_light_metadata_create_side_data(f);
+            if (cl) {
+                // 683 nits over a 4000-nit mastering display is the real
+                // shape of the problem -- see the Birds of Prey HDR10+
+                // clip, whose grade reaches barely a sixth of the monitor
+                // it was delivered on.
+                cl->MaxCLL = 683;
+                test_assert(std::fabs(VideoDecoder::contentLightPeakNits(f) - 683.0f) < 0.5f,
+                            "contentLightPeakNits() reads MaxCLL from content light level metadata");
+                test_assert(selectSourcePeakNits(0.0f, 4000.0f,
+                                                 VideoDecoder::contentLightPeakNits(f)) == 683.0f,
+                            "A 4000-nit grade whose MaxCLL is 683 is tone mapped from 683");
+                // MaxCLL of 0 is the encoder's "unknown", not a real peak.
+                cl->MaxCLL = 0;
+                test_assert(VideoDecoder::contentLightPeakNits(f) == 0.0f,
+                            "contentLightPeakNits() treats a zero MaxCLL as unknown");
+            }
             av_frame_free(&f);
+        }
+
+        // capToDisplaySize(), the HDR path's guard against tone mapping
+        // more pixels than the window can actually show.
+        {
+            int w = 0, h = 0;
+
+            // A 4K frame in the default 1024x576 window: the box is
+            // already a multiple of the quantisation step, so the fit
+            // is exact and the aspect ratio is preserved.
+            w = 3840; h = 2160;
+            capToDisplaySize(w, h, 1024, 576);
+            test_assert(w == 1024 && h == 576, "capToDisplaySize() fits a 4K frame to a 1024x576 display area");
+
+            // Never upscales: a target already inside the box is left
+            // exactly as it was, rather than being stretched to fill it.
+            w = 1280; h = 720;
+            capToDisplaySize(w, h, 3840, 2160);
+            test_assert(w == 1280 && h == 720, "capToDisplaySize() leaves a target smaller than the display area alone");
+
+            // Equal sizes are "already fits", not a rescale.
+            w = 1920; h = 1080;
+            capToDisplaySize(w, h, 1920, 1080);
+            test_assert(w == 1920 && h == 1080, "capToDisplaySize() no-ops when the target exactly fills the display area");
+
+            // The box is rounded up to kDisplayCapStep so a window
+            // being dragged does not reallocate on every pixel: 1000x570
+            // rounds to 1024x576, which a 16:9 source fills exactly.
+            w = 3840; h = 2160;
+            capToDisplaySize(w, h, 1000, 570);
+            test_assert(w == 1024 && h == 576, "capToDisplaySize() quantises the display box up to the step size");
+
+            // Aspect is taken from the tighter axis: a 4:3 source in a
+            // wide box is limited by height, not width.
+            w = 1440; h = 1080;
+            capToDisplaySize(w, h, 1920, 540);
+            test_assert(h == 576 && w == 768, "capToDisplaySize() fits to the constraining axis for a 4:3 source");
+
+            // Results stay even, matching getTargetDimensions().
+            w = 1999; h = 1111;
+            capToDisplaySize(w, h, 333, 333);
+            test_assert(w % 2 == 0 && h % 2 == 0, "capToDisplaySize() produces even dimensions");
+            test_assert(w <= 384 && h <= 384, "capToDisplaySize() stays within the quantised box");
+
+            // A display size of zero or less means "unknown" and
+            // disables the cap entirely -- this is what the bench
+            // harness and every non-player caller gets.
+            w = 3840; h = 2160;
+            capToDisplaySize(w, h, 0, 0);
+            test_assert(w == 3840 && h == 2160, "capToDisplaySize() is a no-op when the display size is unknown");
+            capToDisplaySize(w, h, -100, -100);
+            test_assert(w == 3840 && h == 2160, "capToDisplaySize() is a no-op for a negative display size");
+
+            // A degenerate target is left alone rather than divided by.
+            w = 0; h = 0;
+            capToDisplaySize(w, h, 1024, 576);
+            test_assert(w == 0 && h == 0, "capToDisplaySize() tolerates a zero-sized target");
+        }
+
+        // selectSourcePeakNits(), which reconciles the two peak figures a
+        // file can carry with the user's override.
+        {
+            // The override wins outright -- that is what it is for. Even
+            // when both metadata figures are present and disagree with it.
+            test_assert(selectSourcePeakNits(600.0f, 4000.0f, 1000.0f) == 600.0f,
+                        "selectSourcePeakNits() prefers an explicit override over metadata");
+            test_assert(selectSourcePeakNits(600.0f, 0.0f, 0.0f) == 600.0f,
+                        "selectSourcePeakNits() honours an override when the file carries no metadata");
+
+            // The common HDR10 case: graded on a 4000-nit reference
+            // monitor, but nothing in the picture exceeds 1000. Mapping
+            // from 4000 would spend most of the curve on range the file
+            // never uses and the result would come out dim.
+            test_assert(selectSourcePeakNits(0.0f, 4000.0f, 1000.0f) == 1000.0f,
+                        "selectSourcePeakNits() prefers MaxCLL over a higher mastering peak");
+
+            // MaxCLL above the mastering display is metadata that
+            // contradicts itself: content cannot out-run the monitor it
+            // was graded on, so the mastering peak is the ceiling.
+            test_assert(selectSourcePeakNits(0.0f, 1000.0f, 4000.0f) == 1000.0f,
+                        "selectSourcePeakNits() caps MaxCLL at the mastering peak");
+
+            // Either figure alone is used as-is.
+            test_assert(selectSourcePeakNits(0.0f, 4000.0f, 0.0f) == 4000.0f,
+                        "selectSourcePeakNits() falls back to the mastering peak alone");
+            test_assert(selectSourcePeakNits(0.0f, 0.0f, 1000.0f) == 1000.0f,
+                        "selectSourcePeakNits() falls back to MaxCLL alone");
+
+            // Nothing known at all returns 0, which leaves the tone
+            // mapper on its own default rather than mapping from zero.
+            test_assert(selectSourcePeakNits(0.0f, 0.0f, 0.0f) == 0.0f,
+                        "selectSourcePeakNits() returns 0 when nothing is known");
+
+            // Negatives are treated as absent, not as small peaks.
+            test_assert(selectSourcePeakNits(-1.0f, 0.0f, 1000.0f) == 1000.0f,
+                        "selectSourcePeakNits() treats a negative override as absent");
+            test_assert(selectSourcePeakNits(0.0f, -1.0f, -1.0f) == 0.0f,
+                        "selectSourcePeakNits() treats negative metadata as absent");
+        }
+
+        // selectSourcePeakNits() with dynamic metadata in play.
+        {
+            // Dynamic supersedes both static figures: that is the point of
+            // per-frame metadata.
+            test_assert(selectSourcePeakNits(0.0f, 4000.0f, 1000.0f, 300.0f) == 300.0f,
+                        "selectSourcePeakNits() prefers the dynamic peak over static metadata");
+            // Capped by the mastering display, which is a physical ceiling.
+            test_assert(selectSourcePeakNits(0.0f, 1000.0f, 0.0f, 4000.0f) == 1000.0f,
+                        "selectSourcePeakNits() caps the dynamic peak at the mastering peak");
+            // But deliberately NOT capped by MaxCLL -- the two disagree by
+            // small margins in real files (the HDR10+ clip reports a
+            // per-frame 700 against a MaxCLL of 683), and clamping would
+            // discard the dynamic value on most frames.
+            test_assert(selectSourcePeakNits(0.0f, 4000.0f, 683.0f, 700.0f) == 700.0f,
+                        "selectSourcePeakNits() does not let MaxCLL clamp the dynamic peak");
+            // An explicit override still beats everything.
+            test_assert(selectSourcePeakNits(500.0f, 4000.0f, 1000.0f, 300.0f) == 500.0f,
+                        "selectSourcePeakNits() prefers an override over the dynamic peak");
+            // No dynamic metadata leaves the static behaviour untouched.
+            test_assert(selectSourcePeakNits(0.0f, 4000.0f, 1000.0f, 0.0f) == 1000.0f,
+                        "selectSourcePeakNits() falls back to static metadata with no dynamic peak");
+        }
+
+        // DynamicPeakTracker: smooth within a shot, snap on a cut.
+        {
+            DynamicPeakTracker t;
+            test_assert(t.update(0.0f) == 0.0f,
+                        "DynamicPeakTracker reports nothing without dynamic metadata");
+
+            // First value is taken as-is (quantised up).
+            float first = t.update(700.0f);
+            test_assert(first >= 700.0f && first <= 725.0f,
+                        "DynamicPeakTracker adopts the first frame's peak");
+
+            // A small change is eased into, not followed exactly.
+            t.reset();
+            t.update(700.0f);
+            t.update(600.0f);
+            test_assert(t.smoothedNits() > 650.0f,
+                        "DynamicPeakTracker eases within-shot drift rather than tracking it exactly");
+
+            // A large jump is a cut and is followed immediately.
+            t.reset();
+            t.update(700.0f);
+            t.update(200.0f);
+            test_assert(std::fabs(t.smoothedNits() - 200.0f) < 1.0f,
+                        "DynamicPeakTracker snaps to a scene cut instead of fading into it");
+
+            // reset() clears the smoothing so a seek does not leak across.
+            t.reset();
+            test_assert(t.smoothedNits() == 0.0f, "DynamicPeakTracker::reset() clears the smoothed peak");
+
+            // Output is quantised, so the tone mapper is not rebuilding
+            // its tables for every one-nit wobble.
+            t.reset();
+            float q = t.update(613.0f);
+            test_assert(std::fmod(q, kDynamicPeakQuantNits) == 0.0f,
+                        "DynamicPeakTracker quantises its reported peak");
+        }
+
+        // AdaptiveToneMapScale: shrink under overrun, recover slowly.
+        {
+            AdaptiveToneMapScale a;
+            test_assert(a.scale() == 1.0f, "AdaptiveToneMapScale starts at full size");
+
+            // An unknown frame rate must not move it at all.
+            a.update(100.0, 0.0);
+            test_assert(a.scale() == 1.0f, "AdaptiveToneMapScale does nothing without a frame budget");
+
+            // Overrunning the budget steps the target down, but only after
+            // a few frames -- one expensive frame is not a trend.
+            a.reset();
+            a.update(20.0, 16.7);
+            test_assert(a.scale() == 1.0f, "AdaptiveToneMapScale ignores a single overrunning frame");
+            a.update(20.0, 16.7);
+            a.update(20.0, 16.7);
+            test_assert(a.scale() < 1.0f, "AdaptiveToneMapScale shrinks after sustained overrun");
+
+            // It never shrinks past the floor however bad things get.
+            a.reset();
+            for (int i = 0; i < 500; ++i) a.update(500.0, 16.7);
+            test_assert(a.scale() >= kAdaptiveMinScale - 1e-6f,
+                        "AdaptiveToneMapScale never shrinks past its floor");
+
+            // Plenty of headroom grows it back, but slowly, and never
+            // beyond full size.
+            for (int i = 0; i < 2000; ++i) a.update(1.0, 16.7);
+            test_assert(a.scale() == 1.0f, "AdaptiveToneMapScale recovers to full size given headroom");
+
+            // Sitting inside the deadband holds it steady.
+            a.reset();
+            for (int i = 0; i < 200; ++i) a.update(16.7 * 0.55, 16.7);
+            test_assert(a.scale() == 1.0f, "AdaptiveToneMapScale holds steady inside the deadband");
+
+            a.reset();
+            test_assert(a.scale() == 1.0f, "AdaptiveToneMapScale::reset() restores full size");
+        }
+
+        // applyAdaptiveScale() keeps targets legal.
+        {
+            int w = 1024, h = 576;
+            applyAdaptiveScale(w, h, 0.5f);
+            test_assert(w == 512 && h == 288, "applyAdaptiveScale() halves a target");
+            test_assert(w % 2 == 0 && h % 2 == 0, "applyAdaptiveScale() produces even dimensions");
+
+            w = 1024; h = 576;
+            applyAdaptiveScale(w, h, 1.0f);
+            test_assert(w == 1024 && h == 576, "applyAdaptiveScale() is a no-op at full scale");
+
+            w = 1024; h = 576;
+            applyAdaptiveScale(w, h, 0.0f);
+            test_assert(w == 1024 && h == 576, "applyAdaptiveScale() ignores a degenerate scale");
+
+            w = 2; h = 2;
+            applyAdaptiveScale(w, h, 0.01f);
+            test_assert(w >= 2 && h >= 2, "applyAdaptiveScale() never produces a zero-sized target");
         }
 
         std::cout << "HDR ToneMapper unit tests PASSED!" << std::endl;

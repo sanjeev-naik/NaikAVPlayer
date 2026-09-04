@@ -647,6 +647,41 @@ endif()
 setup_target_dependencies(NaikAVPlayer_dsp_repro)
 
 # -------------------------------------------------------------
+# Standalone HDR conversion timing harness (not part of the regular
+# test suite -- see tests/hdr_bench_standalone.cpp). Feeds real packets
+# through VideoDecoder with no window, audio device or render loop in
+# the way, and times decodeNextFrame() and convertFrame() separately.
+# Needs a 4K HDR file passed on the command line to say anything useful.
+# -------------------------------------------------------------
+add_executable(NaikAVPlayer_hdr_bench
+    tests/hdr_bench_standalone.cpp
+    src/video/VideoDecoder.cpp
+)
+
+target_include_directories(NaikAVPlayer_hdr_bench PRIVATE "${PLAYER_INCLUDE_DIR}")
+
+if(FFMPEG_USE_SYSTEM)
+    target_link_libraries(NaikAVPlayer_hdr_bench PRIVATE PkgConfig::FFMPEG)
+else()
+    target_include_directories(NaikAVPlayer_hdr_bench SYSTEM PRIVATE "${FFMPEG_DIR}/include")
+    target_link_directories(NaikAVPlayer_hdr_bench PRIVATE "${FFMPEG_DIR}/lib")
+    target_link_libraries(NaikAVPlayer_hdr_bench PRIVATE
+        avcodec
+        avformat
+        avutil
+        swscale
+    )
+endif()
+if(TARGET_PLATFORM_LINUX)
+    target_link_libraries(NaikAVPlayer_hdr_bench PRIVATE pthread dl)
+endif()
+if(TARGET_PLATFORM_WINDOWS AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_link_options(NaikAVPlayer_hdr_bench PRIVATE -static-libgcc -static-libstdc++)
+endif()
+
+setup_target_dependencies(NaikAVPlayer_hdr_bench)
+
+# -------------------------------------------------------------
 # Standalone getColorInfo() data-race diagnostic (see
 # tests/colorinfo_race_repro.cpp) -- isolates the specific race between the
 # Diagnostics HUD's getColorInfo() and the video decode thread.

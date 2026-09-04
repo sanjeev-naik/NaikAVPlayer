@@ -114,6 +114,9 @@ void PlayerUI::openMediaFileDialog() {
     if (!path.empty()) {
       if (m_controller.openFile(path)) {
         m_controller.play();
+      } else {
+        showToast("Could not open file: " + m_controller.getLastOpenError(),
+                  true, 8.0);
       }
     }
   } else {
@@ -278,6 +281,7 @@ void PlayerUI::draw(int windowWidth, int windowHeight,
         m_controller.play();
         m_showLoadFileDialog = false;
       } else {
+        m_loadErrorReason = m_controller.getLastOpenError();
         ImGui::OpenPopup("Load Error");
       }
     }
@@ -291,6 +295,11 @@ void PlayerUI::draw(int windowWidth, int windowHeight,
     if (ImGui::BeginPopup("Load Error")) {
       ImGui::TextColored(ImVec4(1.0f, 0.2f, 0.2f, 1.0f),
                          "Failed to load file!");
+      if (!m_loadErrorReason.empty()) {
+        // The reason FFmpeg gave, which is usually the whole answer --
+        // "moov atom not found" means a truncated download, not a bad path.
+        ImGui::TextWrapped("%s", m_loadErrorReason.c_str());
+      }
       ImGui::Text("Please verify the file path is correct.");
       if (ImGui::Button("Close")) {
         ImGui::CloseCurrentPopup();
@@ -2887,8 +2896,9 @@ void PlayerUI::drawHdrPanel(int windowWidth, int windowHeight) {
   ImGui::SameLine();
   if (colorInfo.toneMapped) {
     ImGui::TextColored(ImVec4(0.0f, 0.83f, 0.4f, 1.0f),
-                       "BT.2390 -> SDR (%.0f -> %.0f nits)",
-                       colorInfo.toneMapSourceNits, colorInfo.toneMapTargetNits);
+                       "BT.2390 -> SDR (%.0f -> %.0f nits)%s",
+                       colorInfo.toneMapSourceNits, colorInfo.toneMapTargetNits,
+                       colorInfo.toneMapDynamic ? "  [dynamic]" : "");
   } else if (colorInfo.isHDR) {
     ImGui::TextColored(ImVec4(0.95f, 0.35f, 0.35f, 1.0f),
                        "Off (HDR shown uncorrected)");
@@ -2927,11 +2937,119 @@ void PlayerUI::drawHdrPanel(int windowWidth, int windowHeight) {
   ImGui::SetNextItemWidth(160.0f);
   if (ImGui::SliderFloat("Display peak", &targetNits, 50.0f, 1000.0f,
                          "%.0f nits")) {
+    // Applied live only. The decoder re-reads this for every frame it
+    // converts, so the picture tracks the drag during playback; the disk
+    // write and the paused re-decode wait for the drag to end, because a
+    // seek per drag frame would tear the pipeline down and refill it
+    // dozens of times a second.
     m_controller.setHdrTargetPeakNits(targetNits);
+  }
+  if (ImGui::IsItemDeactivatedAfterEdit()) {
+    m_controller.persistHdrSettings();
   }
   if (ImGui::IsItemHovered()) {
     ImGui::SetTooltip("Peak brightness of your display. 100 nits is the\n"
                       "SDR reference; raise it only for a brighter panel.");
+  }
+
+  // Source peak. Normally read from the file, so the override is behind a
+  // checkbox: an explicit value that disagrees with correct metadata makes
+  // the picture worse, and there is no way for the panel to tell which of
+  // the two is wrong.
+  bool overrideSource = m_controller.getHdrSourcePeakNits() > 0.0f;
+  if (ImGui::Checkbox("Override source peak", &overrideSource)) {
+    if (overrideSource) {
+      // Seed with whatever the automatic choice arrived at, so ticking the
+      // box does not itself change the picture -- the slider then moves
+      // away from a known-good starting point.
+      const float seed =
+          (colorInfo.toneMapped && colorInfo.toneMapSourceNits > 0.0f)
+              ? colorInfo.toneMapSourceNits
+              : 1000.0f;
+      m_controller.setHdrSourcePeakNits(seed);
+    } else {
+      m_controller.setHdrSourcePeakNits(0.0f);
+    }
+    m_controller.persistHdrSettings();
+  }
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip(
+        "Peak brightness the content was graded for. Read from the file\n"
+        "by default (mastering metadata, capped by MaxCLL), which is\n"
+        "right unless the file lies about it.\n\n"
+        "Set it too high and the picture comes out dim; too low and\n"
+        "highlights clip.");
+  }
+
+  if (overrideSource) {
+    float sourceNits = m_controller.getHdrSourcePeakNits();
+    ImGui::SetNextItemWidth(160.0f);
+    if (ImGui::SliderFloat("Source peak", &sourceNits, 100.0f, 10000.0f,
+                           "%.0f nits", ImGuiSliderFlags_Logarithmic)) {
+      m_controller.setHdrSourcePeakNits(sourceNits);
+    }
+    if (ImGui::IsItemDeactivatedAfterEdit()) {
+      m_controller.persistHdrSettings();
+    }
+    if (ImGui::IsItemHovered()) {
+      ImGui::SetTooltip("1000 and 4000 nits are the usual mastering\n"
+                        "targets for HDR10.");
+    }
+  } else if (colorInfo.toneMapped && colorInfo.toneMapSourceNits > 0.0f) {
+    ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.75f, 1.0f),
+                       "Source peak: %.0f nits (from file)",
+                       colorInfo.toneMapSourceNits);
+  }
+
+  ImGui::Separator();
+
+  bool dynamicOn = m_controller.isHdrDynamicMetadataEnabled();
+  if (ImGui::Checkbox("Follow HDR10+ / Dolby Vision metadata", &dynamicOn)) {
+    m_controller.setHdrDynamicMetadataEnabled(dynamicOn);
+    m_controller.persistHdrSettings();
+    showToast(dynamicOn ? "Dynamic HDR metadata enabled"
+                        : "Dynamic HDR metadata disabled",
+              false, 2.0);
+  }
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip(
+        "Maps each frame from the peak that frame actually reaches,\n"
+        "instead of mapping the whole file from one static peak. Only\n"
+        "does anything for files that carry per-frame metadata -- and a\n"
+        "hardware decoder may strip it, in which case the status line\n"
+        "above will not say [dynamic].");
+  }
+  // Say plainly when the setting is on but the file or decoder is not
+  // supplying anything, rather than letting it look broken.
+  if (dynamicOn && colorInfo.toneMapped && !colorInfo.toneMapDynamic) {
+    ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.75f, 1.0f),
+                       "  (no per-frame metadata on this stream)");
+  }
+
+  bool adaptiveOn = m_controller.isHdrAdaptiveResolutionEnabled();
+  if (ImGui::Checkbox("Adapt resolution to keep frame rate", &adaptiveOn)) {
+    m_controller.setHdrAdaptiveResolutionEnabled(adaptiveOn);
+    m_controller.persistHdrSettings();
+    showToast(adaptiveOn ? "Adaptive tone-map resolution enabled"
+                         : "Adaptive tone-map resolution disabled",
+              false, 2.0);
+  }
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip(
+        "Tone maps at a smaller size when the machine cannot keep up,\n"
+        "and goes back to full size when it can. Costs sharpness under\n"
+        "load; turning it off means late frames and dropped ones\n"
+        "instead, which on heavy content looks like flashing.");
+  }
+  {
+    // The HUD reports the size actually converted, so this is the honest
+    // place to show what the adaptation is currently doing.
+    const int pw = m_controller.getPlaybackWidth();
+    const int ph = m_controller.getPlaybackHeight();
+    if (adaptiveOn && pw > 0 && ph > 0) {
+      ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.75f, 1.0f),
+                         "  Tone mapping at %dx%d", pw, ph);
+    }
   }
 
   if (m_hudFont)

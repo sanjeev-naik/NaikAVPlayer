@@ -257,6 +257,15 @@ static SDL_Colorspace getSDLColorspace(const AVFrame *frame) {
   AVColorSpace spc = frame->colorspace;
   AVColorRange rng = frame->color_range;
 
+  // Packed RGB carries no YUV matrix to undo. Tone mapped HDR arrives
+  // here (see VideoDecoder::toneMapFrame), already converted to BT.709
+  // primaries and re-encoded with the BT.709 OETF, so the only sensible
+  // tag is plain sRGB -- anything else asks the GPU to convert a signal
+  // that is already in the display's space.
+  if (frame->format == AV_PIX_FMT_RGB24) {
+    return SDL_COLORSPACE_SRGB;
+  }
+
   // YUVJ420P is legacy and always full range
   if (frame->format == AV_PIX_FMT_YUVJ420P) {
     rng = AVCOL_RANGE_JPEG;
@@ -439,6 +448,13 @@ int main(int argc, char *argv[]) {
   if (!mediaPath.empty()) {
     if (controller.openFile(mediaPath)) {
       controller.play();
+    } else {
+      // Never fail silently: the welcome screen staying up with no
+      // explanation is indistinguishable from the player being broken,
+      // and the stderr message behind this is invisible in the MSVC
+      // build, which has no console attached.
+      playerUI.showToast("Could not open file: " + controller.getLastOpenError(),
+                         true, 8.0);
     }
   }
 
@@ -635,6 +651,9 @@ int main(int argc, char *argv[]) {
     if (droppedPaths.size() == 1) {
       if (controller.openFile(droppedPaths[0])) {
         controller.play();
+      } else {
+        playerUI.showToast("Could not open file: " + controller.getLastOpenError(),
+                           true, 8.0);
       }
     } else if (droppedPaths.size() > 1) {
       size_t firstNewIndex = controller.getPlaylist().size();
@@ -724,6 +743,11 @@ int main(int argc, char *argv[]) {
           targetFormat = SDL_PIXELFORMAT_NV12;
         } else if (currentFrame.frame->format == AV_PIX_FMT_NV21) {
           targetFormat = SDL_PIXELFORMAT_NV21;
+        } else if (currentFrame.frame->format == AV_PIX_FMT_RGB24) {
+          // Tone mapped HDR: the decoder hands over packed RGB rather
+          // than YUV, so the frame skips the GPU's YUV conversion
+          // entirely instead of being packed back into YUV first.
+          targetFormat = SDL_PIXELFORMAT_RGB24;
         }
 
         SDL_Colorspace colorspace = getSDLColorspace(currentFrame.frame);
@@ -779,8 +803,12 @@ int main(int argc, char *argv[]) {
 
           auto renderStart = std::chrono::steady_clock::now();
           // Copy raw plane segments directly to GPU-mapped texture memory
-          if (texFormat == SDL_PIXELFORMAT_NV12 ||
-              texFormat == SDL_PIXELFORMAT_NV21) {
+          if (texFormat == SDL_PIXELFORMAT_RGB24) {
+            SDL_UpdateTexture(videoTexture, nullptr,
+                              currentFrame.frame->data[0],
+                              currentFrame.frame->linesize[0]);
+          } else if (texFormat == SDL_PIXELFORMAT_NV12 ||
+                     texFormat == SDL_PIXELFORMAT_NV21) {
             SDL_UpdateNVTexture(
                 videoTexture, nullptr, currentFrame.frame->data[0],
                 currentFrame.frame->linesize[0], currentFrame.frame->data[1],
@@ -814,6 +842,21 @@ int main(int argc, char *argv[]) {
       }
       if (currentFrame.frame) {
         av_frame_free(&currentFrame.frame);
+      }
+    }
+
+    // Tell the decoder how big the picture is actually being drawn, so an
+    // HDR source is not tone mapped at a resolution this window cannot
+    // show. The renderer's output size, not winWidth/winHeight: those are
+    // in window points, and on a HiDPI display the backbuffer is larger.
+    // Cheap and lock-free, so it just runs every frame rather than being
+    // hung off resize events -- which would also miss display-scale
+    // changes and the initial size.
+    {
+      int outW = 0;
+      int outH = 0;
+      if (SDL_GetCurrentRenderOutputSize(renderer, &outW, &outH)) {
+        controller.setDisplaySize(outW, outH);
       }
     }
 

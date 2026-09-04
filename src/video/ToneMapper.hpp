@@ -32,6 +32,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <thread>
 #include <vector>
 
@@ -47,8 +48,53 @@
 #define NAIKAV_TM_INLINE inline
 #endif
 
+// Runtime CPU dispatch for the per-pixel loop.
+//
+// The tone mapper is the largest cost in the HDR path (measured ~8.4
+// ns/pixel across 8 threads, ~70 ms on a 4K frame), and building it for
+// AVX2 measured roughly a fifth off that. The whole binary cannot simply
+// be built with -mavx2 -- it would crash on any machine without it -- so
+// the inner loop is compiled twice and selected once at runtime.
+//
+// GCC/Clang on x86 only. MSVC has no per-function target attribute of
+// this kind, and non-x86 has no AVX2 at all; both fall back to the single
+// baseline path, which is what shipped before.
+#if (defined(__GNUC__) || defined(__clang__)) &&     (defined(__x86_64__) || defined(__i386__))
+  #define NAIKAV_TM_MULTIVERSION 1
+  // AVX2 without FMA on purpose. Contracting the HLG OOTF's
+  // multiply-adds into fused ones changes its rounding, so the AVX2 and
+  // baseline paths would no longer produce bit-identical pictures --
+  // measured as differing output for HLG while PQ stayed exact. The
+  // vectorisation is where the time goes; the fused multiply-add is not
+  // worth two code paths that disagree.
+  #define NAIKAV_TM_TARGET_AVX2 __attribute__((target("avx2")))
+  #define NAIKAV_TM_ALWAYS_INLINE __attribute__((always_inline)) inline
+#else
+  #define NAIKAV_TM_MULTIVERSION 0
+  #define NAIKAV_TM_TARGET_AVX2
+  #define NAIKAV_TM_ALWAYS_INLINE inline
+#endif
+
 namespace naikav {
 namespace video {
+
+#if NAIKAV_TM_MULTIVERSION
+// Queried once. __builtin_cpu_supports resolves against the CPU the
+// process is actually running on, not the one it was built on.
+inline bool hasAvx2() {
+    // NAIKAV_NO_AVX2=1 forces the baseline path. Kept because the two
+    // must produce the same picture: the only way to check that claim is
+    // to run both on the same frames and compare.
+    static const bool supported = []() {
+        const char* off = std::getenv("NAIKAV_NO_AVX2");
+        if (off && off[0] == '1') {
+            return false;
+        }
+        return __builtin_cpu_supports("avx2") != 0;
+    }();
+    return supported;
+}
+#endif
 
 // Which HDR transfer function the source carries. None means SDR -- the
 // tone mapper stays entirely out of the way.
@@ -73,6 +119,19 @@ struct HdrToneMapSettings {
     // the mastering-display metadata when the file carries it, otherwise
     // kDefaultSourcePeakNits below.
     float sourcePeakNits = 0.0f;
+
+    // Follow HDR10+ / Dolby Vision per-frame metadata when the file
+    // carries it, instead of mapping every frame from one static peak.
+    // Ignored when sourcePeakNits above is set, since an explicit
+    // override is by definition a decision to ignore the file.
+    bool useDynamicMetadata = true;
+
+    // Let the decoder shrink the tone-mapping target when the machine
+    // cannot hold the source's frame rate at the full window size. Costs
+    // sharpness under load and keeps the frame rate steady; turning it
+    // off restores the fixed target, which on heavy content means late
+    // frames and the drop logic instead.
+    bool adaptiveResolution = true;
 };
 
 // Fallback mastering peak when a file carries no mastering-display
@@ -559,7 +618,12 @@ private:
     // math over contiguous arrays that vectorizes cleanly. Interleaved
     // per pixel, the gathers stall the arithmetic and the whole loop
     // compiles to scalar code; separated, only the gathers stay scalar.
-    void processRows(const uint8_t* src, int srcStride,
+    // The body lives here so that the two dispatch targets below compile
+    // the identical source twice, once for a baseline machine and once
+    // with AVX2 enabled. always_inline is what actually lets the AVX2
+    // wrapper recompile it under its own target flags.
+    NAIKAV_TM_ALWAYS_INLINE
+    void processRowsImpl(const uint8_t* src, int srcStride,
                      uint8_t* dst, int dstStride,
                      int width, int y0, int y1) const {
         alignas(32) float lr[kBlock];
@@ -631,6 +695,33 @@ private:
                 }
             }
         }
+    }
+
+#if NAIKAV_TM_MULTIVERSION
+    // Same source, compiled for AVX2. Phase 2 -- the tone-map gain, the
+    // BT.2020 -> BT.709 matrix and the soft gamut clip -- is branch-free
+    // and gather-free precisely so it can be vectorised here.
+    NAIKAV_TM_TARGET_AVX2
+    void processRowsAvx2(const uint8_t* src, int srcStride,
+                         uint8_t* dst, int dstStride,
+                         int width, int y0, int y1) const {
+        processRowsImpl(src, srcStride, dst, dstStride, width, y0, y1);
+    }
+#endif
+
+    // Runtime dispatch. The check is one cached predicate, not a per-pixel
+    // cost, and it keeps the binary runnable on machines without AVX2 --
+    // building the whole player with -mavx2 would not.
+    void processRows(const uint8_t* src, int srcStride,
+                     uint8_t* dst, int dstStride,
+                     int width, int y0, int y1) const {
+#if NAIKAV_TM_MULTIVERSION
+        if (hasAvx2()) {
+            processRowsAvx2(src, srcStride, dst, dstStride, width, y0, y1);
+            return;
+        }
+#endif
+        processRowsImpl(src, srcStride, dst, dstStride, width, y0, y1);
     }
 };
 

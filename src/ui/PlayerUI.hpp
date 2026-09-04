@@ -74,6 +74,10 @@ private:
     // Modal state
     bool m_showLoadFileDialog;
     char m_filePathBuffer[512];
+    // Reason the last typed-path load failed, shown inside the "Load
+    // Error" popup. Captured when the popup opens, since the controller's
+    // copy is cleared by the next open attempt.
+    std::string m_loadErrorReason;
 
     // Loaded fonts
     ImFont* m_mainFont = nullptr;
