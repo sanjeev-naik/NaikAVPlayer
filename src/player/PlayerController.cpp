@@ -17,18 +17,9 @@ constexpr double kMinCatchupGap = 0.35;      // below this a plain jump looks id
 PlayerController::PlayerController()
     : m_state(PlayerState::UNINITIALIZED),
       m_videoQueue(100), // Max capacity of 100 packets
-      // Sized in packets, but what matters is the *time* it holds, and
-      // that varies enormously by codec: an AAC packet is ~21 ms while a
-      // TrueHD access unit is under 1 ms, so the old 150-packet queue was
-      // three seconds of AAC but only ~125 ms of TrueHD. That mattered
-      // once prerollVideo() started holding audio at the starting line
-      // while the video pipeline opens its codec: the demuxer fills this
-      // queue, blocks on it, and then stops delivering *video* packets
-      // too, so the first video frame never arrives and the preroll can
-      // only ever time out. Sized here to cover the preroll timeout even
-      // for the shortest packets in practice. Costs a few MB; the read
-      // -ahead it allows is still bounded by the 100-packet video queue.
-      m_audioQueue(2400),
+      // Starts at the audio-only size; openFile() raises it once it knows
+      // the file has video to preroll. See kAudioQueuePacketsWithVideo.
+      m_audioQueue(kAudioQueuePacketsAudioOnly),
       m_subtitleQueue(100), // Max capacity of 100 subtitle packets
       m_hasAudio(false),
       m_hasVideo(false),
@@ -79,6 +70,7 @@ bool PlayerController::openFile(const std::string& filename, bool resetPlaylist)
     }
 
     setLastOpenError("");
+    invalidateVideoInfoCache();
 
     try {
         m_filename = filename;
@@ -192,6 +184,14 @@ bool PlayerController::openFile(const std::string& filename, bool resetPlaylist)
                 m_audioDecoder->attachSeekGeneration(m_demuxer->seekGenerationPtr());
             }
         }
+
+        // Before m_demuxer->start(): a file with video needs room to buffer
+        // audio through prerollVideo() without the demuxer blocking here and
+        // starving the video packets that preroll is waiting for. An
+        // audio-only file must keep the smaller bound, or a short one is
+        // read to EOF while still paused at the start.
+        m_audioQueue.setCapacity(m_hasVideo ? kAudioQueuePacketsWithVideo
+                                            : kAudioQueuePacketsAudioOnly);
 
         if (!m_hasVideo && !m_hasAudio) {
             std::cerr << "Error: File has no playable video or audio streams" << std::endl;
@@ -774,24 +774,36 @@ double PlayerController::getDuration() const {
 int PlayerController::getVideoWidth() const {
     std::unique_lock<std::mutex> lock(m_videoDecoderMutex, std::try_to_lock);
     if (!lock.owns_lock()) {
-        std::lock_guard<std::mutex> cache(m_videoInfoCacheMutex);
-        return m_cachedVideoWidth;
+        {
+            std::lock_guard<std::mutex> cache(m_videoInfoCacheMutex);
+            if (m_videoWidthCached) {
+                return m_cachedVideoWidth;
+            }
+        }
+        lock.lock();  // nothing cached yet: a correct answer is worth the wait
     }
     const int value = m_videoDecoder ? m_videoDecoder->getWidth() : 0;
     std::lock_guard<std::mutex> cache(m_videoInfoCacheMutex);
     m_cachedVideoWidth = value;
+    m_videoWidthCached = true;
     return value;
 }
 
 int PlayerController::getVideoHeight() const {
     std::unique_lock<std::mutex> lock(m_videoDecoderMutex, std::try_to_lock);
     if (!lock.owns_lock()) {
-        std::lock_guard<std::mutex> cache(m_videoInfoCacheMutex);
-        return m_cachedVideoHeight;
+        {
+            std::lock_guard<std::mutex> cache(m_videoInfoCacheMutex);
+            if (m_videoHeightCached) {
+                return m_cachedVideoHeight;
+            }
+        }
+        lock.lock();
     }
     const int value = m_videoDecoder ? m_videoDecoder->getHeight() : 0;
     std::lock_guard<std::mutex> cache(m_videoInfoCacheMutex);
     m_cachedVideoHeight = value;
+    m_videoHeightCached = true;
     return value;
 }
 
@@ -1015,25 +1027,37 @@ double PlayerController::getSeekReferenceTime() {
 std::string PlayerController::getVideoPixelFormat() const {
     std::unique_lock<std::mutex> lock(m_videoDecoderMutex, std::try_to_lock);
     if (!lock.owns_lock()) {
-        std::lock_guard<std::mutex> cache(m_videoInfoCacheMutex);
-        return m_cachedPixelFormat;
+        {
+            std::lock_guard<std::mutex> cache(m_videoInfoCacheMutex);
+            if (m_pixelFormatCached) {
+                return m_cachedPixelFormat;
+            }
+        }
+        lock.lock();
     }
     std::string value =
         m_videoDecoder ? m_videoDecoder->getPixelFormatName() : std::string("unknown");
     std::lock_guard<std::mutex> cache(m_videoInfoCacheMutex);
     m_cachedPixelFormat = value;
+    m_pixelFormatCached = true;
     return value;
 }
 
 bool PlayerController::isVideoHardware() const {
     std::unique_lock<std::mutex> lock(m_videoDecoderMutex, std::try_to_lock);
     if (!lock.owns_lock()) {
-        std::lock_guard<std::mutex> cache(m_videoInfoCacheMutex);
-        return m_cachedIsHardware;
+        {
+            std::lock_guard<std::mutex> cache(m_videoInfoCacheMutex);
+            if (m_isHardwareCached) {
+                return m_cachedIsHardware;
+            }
+        }
+        lock.lock();
     }
     const bool value = m_videoDecoder ? m_videoDecoder->isHardware() : false;
     std::lock_guard<std::mutex> cache(m_videoInfoCacheMutex);
     m_cachedIsHardware = value;
+    m_isHardwareCached = true;
     return value;
 }
 
@@ -1677,13 +1701,19 @@ size_t PlayerController::getAudioFrameQueueSize() const {
 ColorPipelineInfo PlayerController::getColorInfo() const {
     std::unique_lock<std::mutex> lock(m_videoDecoderMutex, std::try_to_lock);
     if (!lock.owns_lock()) {
-        std::lock_guard<std::mutex> cache(m_videoInfoCacheMutex);
-        return m_cachedColorInfo;
+        {
+            std::lock_guard<std::mutex> cache(m_videoInfoCacheMutex);
+            if (m_colorInfoCached) {
+                return m_cachedColorInfo;
+            }
+        }
+        lock.lock();
     }
     ColorPipelineInfo value =
         m_videoDecoder ? m_videoDecoder->getColorInfo() : ColorPipelineInfo{};
     std::lock_guard<std::mutex> cache(m_videoInfoCacheMutex);
     m_cachedColorInfo = value;
+    m_colorInfoCached = true;
     return value;
 }
 

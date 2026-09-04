@@ -436,7 +436,10 @@ The single demuxer thread reads both the video and audio packet streams via `av_
 - **`push_drop_oldest(value, dropCleanup)`**: never waits at all — drops the oldest entry immediately if full. Used for audio packets specifically while the audio consumer is known to be idle (paused, or mid seek catch-up), since waiting on a consumer that isn't running serves no purpose.
 
 > [!NOTE]
-> Queue capacities are counted in packets (video 100, audio 2400, subtitle 100) but what matters for the audio queue is the *time* it holds, and that varies by two orders of magnitude between codecs: an AAC packet is ~21 ms while a TrueHD access unit is under 1 ms. The old 150-packet capacity was three seconds of AAC but only ~125 ms of TrueHD, which was not enough to cover the startup preroll — the demuxer filled it, blocked on it, and stopped delivering *video* packets too, starving the very frame the preroll was waiting for.
+> Queue capacities are counted in packets (video 100, subtitle 100) but what matters for the audio queue is the *time* it holds, and that varies by two orders of magnitude between codecs: an AAC packet is ~21 ms while a TrueHD access unit is under 1 ms. So the audio bound is chosen per file in `openFile()`:
+>
+> - **2400 packets when the file has video.** 150 was three seconds of AAC but only ~125 ms of TrueHD — not enough to cover the startup preroll, during which the demuxer filled the queue, blocked on it, and stopped delivering *video* packets too, starving the very frame the preroll was waiting for.
+> - **150 packets for audio-only.** Such a file never prerolls, and the larger bound is actively wrong there: the demuxer reads a short file to EOF and reports end-of-stream while playback is still paused at the start.
 
 This also replaced the previous PTS-based `throttleCatchupReadahead()` mechanism that capped video read-ahead during seek catch-up: the queue's own bounded-wait-then-drop behavior now throttles read-ahead naturally, tracking actual decoder throughput instead of a fixed "1 second past target" heuristic. See [Section 9](#9-troubleshooting) for the hang symptom this fixes, and `tests/tests.cpp` (`T7b`, `T7c`, and the "rapid consecutive seek recovery" integration case) for the regression coverage.
 

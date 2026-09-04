@@ -113,7 +113,7 @@ src/
           ▼                     ▼                    ▼
   ┌──────────────┐      ┌──────────────┐     ┌──────────────┐
   │ Video Packet │      │ Audio Packet │     │Subtitle Queue│
-  │ Queue (100)  │      │ Queue (2400) │     │ (100 pkts)   │
+  │ Queue (100)  │      │Queue(150/2400│     │ (100 pkts)   │
   └───────┬──────┘      └───────┬──────┘     └───────┬──────┘
           │                     │                    │
           ▼                     ▼                    ▼
@@ -169,7 +169,9 @@ src/
   queued, so video never begins a file already behind (prerollVideo()).
 ```
 
-- **Demuxer Thread**: Reads raw packets via `av_read_frame` and routes them into bounded `ThreadSafeQueue<AVPacket*>` instances (video capacity: 100 packets, audio capacity: 2400, subtitle capacity: 100 packets). Pushes never block indefinitely — see [Stall-Proof Queue Backpressure](#stall-proof-queue-backpressure-deadlock-prevention) below. The audio queue is counted in packets but sized for *time*: a packet is ~21 ms of AAC but under 1 ms of TrueHD, and it has to hold enough to cover the startup preroll without the demuxer blocking on it and starving video.
+- **Demuxer Thread**: Reads raw packets via `av_read_frame` and routes them into bounded `ThreadSafeQueue<AVPacket*>` instances (video capacity: 100 packets, subtitle capacity: 100, audio capacity 150 or 2400 depending on the file). Pushes never block indefinitely — see [Stall-Proof Queue Backpressure](#stall-proof-queue-backpressure-deadlock-prevention) below.
+
+  The audio queue is counted in packets but what matters is the *time* it holds, and that varies by two orders of magnitude between codecs: an AAC packet is ~21 ms, a TrueHD access unit under 1 ms. A file **with video** gets the larger bound, because it has to buffer audio through the startup preroll without the demuxer blocking here and starving video of the very packets the preroll is waiting for. An **audio-only** file keeps the smaller one: it never prerolls, and buffering that far ahead would let the demuxer swallow a short file whole and report end-of-stream while playback is still paused at the start.
 - **Video Decoder Thread**: Background worker thread that pops packets from the video queue, decodes them (via hardware or software fallback), and pushes converted frames into the bounded `m_decodedFrameQueue` (capacity: 8 frames), using the same bounded-wait backpressure. A frame more than 100 ms behind the clock is dropped here — *before* the conversion that would be wasted on it — but only while the packet queue is actually backed up, which is what distinguishes a pipeline that has fallen behind from one that is merely being fed at real time (see [Startup Preroll and A/V Sync](#startup-preroll-and-av-sync)).
 - **Audio Decoding**: Executed sample-accurately inside the SDL3 Audio Stream callback thread. It pulls packets from the audio queue, decodes them, resamples to the output layout/rate as interleaved float (`swr_convert`, libsoxr engine), runs the DSP chain and loudness normalization in place, then dithers and truncates to the device's 16-bit format — see [Audio DSP & Loudness Pipeline](#audio-dsp--loudness-pipeline) below.
 - **Subtitle Decoder & Parser**: Handles container-embedded subtitle streams via FFmpeg decoders and standalone external files (`.srt`, `.vtt`, `.ass`, `.ssa`, `.sub`) parsed directly into in-memory timed events.

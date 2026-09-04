@@ -49,6 +49,20 @@ private:
     // Packet queues
     ThreadSafeQueue<AVPacket*> m_videoQueue;
     ThreadSafeQueue<AVPacket*> m_audioQueue;
+    // How much audio to buffer, chosen per file in openFile().
+    //
+    // A file with video needs enough to cover prerollVideo() without the
+    // demuxer blocking on this queue and starving video of the packets the
+    // preroll is waiting for -- and "enough" is a matter of time, not
+    // packets: an AAC packet is ~21 ms while a TrueHD access unit is under
+    // 1 ms, so 150 packets is three seconds of one and ~125 ms of the
+    // other.
+    //
+    // An audio-only file never prerolls, and buffering that far ahead there
+    // is actively wrong: the demuxer would swallow a short file whole and
+    // report EOF while playback is still paused at the start.
+    static constexpr size_t kAudioQueuePacketsWithVideo = 2400;
+    static constexpr size_t kAudioQueuePacketsAudioOnly = 150;
     ThreadSafeQueue<AVPacket*> m_subtitleQueue;
     
     // Sub-modules
@@ -130,12 +144,34 @@ private:
     // These are display-only figures that change rarely (or never) during
     // playback, so showing the previous value for one frame while the
     // decoder is busy costs nothing and cannot be seen.
+    // A cached entry may only be *returned* once it holds a real reading.
+    // Falling back to an empty cache would report a 0x0 video or an
+    // "unknown" pixel format to a caller that simply happened to ask while
+    // the decode thread held the mutex -- which is wrong rather than
+    // merely stale, and is exactly what broke "Video width is populated
+    // correctly". So the first read of each property waits for the real
+    // value; every read after that can fall back.
     mutable std::mutex m_videoInfoCacheMutex;
     mutable ColorPipelineInfo m_cachedColorInfo;
     mutable std::string m_cachedPixelFormat{"unknown"};
     mutable bool m_cachedIsHardware = false;
     mutable int m_cachedVideoWidth = 0;
     mutable int m_cachedVideoHeight = 0;
+    mutable bool m_colorInfoCached = false;
+    mutable bool m_pixelFormatCached = false;
+    mutable bool m_isHardwareCached = false;
+    mutable bool m_videoWidthCached = false;
+    mutable bool m_videoHeightCached = false;
+    // Cleared whenever the decoder is replaced, so one file never reports
+    // the previous file's dimensions.
+    void invalidateVideoInfoCache() {
+        std::lock_guard<std::mutex> lock(m_videoInfoCacheMutex);
+        m_colorInfoCached = false;
+        m_pixelFormatCached = false;
+        m_isHardwareCached = false;
+        m_videoWidthCached = false;
+        m_videoHeightCached = false;
+    }
     // openFile() runs on the UI thread but playlist advance calls it from
     // the playback path, so the error it leaves behind is guarded.
     mutable std::mutex m_lastOpenErrorMutex;
