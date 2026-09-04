@@ -44,8 +44,23 @@ private:
     
     AVRational m_videoTimeBase;
     AVRational m_audioTimeBase;
+
+    // The instant the *file* begins, in AV_TIME_BASE units, and the same
+    // instant expressed in each stream's own time base.
+    //
+    // Every stream timestamp is normalised against this one shared origin,
+    // never against the stream's own start_time. Those differ: this
+    // project's 4K HDR10+ test clip starts its video stream at 0.838s and
+    // its audio stream at 0.000s, so subtracting each stream's own start
+    // shifted video 838ms earlier than audio -- audible as the audio
+    // lagging by most of a second. A common origin preserves the relative
+    // offset the container describes while still letting the timeline
+    // start at zero for a file that begins at some large timestamp (an
+    // MPEG-TS recording, say).
+    int64_t m_startTimeUs;
     int64_t m_videoStartTime;
     int64_t m_audioStartTime;
+    void computeStartTimes();
     
     double m_duration; // in seconds
     

@@ -31,6 +31,7 @@ Demuxer::Demuxer(const std::string& filename,
       m_audioCodecParams(nullptr),
       m_videoTimeBase{0, 1},
       m_audioTimeBase{0, 1},
+      m_startTimeUs(0),
       m_videoStartTime(0),
       m_audioStartTime(0),
       m_duration(0.0),
@@ -227,8 +228,8 @@ bool Demuxer::open() {
             m_videoStreamIdx = i;
             m_videoCodecParams = codecParams;
             m_videoTimeBase = m_formatCtx->streams[i]->time_base;
-            m_videoStartTime = m_formatCtx->streams[i]->start_time;
-            if (m_videoStartTime == AV_NOPTS_VALUE) m_videoStartTime = 0;
+            // Start times are assigned together in computeStartTimes()
+            // once every stream is known -- they must share one origin.
             // avg_frame_rate is the honest average over the file;
             // r_frame_rate is the smallest rate all timestamps are
             // multiples of, which for a variable-rate stream can be a
@@ -325,6 +326,10 @@ bool Demuxer::open() {
         }
     }
 
+    // Before selecting an audio stream: selectAudioStream() derives that
+    // stream's origin from m_startTimeUs, which this establishes.
+    computeStartTimes();
+
     // Select default audio stream if audio tracks were found
     if (!m_audioTracks.empty()) {
         auto it = std::find_if(m_audioTracks.begin(), m_audioTracks.end(),
@@ -379,8 +384,7 @@ bool Demuxer::selectAudioStream(int streamIdx) {
     m_audioStreamIdx.store(streamIdx);
     m_audioCodecParams = m_formatCtx->streams[streamIdx]->codecpar;
     m_audioTimeBase = m_formatCtx->streams[streamIdx]->time_base;
-    m_audioStartTime = m_formatCtx->streams[streamIdx]->start_time;
-    if (m_audioStartTime == AV_NOPTS_VALUE) m_audioStartTime = 0;
+    m_audioStartTime = av_rescale_q(m_startTimeUs, AV_TIME_BASE_Q, m_audioTimeBase);
     return true;
 }
 
@@ -450,6 +454,39 @@ double Demuxer::packetTimeSeconds(const AVPacket* pkt, int streamIdx) const {
     return (ts - m_audioStartTime) * av_q2d(m_audioTimeBase);
 }
 
+// Establishes the one origin every stream's timestamps are measured from.
+// Prefers the container's own start time; falls back to the earliest stream
+// start when the container declares none, and to zero when nothing does.
+void Demuxer::computeStartTimes() {
+    m_startTimeUs = 0;
+    if (!m_formatCtx) {
+        return;
+    }
+    if (m_formatCtx->start_time != AV_NOPTS_VALUE) {
+        m_startTimeUs = m_formatCtx->start_time;
+    } else {
+        int64_t earliest = INT64_MAX;
+        for (unsigned int i = 0; i < m_formatCtx->nb_streams; ++i) {
+            const AVStream* st = m_formatCtx->streams[i];
+            if (st->start_time == AV_NOPTS_VALUE) {
+                continue;
+            }
+            const int64_t us = av_rescale_q(st->start_time, st->time_base, AV_TIME_BASE_Q);
+            earliest = std::min(earliest, us);
+        }
+        if (earliest != INT64_MAX) {
+            m_startTimeUs = earliest;
+        }
+    }
+
+    if (m_videoStreamIdx >= 0) {
+        m_videoStartTime = av_rescale_q(m_startTimeUs, AV_TIME_BASE_Q, m_videoTimeBase);
+    }
+    if (m_audioStreamIdx.load() >= 0) {
+        m_audioStartTime = av_rescale_q(m_startTimeUs, AV_TIME_BASE_Q, m_audioTimeBase);
+    }
+}
+
 AVCodecParameters* Demuxer::getSubtitleCodecParams(int streamIdx) const {
     if (!m_formatCtx || streamIdx < 0 || streamIdx >= static_cast<int>(m_formatCtx->nb_streams)) {
         return nullptr;
@@ -495,12 +532,18 @@ void Demuxer::performSeek() {
     if (m_videoStreamIdx >= 0) {
         streamIdx = m_videoStreamIdx;
         // In FFmpeg, stream-specific seek requires the timestamp in stream timebase units
-        targetTs = static_cast<int64_t>(targetTime / av_q2d(m_videoTimeBase));
+        // targetTime is normalised against m_startTimeUs (see
+        // computeStartTimes()), so the origin has to be added back to land
+        // on the container's own timeline. Without this, seeking to T on a
+        // file whose streams do not begin at zero lands T - start instead.
+        targetTs = static_cast<int64_t>(targetTime / av_q2d(m_videoTimeBase)) +
+                   m_videoStartTime;
     } else if (audioIdx >= 0) {
         streamIdx = audioIdx;
-        targetTs = static_cast<int64_t>(targetTime / av_q2d(m_audioTimeBase));
+        targetTs = static_cast<int64_t>(targetTime / av_q2d(m_audioTimeBase)) +
+                   m_audioStartTime;
     } else {
-        targetTs = static_cast<int64_t>(targetTime * AV_TIME_BASE);
+        targetTs = static_cast<int64_t>(targetTime * AV_TIME_BASE) + m_startTimeUs;
     }
     
     // Seek to nearest keyframe around target timestamp using modern fast binary-search avformat_seek_file
@@ -508,7 +551,8 @@ void Demuxer::performSeek() {
     if (ret < 0) {
         std::cerr << "Warning: Could not seek to " << targetTime << "s using stream " << streamIdx << std::endl;
         // Fallback to default seek if stream-specific seek fails
-        int64_t fallbackTs = static_cast<int64_t>(targetTime * AV_TIME_BASE);
+        int64_t fallbackTs =
+            static_cast<int64_t>(targetTime * AV_TIME_BASE) + m_startTimeUs;
         avformat_seek_file(m_formatCtx, -1, INT64_MIN, fallbackTs, INT64_MAX, 0);
     } else {
         std::cout << "Successfully seeked format context to " << targetTime << "s" << std::endl;
