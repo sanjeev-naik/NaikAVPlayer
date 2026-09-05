@@ -29,7 +29,7 @@
 - [Real-Time Audio DSP & Loudness Pipeline](#audio-dsp--loudness-pipeline)
 - [Dedicated Audio-Only Playback & Visualizer](#dedicated-audio-only-playback--real-time-visualizer)
 - [Multiple Audio Tracks & Subtitles](#multiple-audio-track-switching--external-audio)
-- [Building from Source](#build-instructions)
+- [Building from Source](#build--local-cross-compilation-guide)
 - [Usage Guide & Hotkeys](#usage-guide)
 - [Frequently Asked Questions (FAQ)](#frequently-asked-questions-faq)
 - [External References & Standards](#external-references--standards)
@@ -42,7 +42,10 @@
 - **Symmetric Low-Latency Seeking:** Rapid keyframe seek operations flushing packet queues and decoding pipelines under 80ms.
 - **Stall-Proof Pipeline Backpressure:** Producer threads never block indefinitely on a full queue — bounded-wait pushes fall back to dropping the oldest queued item once a timeout elapses, so a paused audio device, a stalled render loop, or a wedged decoder can never freeze the single demuxer thread that feeds both the video and audio queues.
 - **Dynamic Hardware Decoder Fallback:** Tries platform-specific hardware decoders (D3D11VA, DXVA2, QSV, CUVID on Windows; V4L2M2M, VAAPI, QSV, CUVID on Linux), falling back dynamically to software H.264 decoding if hardware context allocation fails or encounters runtime surface mapping errors.
-- **Sub-10ms Audio-Video Synchronization:** Reconstructs the audio clock sample-accurately from PCM sample offsets to maintain A/V drift under 10ms.
+- **HDR → SDR Tone Mapping (BT.2390):** HDR10, HDR10+, Dolby Vision (base layer) and HLG sources are converted for an SDR display rather than merely truncated to 8 bits. The transfer function is decoded to linear light (SMPTE ST 2084 PQ, or ARIB STD-B67 HLG including its luminance-dependent OOTF), highlights are rolled off with the ITU-R BT.2390 EETF toward the display's peak, the BT.2020 gamut is converted to BT.709 in linear light with out-of-gamut colors desaturated toward their own luminance rather than hard-clipped per channel, and the result is re-encoded with the BT.709 OETF. The source peak is taken from the file rather than assumed: HDR10+ (`maxscl`) or Dolby Vision (RPU L1) per-frame metadata when the stream carries it, otherwise the mastering-display peak reconciled with MaxCLL. Where a hardware decoder strips that metadata it is recovered from the stream header, or failing that by decoding a single frame in software at open. The display peak defaults to the 100-nit SDR reference, and both are overridable. See `naikav::video::ToneMapper`. Without this step a PQ signal reaches the display still PQ-encoded, which renders it dark and desaturated — 100-nit reference white lands at code 130 of 255 instead of 213.
+- **Tone Mapping Sized to the Window, and to the Machine:** Tone mapping costs strictly per output pixel and the result is scaled to fit the window before anyone sees it, so the HDR target is capped to the renderer's output size — mapping a 4K frame for a 1024x576 window did about seven times the work the letterbox blit then threw away. On top of that the target shrinks a step at a time whenever the measured conversion overruns the source's frame interval, and is restored once it fits. Without it, software-decoded 4K60 delivered 10–44 fps in bursts with 200 ms gaps — which reads as flashing rather than as a low frame rate; with it, 40–59 fps. Content with headroom never leaves full resolution.
+- **Runtime-Dispatched AVX2 Tone Mapper:** The per-pixel loop is compiled twice and selected once at runtime via `__builtin_cpu_supports`, so the binary still runs on machines without AVX2 — which building the whole player with `-mavx2` would not. Worth about 20% of the conversion (77 ms to 62 ms on a native 4K frame). FMA is deliberately left off: contracting the HLG OOTF's multiply-adds changed that path's rounding, and the two code paths are verified to produce byte-identical output instead.
+- **Sub-10ms Audio-Video Synchronization:** Reconstructs the audio clock sample-accurately from PCM sample offsets to maintain A/V drift under 10ms. Because the demuxer is paced by audio consumption, video can never decode ahead to recover a deficit it starts with — so playback also holds the audio clock at the starting line until the first video frame is ready, rather than beginning every file already behind by however long the decoder took to open.
 - **Fullscreen, Cursor Auto-Hide & Usability Gestures:** Fullscreen mode toggling via `F11`, `Alt+Enter`, or double-clicking anywhere on the video canvas; automatic cursor and controls dock hiding after 2.5 seconds of playback inactivity; instant volume adjustment via `Up`/`Down` arrow keys (±5%), mouse wheel over video, or mute toggle (`M`); and auto-pausing background playback during native file explorer dialogs.
 - **Lossless Video Frame Screenshot Export:** Capture and export the current video frame as a full-resolution PNG image (`S` hotkey) saved directly to the `screenshots/` directory with automatic timestamps (`NaikAVPlayer_<basename>_<YYYYMMDD_HHMMSS>_<time>.png`) using FFmpeg's native PNG encoder and `sws_scale` RGB24 conversion, accompanied by animated on-screen Toast feedback.
 - **Multiple Audio Track Switching & External Audio Support:** Full multi-stream container discovery for MP4/MKV files containing multiple embedded audio tracks (e.g. multi-language English/Japanese/Hindi, Director's commentary, stereo vs 5.1/7.1 surround). Supports seamless runtime audio track switching via the dedicated `[Audio]` headphone button or `B` hotkey without stalling video playback. Includes loading external standalone audio files (`.m4a`, `.aac`, `.ac3`, `.mp3`, `.wav`, `.flac`, `.ogg`, `.opus`, `.wma`, `.mka`) with automatic demuxer clock synchronization, switching back and forth between external and embedded tracks, and stream muting/disabling.
@@ -65,7 +68,8 @@
 - **Loop Playback:** Wraparound seek to 0.0 upon reaching end-of-file for continuous playback, toggleable via the controls dock `[Loop]` icon button and `L` hotkey.
 - **Playlist & Auto-Advance:** Build a queue of local media files — multi-select "Add Files" dialog, non-recursive "Add Folder" directory scan, or dropping more than one file onto the window at once — with drag-to-reorder, per-row removal, and double-click-to-play, via the `[Playlist]` button in the controls dock or the `P` hotkey. `Off` / `All` / `One` repeat modes plus a Shuffle toggle govern auto-advance once playback naturally reaches end-of-file, independent of the per-file `[Loop]` button above (which always just repeats the current file and takes priority while it's on). Playlist contents and repeat/shuffle state persist across restarts as standard M3U8 (`playlist.m3u8`).
 - **Native File Picker:** Cross-platform native file picker integration using `nativefiledialog-extended` (NFD) on Win32 and GTK3/Portal backends.
-- **Pipeline Diagnostics & System Info HUD:** Real-time overlay (`--metrics` or `D` key) displaying active player states, media telemetry (native vs. playback resolution, pixel format, hardware vs. software decoder type), Color & HDR pipeline characteristics (Color Space, Primaries, TRC, Range, Chroma Subsampling, Bit Depth, HDR10/HDR10+/Dolby Vision/HLG standard), pipeline queue depth levels, decode/render frame pacing budgets, and rolling clock synchronization offsets.
+- **Pipeline Diagnostics & System Info HUD:** Real-time overlay (`--metrics` or `D` key) displaying active player states, media telemetry (native vs. playback resolution, pixel format, hardware vs. software decoder type), Color & HDR pipeline characteristics (Color Space, Primaries, TRC, Range, Chroma Subsampling, Bit Depth, HDR10/HDR10+/Dolby Vision/HLG standard, plus a read-only line reporting whether tone mapping is actually active and between which peak luminances — the toggle and display-peak slider themselves live in the HDR panel, see below), pipeline queue depth levels, decode/render frame pacing budgets, and rolling clock synchronization offsets. Measuring the pipeline must not disturb it: every video property the HUD reads is fetched without ever waiting on the decoder (see [Reading Decoder State Without Stalling](#reading-decoder-state-without-stalling)), so turning the overlay on does not cost frames.
+- **HDR Tone Mapping Panel:** Dedicated overlay (`C` key or the controls-dock `[HDR]` button) reporting the source’s HDR standard, the live tone mapping status and whether a *dynamic* curve is actually in use, with the HDR → SDR on/off toggle, the display-peak slider (50–1000 nits), an optional source-peak override (100–10000 nits, for files whose metadata is wrong), and toggles for following HDR10+/Dolby Vision metadata and for adapting resolution to hold the frame rate. Settings persist across restarts and apply to the next decoded frame — no seek or reopen needed. Sliders apply live while dragging and only write to disk once released. Kept separate from the diagnostics HUD, which only reports the pipeline rather than changing it.
 - **Audio Processing Panel:** Dedicated overlay (`A` key) for the full DSP chain (EQ, noise gate, compressor, multiband compressor, limiter, crossover, loudness, 3D surround, widener, balance), a live FFT spectrum visualizer, plus channel/output-device/bit-depth/resampler-quality selection, separate from the diagnostics HUD.
 - **Translucent User Interface:** ImGui-based desktop interface using bundled Noto Sans typography.
 
@@ -84,13 +88,13 @@ src/
 ├── app/       main.cpp — entry point, SDL window/event loop, render loop, CLI flags
 ├── audio/     AudioDecoder.{hpp,cpp}, AudioTrack.hpp — decode, resample, SDL callback, track models, output selectors
 │   └── dsp/   header-only DSP module (see Audio DSP & Loudness Pipeline below)
-├── core/      ThreadSafeQueue.hpp, MetricRing.hpp, PipelineMetrics.hpp
+├── core/      ThreadSafeQueue.hpp, MetricRing.hpp, PipelineMetrics.hpp, FFmpegCompat.hpp
 ├── media/     Demuxer.{hpp,cpp} — packet reading, multi-stream track enumeration and routing
 ├── player/    PlayerController.{hpp,cpp} — state machine, track switching, seeking, settings persistence
 ├── playlist/  header-only Playlist module (queue, repeat/shuffle, M3U8 I/O — see Playlist & Auto-Advance below)
 ├── subtitle/  SubtitleDecoder.{hpp,cpp}, SubtitleTrack.hpp — decoding, parsing, sync, sanitization
 ├── ui/        PlayerUI.{hpp,cpp} — ImGui controls dock, diagnostics HUD, audio panel, subtitle overlay
-└── video/     VideoDecoder.{hpp,cpp}, FrameExporter.hpp — HW/SW decode, frame conversion, PNG screenshot export
+└── video/     VideoDecoder.{hpp,cpp}, ToneMapper.hpp, FrameExporter.hpp — HW/SW decode, frame conversion, HDR→SDR tone mapping, PNG screenshot export
 ```
 
 
@@ -109,7 +113,7 @@ src/
           ▼                     ▼                    ▼
   ┌──────────────┐      ┌──────────────┐     ┌──────────────┐
   │ Video Packet │      │ Audio Packet │     │Subtitle Queue│
-  │ Queue (100)  │      │ Queue (150)  │     │  (50 pkts)   │
+  │ Queue (100)  │      │Queue(150-4000│     │ (100 pkts)   │
   └───────┬──────┘      └───────┬──────┘     └───────┬──────┘
           │                     │                    │
           ▼                     ▼                    ▼
@@ -117,12 +121,31 @@ src/
   │Video Decoder │      │Audio Decoder │     │  Subtitle    │
   │Thread (HW/SW)│      │  (SDL3 Audio)│     │Decoder/Parser│
   └───────┬──────┘      └───────┬──────┘     └───────┬──────┘
-          │ decoded frames      │ PCM Audio & PTS    │ events
+          │                     │ PCM Audio & PTS    │ events
           ▼                     ▼                    │
-  ┌──────────────┐      ┌──────────────┐             │
-  │Decoded Frame │      │ Audio Master │             │
-  │  Queue (8)   │      │    Clock     │             │
-  └───────┬──────┘      └───────┬──────┘             │
+  ┌───────────────────┐ ┌──────────────┐             │
+  │ Late? backlogged? │ │ Audio Master │             │
+  │  └─► drop, skip   │ │    Clock     │             │
+  │      conversion   │ │              │             │
+  └───────┬───────────┘ └───────┬──────┘             │
+          │ kept frames         │                    │
+          ▼                     │                    │
+  ┌───────────────────┐         │                    │
+  │  convertFrame()   │         │                    │
+  │  SDR: zero-copy   │         │                    │
+  │       planar YUV  │         │                    │
+  │  HDR: cap to      │         │                    │
+  │       window ──►  │         │                    │
+  │       unpack RGB48│         │                    │
+  │       ──► BT.2390 │         │                    │
+  │       ──► RGB24   │         │                    │
+  └───────┬───────────┘         │                    │
+          │ decoded frames      │                    │
+          ▼                     │                    │
+  ┌──────────────┐              │                    │
+  │Decoded Frame │              │                    │
+  │  Queue (8)   │              │                    │
+  └───────┬──────┘              │                    │
           │                     │                    │
           └──────────────┬──────┴────────────────────┘
                          │
@@ -133,22 +156,108 @@ src/
   │  │ Dequeue Frames ──► Query Master Clock (A/V Sync)   │  │
   │  │                            │                       │  │
   │  │                            ▼                       │  │
-  │  │ Drop Late Frames ──► GPU YUV Texture Upload & UI   │  │
+  │  │ Publish window size ──► GPU Texture Upload & UI    │  │
+  │  │   (caps HDR work)        YUV planar, or RGB24      │  │
+  │  │                          when tone mapped          │  │
   │  │                            │                       │  │
   │  │                            ▼                       │  │
   │  │ Subtitle Overlay Match ──► Render Contrast Backdrop│  │
   │  └────────────────────────────────────────────────────┘  │
   └──────────────────────────────────────────────────────────┘
+
+  Startup only: play() holds the audio clock until the first frame is
+  queued, so video never begins a file already behind (prerollVideo()).
 ```
 
-- **Demuxer Thread**: Reads raw packets via `av_read_frame` and routes them into bounded `ThreadSafeQueue<AVPacket*>` instances (video capacity: 100 packets, audio capacity: 150 packets, subtitle capacity: 50 packets). Pushes never block indefinitely — see [Stall-Proof Queue Backpressure](#stall-proof-queue-backpressure-deadlock-prevention) below.
-- **Video Decoder Thread**: Background worker thread that pops packets from the video queue, decodes them (via hardware or software fallback), converts frames, and pushes them into the bounded `m_decodedFrameQueue` (capacity: 8 frames), using the same bounded-wait backpressure.
+- **Demuxer Thread**: Reads raw packets via `av_read_frame` and routes them into bounded `ThreadSafeQueue<AVPacket*>` instances (video capacity: 100 packets, subtitle capacity: 100, audio capacity sized per file, 150–4000 packets). Pushes never block indefinitely — see [Stall-Proof Queue Backpressure](#stall-proof-queue-backpressure-deadlock-prevention) below.
+
+  The audio queue is counted in packets but what matters is the *time* it holds, and that varies by two orders of magnitude between codecs: an AAC packet is ~23 ms, a TrueHD access unit under 1 ms. So a file **with video** sizes this queue by the clock rather than by a packet count: `audioQueuePacketsForFormat()` asks for however many packets hold three seconds of *this* stream's audio, from the samples-per-packet the decoder declares, bounded to 150–4000. It has to buffer audio through the startup preroll without the demuxer blocking here and starving video of the very packets the preroll is waiting for — and a flat 150 packets is three seconds of AAC but only ~125 ms of TrueHD. Ordinary codecs therefore land on the 150 floor, exactly the bound that has always shipped, which matters because the demuxer's backpressure against this queue is load-bearing. An **audio-only** file keeps the floor unconditionally: it never prerolls, and buffering that far ahead would let the demuxer swallow a short file whole and report end-of-stream while playback is still paused at the start.
+- **Video Decoder Thread**: Background worker thread that pops packets from the video queue, decodes them (via hardware or software fallback), and pushes converted frames into the bounded `m_decodedFrameQueue` (capacity: 8 frames), using the same bounded-wait backpressure. A frame more than 100 ms behind the clock is dropped here — *before* the conversion that would be wasted on it — but only while the packet queue is actually backed up, which is what distinguishes a pipeline that has fallen behind from one that is merely being fed at real time (see [Startup Preroll and A/V Sync](#startup-preroll-and-av-sync)).
 - **Audio Decoding**: Executed sample-accurately inside the SDL3 Audio Stream callback thread. It pulls packets from the audio queue, decodes them, resamples to the output layout/rate as interleaved float (`swr_convert`, libsoxr engine), runs the DSP chain and loudness normalization in place, then dithers and truncates to the device's 16-bit format — see [Audio DSP & Loudness Pipeline](#audio-dsp--loudness-pipeline) below.
 - **Subtitle Decoder & Parser**: Handles container-embedded subtitle streams via FFmpeg decoders and standalone external files (`.srt`, `.vtt`, `.ass`, `.ssa`, `.sub`) parsed directly into in-memory timed events.
-- **Main / Render Thread**: Dequeues decoded frames from `m_decodedFrameQueue` whose PTS matches the master clock time, matches active subtitle events against playback PTS + delay offset, updates the SDL YUV texture on the GPU, and renders the Dear ImGui interface overlay.
+- **Main / Render Thread**: Dequeues decoded frames from `m_decodedFrameQueue` whose PTS matches the master clock time, matches active subtitle events against playback PTS + delay offset, uploads to the SDL streaming texture, and renders the Dear ImGui interface overlay. It also publishes the renderer's output size back to the controller every frame, which is what lets the HDR path avoid tone mapping more pixels than the window can show. The texture is planar YUV for the zero-copy SDR path and RGB24 for tone-mapped HDR.
 
 #### GPU-Mapped Planar YUV Uploads
 Instead of performing CPU-side YUV-to-RGB color space conversion, the video decoder pipeline extracts raw YUV 4:2:0 planar frame data directly. The main thread maps this data onto a hardware-accelerated SDL3 streaming texture (`SDL_PIXELFORMAT_IYUV`) using `SDL_UpdateYUVTexture`. This uploads plane segments directly to GPU texture memory, allowing graphics hardware to handle color space conversion and scaling efficiently.
+
+#### HDR → SDR Tone Mapping Pipeline
+HDR frames cannot go down the [GPU-mapped YUV path](#gpu-mapped-planar-yuv-uploads) above, because that path hands the decoded signal to the display unchanged — correct for BT.709 SDR, wrong for a PQ- or HLG-encoded one, which then renders dark and desaturated no matter how many bits it is carried in. `VideoDecoder::convertFrame()` routes any frame whose `color_trc` is `AVCOL_TRC_SMPTE2084` or `AVCOL_TRC_ARIB_STD_B67` through two stages instead:
+
+```text
+HDR YUV (10/12-bit, BT.2020, PQ or HLG)
+     │  swscale, sliced across every core, scaled to the playback resolution
+     ▼
+RGB48 (16-bit, BT.2020, still HDR-encoded)
+     │  naikav::video::ToneMapper
+     │    ├─ EOTF        PQ (ST 2084) or HLG (STD-B67 + its OOTF) → linear light
+     │    ├─ Tone curve  ITU-R BT.2390 EETF, driven by the brightest channel so
+     │    │              hue holds steady and nothing exceeds the display peak
+     │    ├─ Gamut       BT.2020 → BT.709 in linear light, with out-of-gamut
+     │    │              colors desaturated toward their own luminance
+     │    └─ OETF        BT.709 → 8-bit
+     ▼
+RGB24, tagged BT.709 / sRGB — uploaded straight to an RGB streaming texture
+```
+
+- **Vectorised where it counts:** the per-pixel loop is compiled twice -- once baseline, once for AVX2 -- and selected at runtime, so the binary still runs on machines without AVX2. Worth about 20% of the conversion (77 ms to 62 ms on a native 4K frame). FMA is deliberately left off: contracting the HLG OOTF's multiply-adds changed its rounding, and the two paths are verified byte-identical for both PQ and HLG instead.
+- **Tables, not transcendentals:** every scalar stage (both EOTFs, the tone curve, the OETF) is precomputed into a lookup table once per `(transfer, source peak, target peak)` combination — in practice once per file. The per-pixel path is table reads plus a 3×3 matrix, with no `pow`, `exp` or `sqrt` in it.
+- **Scaling happens first:** the conversion to RGB48 also does the resolution scaling, so selecting a lower playback resolution shrinks the tone mapping work rather than adding to it. The kernel follows the direction of the resample — bilinear at native size (where the only thing being resampled is chroma), an area average when downscaling, bicubic when upscaling.
+- **No detour through YUV:** the mapper writes RGB24 and the renderer uploads it as an RGB texture. Packing it back into YUV420P purely so the GPU could convert it to RGB again cost a third full-frame pass — 47 ms per 4K frame — for a picture identical either way.
+- **Threaded on both sides:** the unpack is built with `sws_alloc_context()` and driven through `sws_scale_frame()`, because that is the only path on which swscale will slice a conversion across cores. Left single-threaded it ran 95 ms on a 4K frame, more than the tone mapper it feeds.
+- **Never more work than the frame budget allows:** when the measured conversion overruns the source's frame interval, the tone-mapping target is shrunk a step at a time and restored once it fits again (`AdaptiveToneMapScale`), reacting within three frames and recovering over about two seconds. This is what makes software-decoded 4K60 playable at all: with the CPU already spent on AV1 decode, the fixed-size mapping overran the 16.7 ms budget, frames arrived late and were dropped in bursts, and delivery swung between 10 and 44 fps with 200 ms gaps -- visible as flashing rather than as a low frame rate. Adapting holds 40-59 fps instead. Content with headroom never leaves full size.
+- **Never more pixels than the window shows:** the tone-mapping target is capped to the renderer's output size (`capToDisplaySize()`), preserving aspect ratio and only ever downscaling. Mapping a 4K frame for a 1024x576 window meant doing seven times the work the letterbox blit immediately threw away. The display box is rounded up to a multiple of 64 px so that dragging a window edge does not reallocate the pipeline on every pixel of the drag. This applies to the HDR path only — the SDR path still honours the resolution selector exactly.
+- **Metadata recovered whatever the decoder:** mastering-display luminance and MaxCLL usually arrive as frame side data from the decoder's SEI parsing, which hardware decoders do not do. The values are therefore looked for in three places in order -- the frame, the stream header, and failing both a one-time software decode of a single frame at open (`Demuxer::probeHdrMetadata()`). The last is what Matroska needs: it commonly carries no stream-level copy, so a 4K HDR MKV played on the GPU would otherwise have nothing at all to tone map from and would silently use the generic default.
+- **Mapped from the peak the content actually reaches:** the source peak is taken from the frame's mastering-display metadata reconciled with its `MaxCLL` — the lower of the two, since content cannot be brighter than the display it was graded on, and a grade delivered on a 4000-nit monitor whose brightest shot only reaches 800 spends most of the tone curve on range the file never uses. Overridable from the HDR panel for files whose metadata is wrong.
+- **Correct by construction where it matters:** the BT.2020 → BT.709 matrix is applied as identity-plus-difference rather than as a plain 3×3 product. Both gamuts share a D65 white, so every row of the true matrix sums to exactly 1 and neutral greys must survive untouched; the published six-decimal coefficients sum to 1.000001 on the green row, which is enough to shift greys off neutral by a code value.
+- **Truthful reporting:** `ColorPipelineInfo::toneMapped` records what the pipeline actually did, not just what the source claimed. The diagnostics HUD (`D`) shows the source's HDR standard *and* whether it was converted, so "HDR10 (PQ)" can never again be displayed over an uncorrected picture.
+
+> [!NOTE]
+> **Cost.** This is a CPU conversion — SDL3's 2D renderer exposes no custom shader stage to do it on the GPU. Row ranges are split across up to 8 worker threads. Measured on a 4-core/8-thread desktop against a 3840×2160 HDR10+ source (`tests/hdr_bench_standalone.cpp`), the tone mapping stage alone runs at ~29 ns/pixel single-threaded and ~8.4 ns/pixel across 8 threads.
+>
+> Because the target is capped to the window, the cost that matters is the size the video is *drawn* at, not the size it was encoded at. End to end — decode plus conversion, per frame, on that 4K source:
+>
+> | Drawn at | Per frame | Rate |
+> | --- | --- | --- |
+> | 1024×576 (default window) | 14 ms | 74 fps |
+> | 1600×900 | 24 ms | 41 fps |
+> | 1920×1080 | 30 ms | 34 fps |
+> | 2560×1440 | 50 ms | 20 fps |
+> | 3840×2160 (full screen) | 82 ms | 12 fps |
+>
+> So 4K HDR plays in real time in any window up to roughly 1080p. **Full-screen 4K HDR still will not sustain 24 fps on a 4-core machine** — there the window genuinely wants every pixel and there is nothing to cap away. Drop the resolution selector below native, or turn tone mapping off in the HDR panel (`C`) and accept the uncorrected picture.
+
+#### FFmpeg Version Portability
+Two different FFmpegs are in play. Windows and Linux x86_64 use a current bundled build (n8.x) downloaded by CMake; **Linux ARM64 deliberately links the distro's system FFmpeg**, because that is what carries the V4L2 M2M hardware decoding a Raspberry Pi needs. A Pi OS or Ubuntu of that generation can be several major versions behind.
+
+`src/core/FFmpegCompat.hpp` is the single place every version threshold is stated. Each guarded feature degrades to the behaviour that predates it rather than failing to build:
+
+| Feature | Needs | Without it |
+| --- | --- | --- |
+| `AVPacket::opaque` seek tagging | 6.0 | Pre-seek packets reach the codec, as before the optimisation |
+| `codecpar` side data / framerate | 7.0 | Metadata comes from the bitstream probe; frame rate from the stream |
+| Dolby Vision side data / L1 levels | 5.0 / 7.0 | Still tone mapped, but statically and unlabelled |
+| HDR10+ dynamic metadata | 4.3 | Static tone mapping |
+| Threaded swscale | 7.1 | Single-threaded unpack (95 ms vs ~27 ms at 4K) |
+| `AVChannelLayout` API | 5.1 | Falls back to the `uint64_t` layout mask |
+| `const AVCodec**` in `av_find_best_stream` | 5.0 | Non-const pointer type |
+
+The whole application compiles cleanly against both FFmpeg 4.4 and 8.1, which is what lets Linux ARM64 link whatever the distro ships.
+
+Note that AVX2 is x86-only by construction: the runtime check compiles out entirely on ARM64, which simply runs the baseline tone mapper.
+
+#### Reading Decoder State Without Stalling
+The video thread holds `m_videoDecoderMutex` for the whole of `decodeNextFrame()` **and** `convertFrame()` — tens of milliseconds on 4K HDR content, since the tone mapping happens inside that call. Anything on the render thread that takes the same mutex therefore waits on the decoder rather than on itself.
+
+That is exactly what the diagnostics HUD does: it reads five video properties (`getColorInfo()`, `isVideoHardware()`, `getVideoPixelFormat()`, `getVideoWidth()`/`getVideoHeight()`) on every rendered frame. Modelled at a 27 ms conversion, those five reads blocked the render thread for a **median of 80 ms per frame against a 16.7 ms budget** — enabling the overlay visibly dropped the frame rate, which is a poor property for a diagnostic tool.
+
+Those accessors now use `try_lock` and return the last known value whenever the decoder is busy, backed by a separate, briefly-held cache mutex. In the same model the median cost falls to **0.00 ms**, with 595 of 600 reads served from cache. They are display-only figures that change rarely or never during playback, so a value one frame old is invisible — while blocking the render thread is not. Any UI accessor added later should follow the same rule rather than taking the decoder mutex directly.
+
+#### Startup Preroll and A/V Sync
+Audio is the master clock, so it must not start running before there is a picture to match it against. `PlayerController::prerollVideo()` holds the audio clock until the video pipeline has produced its first frame, bounded by a two-second ceiling so a stream whose video never decodes still plays its audio.
+
+This matters more than a startup detail because the offset it prevents is permanent. The demuxer is paced by audio consumption -- it blocks once the audio queue is full -- so during playback the video path receives packets at real time and cannot decode ahead. Whatever gap exists when audio starts is carried for the whole file. Before the preroll, a 4K HDR clip whose first frame took 1.10 s to decode ran 1.15 s behind the clock forever, which made every frame register as late and left the player showing one frame in nine.
+
+The audio packet queue is sized to make the wait possible: capacity is counted in packets but what matters is the time it holds, and that varies by two orders of magnitude between codecs (an AAC packet is ~23 ms, a TrueHD access unit under 1 ms), so a file with video gets as many packets as it takes to hold three seconds of its own audio. Too small, and the demuxer blocks on audio during the preroll and starves video of the very packets it is waiting for.
 
 #### Dynamic Hardware Decoder Fallback
 At initialization, the video decoder queries native hardware codecs (`h264_d3d11va`, `h264_dxva2`, `h264_qsv`, `h264_cuvid` on Windows; `h264_vaapi`, `h264_v4l2m2m` on Linux). If hardware initialization fails or encounters runtime frame mapping errors (e.g. running inside headless or virtualized environments), the system intercepts the error, releases the hardware context, configures software `h264`, and resubmits pending packets seamlessly.
@@ -565,7 +674,7 @@ Every published release package archive includes:
 NaikAVPlayer is designed as both a standalone, lightweight media player and a high-performance **native C++ reference engine**. It avoids heavy scripting layers and multi-process overhead by utilizing direct [FFmpeg](https://ffmpeg.org/) C APIs, direct GPU texture memory streaming via [SDL3](https://www.libsdl.org/), and an in-process 64-bit float DSP audio processing architecture with zero-allocation real-time loops.
 
 ### How does NaikAVPlayer achieve sub-10ms Audio/Video synchronization?
-NaikAVPlayer utilizes an **Audio-Master Clock Reference**. The playback clock is reconstructed sample-accurately directly from the SDL3 audio stream consumer offset, accounting for hardware queue depth and resampling latency. The video thread drops or paces frames against this microsecond-accurate timebase.
+NaikAVPlayer utilizes an **Audio-Master Clock Reference**. The playback clock is reconstructed sample-accurately directly from the SDL3 audio stream consumer offset, accounting for hardware queue depth and resampling latency. The video thread paces frames against this microsecond-accurate timebase, and drops one only when it is both late *and* the packet queue is backed up — lateness alone does not mean the pipeline is behind, since a constant offset cannot be recovered by dropping anything (the demuxer is paced by audio, so video never gets the chance to decode ahead). Playback also prerolls the first video frame before starting the audio clock, so that offset does not arise in the first place.
 
 ### How does EBU R128 loudness normalization work?
 Instead of simple peak normalization that distorts dynamics, NaikAVPlayer implements standard **ITU-R BS.1770-4 / EBU R128** loudness measurement. It supports both real-time gated LUFS tracking and whole-file prescan (`prescanIntegratedLufs()`), instantly applying smooth gain corrections to match your target loudness (e.g. -23 LUFS / -16 LUFS) without clipping or distortion.

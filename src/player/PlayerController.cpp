@@ -17,7 +17,9 @@ constexpr double kMinCatchupGap = 0.35;      // below this a plain jump looks id
 PlayerController::PlayerController()
     : m_state(PlayerState::UNINITIALIZED),
       m_videoQueue(100), // Max capacity of 100 packets
-      m_audioQueue(150), // Max capacity of 150 packets (audio packets are smaller)
+      // Starts at the floor; openFile() resizes it once the audio format
+      // is known. See applyAudioQueueCapacity().
+      m_audioQueue(kAudioQueueMinPackets),
       m_subtitleQueue(100), // Max capacity of 100 subtitle packets
       m_hasAudio(false),
       m_hasVideo(false),
@@ -67,6 +69,9 @@ bool PlayerController::openFile(const std::string& filename, bool resetPlaylist)
         savePlaylistState();
     }
 
+    setLastOpenError("");
+    invalidateVideoInfoCache();
+
     try {
         m_filename = filename;
         m_videoQueue.reset();
@@ -81,6 +86,8 @@ bool PlayerController::openFile(const std::string& filename, bool resetPlaylist)
         m_demuxer->attachSubtitleQueue(&m_subtitleQueue);
 
         if (!m_demuxer->open()) {
+            const std::string& reason = m_demuxer->getLastError();
+            setLastOpenError(reason.empty() ? "could not open this file" : reason);
             m_state = PlayerState::ERROR_STATE;
             return false;
         }
@@ -113,6 +120,12 @@ bool PlayerController::openFile(const std::string& filename, bool resetPlaylist)
                 m_metrics->m_convertTimeUs,
                 m_metrics->m_profilingEnabled
             );
+            // Before init(): the frame budget the adaptive tone-map scale
+            // measures against is computed there.
+            m_videoDecoder->setSourceFrameRate(m_demuxer->getVideoFrameRate());
+            m_videoDecoder->setProbedHdrMetadata(
+                m_demuxer->getProbedMasteringPeakNits(),
+                m_demuxer->getProbedContentLightNits());
             m_hasVideo = m_videoDecoder->init();
             if (m_hasVideo) {
                 // Must happen before m_demuxer->start(): the decode loop is not
@@ -172,9 +185,18 @@ bool PlayerController::openFile(const std::string& filename, bool resetPlaylist)
             }
         }
 
+        // Before m_demuxer->start(): size the audio queue to hold a fixed
+        // number of *seconds*, so a codec with very short packets still
+        // buffers enough to carry prerollVideo(). Ordinary codecs land on
+        // the floor, leaving the demuxer's backpressure exactly as it was.
+        applyAudioQueueCapacity(m_demuxer->getAudioCodecParams());
+
         if (!m_hasVideo && !m_hasAudio) {
             std::cerr << "Error: File has no playable video or audio streams" << std::endl;
+            // Set after stop(), which tears the demuxer down: the streams
+            // were found but no decoder could be initialised for them.
             stop();
+            setLastOpenError("no decoder available for this file's streams");
             m_state = PlayerState::ERROR_STATE;
             return false;
         }
@@ -196,6 +218,7 @@ bool PlayerController::openFile(const std::string& filename, bool resetPlaylist)
     } catch (const std::exception& e) {
         std::cerr << "Error: Exception while opening file '" << filename << "': " << e.what() << std::endl;
         stop();
+        setLastOpenError(e.what() ? e.what() : "unknown error");
         m_state = PlayerState::ERROR_STATE;
         return false;
     }
@@ -262,6 +285,93 @@ void PlayerController::pollPlaylistAutoAdvance() {
     }
 }
 
+// Size m_audioQueue for the audio track that is about to play, from the
+// packet length that track declares.
+//
+// Called wherever that track changes -- at open, and on either arm of
+// selectAudioTrack() -- because a second track in the same file can
+// package its audio an order of magnitude differently from the first.
+//
+// Only a file with video is sized by time: the extra buffering exists to
+// carry prerollVideo(), and an audio-only file never prerolls. Buffering
+// that far ahead there is actively wrong -- the demuxer would swallow a
+// short file whole and report EOF while playback is still paused at the
+// start -- so it keeps the floor, exactly as before.
+void PlayerController::applyAudioQueueCapacity(const AVCodecParameters* audioParams) {
+    if (!m_hasVideo || !audioParams) {
+        m_audioQueue.setCapacity(kAudioQueueMinPackets);
+        return;
+    }
+    m_audioQueue.setCapacity(
+        audioQueuePacketsForFormat(audioParams->frame_size, audioParams->sample_rate));
+}
+
+// Wait for the video pipeline to have its first frame before letting the
+// audio clock start.
+//
+// Audio is the master clock, and it used to start the instant play() was
+// called -- while the video path was still opening its codec, allocating
+// its hardware context, building the tone-mapping tables and decoding a
+// first 4K frame. Measured on the 4K HDR10+ HEVC clip, the first frame
+// reached the render queue **1.10 s after play()**, by which time the
+// audio clock already read 1.18 s. That gap is then permanent: the
+// demuxer is paced by audio consumption, so once playing, video receives
+// packets at real time and can never decode ahead to close it. It is the
+// offset that made every frame measure "late" forever (see
+// shouldDropLateFrame()).
+//
+// Holding audio at the starting line costs a moment of extra latency
+// before playback begins and removes the offset entirely, which is the
+// trade every player makes. Safe to sit here: audio packets buffer into
+// a queue sized to hold kAudioQueueSeconds of this file's audio rather
+// than being dropped, and the demuxer's audio push is a bounded wait, so
+// nothing deadlocks even if the wait runs to its timeout.
+void PlayerController::prerollVideo() {
+    m_lastPrerollSeconds = 0.0;
+    if (!m_hasVideo) {
+        return;
+    }
+    // With no audio there is no audio clock to get ahead of anything --
+    // updateClockForVideoOnly() drives the timeline off the frames
+    // themselves, so it cannot drift from them.
+    if (!m_hasAudio) {
+        return;
+    }
+    // Only when a background thread is actually producing frames. With it
+    // disabled -- the test harness and the bench drive decoding from the
+    // calling thread -- nothing would ever arrive and this would just burn
+    // the timeout.
+    if (!m_videoThreadRunning.load()) {
+        return;
+    }
+    if (!m_decodedFrameQueue.empty()) {
+        return;  // resuming from a pause with frames already in hand
+    }
+
+    const auto start = std::chrono::steady_clock::now();
+    const auto deadline = start + kPrerollTimeout;
+    // cppcheck-suppress knownConditionTrueFalse
+    // Waiting on another thread: the video decode thread is what fills this
+    // queue, which static analysis does not model. The early return above
+    // establishes that it was empty, so the condition looks constant from
+    // here -- the whole point of the loop is that it stops being so.
+    while (m_decodedFrameQueue.empty()) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            std::cout << "Preroll timed out after "
+                      << kPrerollTimeout.count()
+                      << " ms; starting audio without a video frame" << std::endl;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    m_lastPrerollSeconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    if (m_lastPrerollSeconds > 0.0) {
+        std::cout << "Prerolled video for " << m_lastPrerollSeconds
+                  << " s before starting audio" << std::endl;
+    }
+}
+
 void PlayerController::play() {
     if (m_state == PlayerState::ENDED) {
         instantSeek(0.0); // restart from the top without a rewind animation
@@ -282,6 +392,10 @@ void PlayerController::play() {
             return;
         }
     }
+
+    // Before the audio clock starts, never after: the whole point is that
+    // it must not run while video is still getting ready.
+    prerollVideo();
 
     {
         std::lock_guard<std::mutex> audioLock(m_audioDecoderMutex);
@@ -580,6 +694,10 @@ void PlayerController::stop() {
     m_hasAudio = false;
     m_hasVideo = false;
     m_videoClock = 0.0;
+    // Nothing has been converted for the next file yet, so stop reporting
+    // the previous one's output size.
+    m_lastOutputWidth.store(0, std::memory_order_relaxed);
+    m_lastOutputHeight.store(0, std::memory_order_relaxed);
 }
 
 void PlayerController::updateClockForVideoOnly() {
@@ -668,20 +786,44 @@ double PlayerController::getDuration() const {
     return 0.0;
 }
 
+// The five accessors below are read by the diagnostics HUD every rendered
+// frame. They never block: if the decode thread currently holds the decoder
+// mutex -- which it does for the whole of decode + convert -- the last known
+// value is returned instead. See m_videoInfoCacheMutex for why.
 int PlayerController::getVideoWidth() const {
-    std::lock_guard<std::mutex> lock(m_videoDecoderMutex);
-    if (m_videoDecoder) {
-        return m_videoDecoder->getWidth();
+    std::unique_lock<std::mutex> lock(m_videoDecoderMutex, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        {
+            std::lock_guard<std::mutex> cache(m_videoInfoCacheMutex);
+            if (m_videoWidthCached) {
+                return m_cachedVideoWidth;
+            }
+        }
+        lock.lock();  // nothing cached yet: a correct answer is worth the wait
     }
-    return 0;
+    const int value = m_videoDecoder ? m_videoDecoder->getWidth() : 0;
+    std::lock_guard<std::mutex> cache(m_videoInfoCacheMutex);
+    m_cachedVideoWidth = value;
+    m_videoWidthCached = true;
+    return value;
 }
 
 int PlayerController::getVideoHeight() const {
-    std::lock_guard<std::mutex> lock(m_videoDecoderMutex);
-    if (m_videoDecoder) {
-        return m_videoDecoder->getHeight();
+    std::unique_lock<std::mutex> lock(m_videoDecoderMutex, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        {
+            std::lock_guard<std::mutex> cache(m_videoInfoCacheMutex);
+            if (m_videoHeightCached) {
+                return m_cachedVideoHeight;
+            }
+        }
+        lock.lock();
     }
-    return 0;
+    const int value = m_videoDecoder ? m_videoDecoder->getHeight() : 0;
+    std::lock_guard<std::mutex> cache(m_videoInfoCacheMutex);
+    m_cachedVideoHeight = value;
+    m_videoHeightCached = true;
+    return value;
 }
 
 std::string PlayerController::getVideoCodecName() const {
@@ -902,19 +1044,109 @@ double PlayerController::getSeekReferenceTime() {
 }
 
 std::string PlayerController::getVideoPixelFormat() const {
-    std::lock_guard<std::mutex> lock(m_videoDecoderMutex);
-    if (m_videoDecoder) {
-        return m_videoDecoder->getPixelFormatName();
+    std::unique_lock<std::mutex> lock(m_videoDecoderMutex, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        {
+            std::lock_guard<std::mutex> cache(m_videoInfoCacheMutex);
+            if (m_pixelFormatCached) {
+                return m_cachedPixelFormat;
+            }
+        }
+        lock.lock();
     }
-    return "unknown";
+    std::string value =
+        m_videoDecoder ? m_videoDecoder->getPixelFormatName() : std::string("unknown");
+    std::lock_guard<std::mutex> cache(m_videoInfoCacheMutex);
+    m_cachedPixelFormat = value;
+    m_pixelFormatCached = true;
+    return value;
 }
 
 bool PlayerController::isVideoHardware() const {
-    std::lock_guard<std::mutex> lock(m_videoDecoderMutex);
-    if (m_videoDecoder) {
-        return m_videoDecoder->isHardware();
+    std::unique_lock<std::mutex> lock(m_videoDecoderMutex, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        {
+            std::lock_guard<std::mutex> cache(m_videoInfoCacheMutex);
+            if (m_isHardwareCached) {
+                return m_cachedIsHardware;
+            }
+        }
+        lock.lock();
     }
-    return false;
+    const bool value = m_videoDecoder ? m_videoDecoder->isHardware() : false;
+    std::lock_guard<std::mutex> cache(m_videoInfoCacheMutex);
+    m_cachedIsHardware = value;
+    m_isHardwareCached = true;
+    return value;
+}
+
+// A frame is worth converting only if it can still be shown on time.
+// Tone mapping a 4K HDR frame costs tens of milliseconds; spending that on
+// a frame the clock has already passed pushes the next frame further
+// behind, which is how a pipeline that is slightly too slow degrades into
+// one that is hopelessly behind. Dropping here, before the conversion,
+// bounds that: the decoder races ahead until it is back in step.
+bool PlayerController::shouldDropLateFrame(double framePts) {
+    // Only ever while genuinely playing. A paused or freshly opened file
+    // must still render the frame under the playhead, and a seek catch-up
+    // is deliberately decoding frames that are "late" by this measure --
+    // dropping them there would mean never landing on the target.
+    if (m_state != PlayerState::PLAYING ||
+        m_catchupMode.load() != SeekCatchupMode::NONE) {
+        m_consecutiveLateDrops = 0;
+        return false;
+    }
+
+    // A frame with no usable timestamp cannot be judged late.
+    if (framePts <= 0.0) {
+        m_consecutiveLateDrops = 0;
+        return false;
+    }
+
+    // Dropping only helps when the pipeline is genuinely backed up, and
+    // "late" on its own does not mean that.
+    //
+    // The demuxer is paced by audio consumption: it blocks pushing audio
+    // once the audio queue is full, so on a file whose video path is
+    // keeping up, video packets arrive at real time and no amount of
+    // dropping lets the decoder run ahead. A player that starts audio
+    // before its first video frame is ready then carries that startup
+    // offset for the rest of the file, and every frame measures late
+    // forever. Measured on the 4K HDR10+ HEVC clip: video pts trails the
+    // master clock by a steady ~1.15 s while both advance at 1.001 s per
+    // second -- nothing is falling behind, yet the max-consecutive rule
+    // let exactly one frame in nine through, 23.976 / 9 = 2.7 fps, on
+    // content this machine decodes at 60.
+    //
+    // The packet queue tells the two cases apart directly. Genuinely
+    // congested, it is full (measured 100/100 on the 4K60 AV1 clip, whose
+    // software decode really cannot keep up); supply-limited, it sits
+    // near empty (0-6 of 100 on the HEVC clip above) and the decoder is
+    // waiting on data rather than drowning in it.
+    const size_t queued = m_videoQueue.size();
+    const size_t capacity = m_videoQueue.capacity();
+    const size_t backlogThreshold =
+        std::max<size_t>(kLateDropMinQueuedPackets, capacity / 4);
+    if (queued < backlogThreshold) {
+        m_consecutiveLateDrops = 0;
+        return false;
+    }
+
+    const double behind = getCurrentTime() - framePts;
+    if (behind <= kLateFrameDropSeconds) {
+        m_consecutiveLateDrops = 0;
+        return false;
+    }
+
+    if (m_consecutiveLateDrops >= kMaxConsecutiveLateDrops) {
+        // Let this one through so the picture keeps moving even when the
+        // machine cannot keep up at all, then start counting again.
+        m_consecutiveLateDrops = 0;
+        return false;
+    }
+
+    m_consecutiveLateDrops++;
+    return true;
 }
 
 void PlayerController::videoThreadLoop() {
@@ -964,8 +1196,20 @@ void PlayerController::videoThreadLoop() {
             std::lock_guard<std::mutex> lock(m_videoDecoderMutex);
             if (m_videoDecoder && !m_seeking.load()) {
                 decoded = m_videoDecoder->decodeNextFrame();
-                if (decoded) {
-                    converted = m_videoDecoder->convertFrame(m_resolutionOption.load());
+                if (decoded && shouldDropLateFrame(m_videoDecoder->getCurrentFramePts())) {
+                    // Deliberately leaves `converted` false: the frame is
+                    // never queued, and the loop comes straight back round
+                    // to decode the next one. Decoding alone runs faster
+                    // than real time on every format this player handles,
+                    // so skipping the conversion is what lets a pipeline
+                    // that has fallen behind actually catch up rather than
+                    // drift further back on every frame.
+                    m_metrics->incrementFramesDropped();
+                } else if (decoded) {
+                    converted = m_videoDecoder->convertFrame(
+                        m_resolutionOption.load(), getHdrToneMapSettings(),
+                        m_displayWidth.load(std::memory_order_relaxed),
+                        m_displayHeight.load(std::memory_order_relaxed));
                     if (converted) {
                         srcFrame = m_videoDecoder->getYUVFrame();
                         if (srcFrame && srcFrame->data[0]) {
@@ -980,6 +1224,12 @@ void PlayerController::videoThreadLoop() {
                             // so there's no fallback to the codec context here.
                             frameWidth = srcFrame->width;
                             frameHeight = srcFrame->height;
+                            // What the pipeline really produced, for the
+                            // diagnostics HUD -- the resolution selector
+                            // alone cannot say, since the HDR path caps
+                            // to the display size.
+                            m_lastOutputWidth.store(frameWidth, std::memory_order_relaxed);
+                            m_lastOutputHeight.store(frameHeight, std::memory_order_relaxed);
                         }
                     }
                 }
@@ -1092,6 +1342,11 @@ void PlayerController::finishCatchup(double resumePts) {
 
 void PlayerController::loadSettings() {
     m_resolutionOption.store(ResolutionOption::ORIGINAL);
+    m_hdrToneMapEnabled.store(true);
+    m_hdrTargetPeakNits.store(100.0f);
+    m_hdrSourcePeakNits.store(0.0f);
+    m_hdrDynamicMetadata.store(true);
+    m_hdrAdaptiveResolution.store(true);
     m_audioDspSettings = naikav::dsp::AudioDspSettings{};
     m_channelOption = AudioChannelOption::AUTO;
     m_outputBitDepth = AudioOutputBitDepth::BIT_16;
@@ -1231,6 +1486,23 @@ void PlayerController::loadSettings() {
                 if (v >= 0 && v < static_cast<int>(ResamplerQuality::COUNT)) {
                     m_resamplerQuality = static_cast<ResamplerQuality>(v);
                 }
+            } else if (key == "hdr_tone_map_enabled") {
+                m_hdrToneMapEnabled.store(std::stoi(value) != 0);
+            } else if (key == "hdr_target_peak_nits") {
+                float v = std::stof(value);
+                if (v >= 50.0f && v <= 1000.0f) {
+                    m_hdrTargetPeakNits.store(v);
+                }
+            } else if (key == "hdr_dynamic_metadata") {
+                m_hdrDynamicMetadata.store(std::stoi(value) != 0);
+            } else if (key == "hdr_adaptive_resolution") {
+                m_hdrAdaptiveResolution.store(std::stoi(value) != 0);
+            } else if (key == "hdr_source_peak_nits") {
+                float v = std::stof(value);
+                // 0 is the "auto" sentinel and is deliberately in range.
+                if (v == 0.0f || (v >= 100.0f && v <= 10000.0f)) {
+                    m_hdrSourcePeakNits.store(v);
+                }
             } else if (key == "playlist_current_index") {
                 m_pendingPlaylistCurrentIndex = std::stoi(value);
             } else if (key == "playlist_repeat_mode") {
@@ -1312,6 +1584,11 @@ void PlayerController::saveSettings() {
     f << "output_bit_depth=" << static_cast<int>(m_outputBitDepth) << "\n";
     f << "output_device_name=" << m_outputDeviceName << "\n";
     f << "resampler_quality=" << static_cast<int>(m_resamplerQuality) << "\n";
+    f << "hdr_tone_map_enabled=" << (m_hdrToneMapEnabled.load() ? 1 : 0) << "\n";
+    f << "hdr_target_peak_nits=" << m_hdrTargetPeakNits.load() << "\n";
+    f << "hdr_source_peak_nits=" << m_hdrSourcePeakNits.load() << "\n";
+    f << "hdr_dynamic_metadata=" << (m_hdrDynamicMetadata.load() ? 1 : 0) << "\n";
+    f << "hdr_adaptive_resolution=" << (m_hdrAdaptiveResolution.load() ? 1 : 0) << "\n";
     f << "playlist_current_index=" << m_playlist.getCurrentIndex() << "\n";
     f << "playlist_repeat_mode=" << static_cast<int>(m_playlist.getRepeatMode()) << "\n";
     f << "playlist_shuffle=" << (m_playlist.isShuffle() ? 1 : 0) << "\n";
@@ -1340,13 +1617,70 @@ void PlayerController::savePlaylistState() {
 
 void PlayerController::setResolutionOption(ResolutionOption option) {
     m_resolutionOption.store(option);
+    // The cached output size describes the old selection until the seek
+    // below produces a frame under the new one; clear it so the HUD falls
+    // back to the computed target rather than showing a stale resolution.
+    m_lastOutputWidth.store(0, std::memory_order_relaxed);
+    m_lastOutputHeight.store(0, std::memory_order_relaxed);
     saveSettings();
     if (m_hasVideo && (m_state == PlayerState::OPENED || m_state == PlayerState::PAUSED)) {
         seek(getCurrentTime());
     }
 }
 
+void PlayerController::setHdrToneMapEnabled(bool enabled) {
+    m_hdrToneMapEnabled.store(enabled);
+    saveSettings();
+    // While paused, nothing decodes a fresh frame to make the change
+    // visible, so re-decode the current position -- the same nudge
+    // setResolutionOption() uses for the same reason.
+    if (m_hasVideo && (m_state == PlayerState::OPENED || m_state == PlayerState::PAUSED)) {
+        seek(getCurrentTime());
+    }
+}
+
+void PlayerController::setHdrTargetPeakNits(float nits) {
+    // Clamped to the range a display peak can sensibly take: below ~50
+    // nits the roll-off crushes everything, and beyond 1000 there is
+    // nothing left to map down to.
+    // Store only -- see the header for why the save and the re-decode are
+    // deferred to persistHdrSettings().
+    m_hdrTargetPeakNits.store(std::clamp(nits, 50.0f, 1000.0f));
+}
+
+void PlayerController::setHdrSourcePeakNits(float nits) {
+    // 0 passes through unclamped as the "auto" sentinel. The upper bound is
+    // the brightest mastering display in use; the lower one is the SDR
+    // reference, below which there is nothing to tone map down from.
+    m_hdrSourcePeakNits.store(nits <= 0.0f ? 0.0f
+                                           : std::clamp(nits, 100.0f, 10000.0f));
+}
+
+void PlayerController::persistHdrSettings() {
+    saveSettings();
+    // While playback is stopped on a frame, nothing decodes a fresh one to
+    // make the change visible, so re-decode the current position -- the
+    // same nudge setResolutionOption() uses for the same reason. Both
+    // OPENED and PAUSED are resting states here (a seek leaves a paused
+    // player in OPENED). While actually playing, the next frame picks the
+    // new value up on its own and this is skipped.
+    if (m_hasVideo && (m_state == PlayerState::OPENED || m_state == PlayerState::PAUSED)) {
+        seek(getCurrentTime());
+    }
+}
+
+// The resolution frames are actually being converted to, which is what
+// the diagnostics HUD reports. Prefers the size the last conversion
+// really produced over the size the resolution selector implies: on an
+// HDR source the two differ whenever the tone-mapping target is capped
+// to the display area. Falls back to the computed target whenever no
+// frame has been converted under the current settings -- before the
+// first one, and after stop() or a resolution change clears the cache.
 int PlayerController::getPlaybackWidth() const {
+    int last = m_lastOutputWidth.load(std::memory_order_relaxed);
+    if (last > 0) {
+        return last;
+    }
     int nativeW = getVideoWidth();
     int nativeH = getVideoHeight();
     int targetW = nativeW;
@@ -1356,6 +1690,10 @@ int PlayerController::getPlaybackWidth() const {
 }
 
 int PlayerController::getPlaybackHeight() const {
+    int last = m_lastOutputHeight.load(std::memory_order_relaxed);
+    if (last > 0) {
+        return last;
+    }
     int nativeW = getVideoWidth();
     int nativeH = getVideoHeight();
     int targetW = nativeW;
@@ -1380,11 +1718,22 @@ size_t PlayerController::getAudioFrameQueueSize() const {
 }
 
 ColorPipelineInfo PlayerController::getColorInfo() const {
-    std::lock_guard<std::mutex> lock(m_videoDecoderMutex);
-    if (m_videoDecoder) {
-        return m_videoDecoder->getColorInfo();
+    std::unique_lock<std::mutex> lock(m_videoDecoderMutex, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        {
+            std::lock_guard<std::mutex> cache(m_videoInfoCacheMutex);
+            if (m_colorInfoCached) {
+                return m_cachedColorInfo;
+            }
+        }
+        lock.lock();
     }
-    return ColorPipelineInfo{};
+    ColorPipelineInfo value =
+        m_videoDecoder ? m_videoDecoder->getColorInfo() : ColorPipelineInfo{};
+    std::lock_guard<std::mutex> cache(m_videoInfoCacheMutex);
+    m_cachedColorInfo = value;
+    m_colorInfoCached = true;
+    return value;
 }
 
 std::vector<naikav::subtitle::SubtitleTrackInfo> PlayerController::getSubtitleTracks() const {
@@ -1611,6 +1960,8 @@ bool PlayerController::selectAudioTrack(int trackId) {
                 m_audioDecoder.reset();
             }
             m_audioQueue.clear([](AVPacket*& pkt) { av_packet_free(&pkt); });
+            applyAudioQueueCapacity(
+                m_externalAudioDemuxer->getAudioCodecParams(extAudioIdx));
 
             m_audioDecoder = std::make_unique<AudioDecoder>(
                 m_externalAudioDemuxer->getAudioCodecParams(extAudioIdx),
@@ -1665,6 +2016,7 @@ bool PlayerController::selectAudioTrack(int trackId) {
                 m_audioDecoder.reset();
             }
             m_audioQueue.clear([](AVPacket*& pkt) { av_packet_free(&pkt); });
+            applyAudioQueueCapacity(m_demuxer->getAudioCodecParams(trackId));
 
             m_audioDecoder = std::make_unique<AudioDecoder>(
                 m_demuxer->getAudioCodecParams(trackId),

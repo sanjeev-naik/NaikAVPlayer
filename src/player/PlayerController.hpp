@@ -5,6 +5,8 @@
 #include <thread>
 #include <atomic>
 #include <cstdint>
+#include <cstddef>
+#include <cmath>
 #include <mutex>
 #include <vector>
 #include "core/ThreadSafeQueue.hpp"
@@ -31,6 +33,52 @@ struct DecodedFrame {
 
 extern bool g_videoThreadEnabled;
 
+// ---------------------------------------------------------------------
+// Audio packet queue sizing
+// ---------------------------------------------------------------------
+//
+// What matters about that queue is the *time* it holds, not the packet
+// count, and packet duration varies by more than an order of magnitude
+// between codecs: an AAC frame is 1024 samples (~23 ms at 44.1 kHz) while
+// a TrueHD access unit is 40 samples (~0.8 ms). The flat 150 packets that
+// used to ship was therefore ~3.5 s of AAC but only ~125 ms of TrueHD --
+// not enough to cover prerollVideo(), during which the demuxer filled the
+// queue, blocked on it, and so stopped delivering *video* packets too,
+// starving the very frame the preroll was waiting for.
+//
+// Sizing by seconds fixes that without disturbing anything else. Ordinary
+// codecs land on the floor, i.e. exactly the behaviour that has always
+// shipped -- which matters, because the demuxer's backpressure against
+// this queue is load-bearing: raising it unconditionally let the demuxer
+// race to end-of-stream and starved the video thread of packets.
+constexpr double kAudioQueueSeconds = 3.0;
+constexpr size_t kAudioQueueMinPackets = 150;
+constexpr size_t kAudioQueueMaxPackets = 4000;
+
+// Packets needed to hold kAudioQueueSeconds of audio whose packets are
+// frameSize samples at sampleRate Hz.
+//
+// frameSize is what the decoder declares as samples per packet; measured
+// against real files it matches the packets actually demuxed exactly (AAC
+// 1024 @ 44.1 kHz = 23.2 ms, TrueHD 40 @ 48 kHz = 0.83 ms). A stream that
+// declares neither -- and every codec whose packets are long enough that
+// kAudioQueueSeconds already fits inside the floor -- gets the floor.
+inline size_t audioQueuePacketsForFormat(int frameSize, int sampleRate) {
+    if (frameSize <= 0 || sampleRate <= 0) {
+        return kAudioQueueMinPackets;
+    }
+    const double packetSeconds =
+        static_cast<double>(frameSize) / static_cast<double>(sampleRate);
+    const double needed = std::ceil(kAudioQueueSeconds / packetSeconds);
+    if (needed <= static_cast<double>(kAudioQueueMinPackets)) {
+        return kAudioQueueMinPackets;
+    }
+    if (needed >= static_cast<double>(kAudioQueueMaxPackets)) {
+        return kAudioQueueMaxPackets;
+    }
+    return static_cast<size_t>(needed);
+}
+
 enum class PlayerState {
     UNINITIALIZED,
     OPENED,
@@ -49,6 +97,9 @@ private:
     // Packet queues
     ThreadSafeQueue<AVPacket*> m_videoQueue;
     ThreadSafeQueue<AVPacket*> m_audioQueue;
+    // Set m_audioQueue's capacity for the audio track about to play, via
+    // audioQueuePacketsForFormat() above.
+    void applyAudioQueueCapacity(const AVCodecParameters* audioParams);
     ThreadSafeQueue<AVPacket*> m_subtitleQueue;
     
     // Sub-modules
@@ -115,6 +166,57 @@ private:
     // video thread can free and reopen with a fresh session when recovering
     // from a hardware decode failure.
     mutable std::mutex m_videoDecoderMutex;
+
+    // Last known values of the read-only video properties the diagnostics
+    // HUD shows, so those accessors never have to *wait* on the decoder.
+    //
+    // The video thread holds m_videoDecoderMutex across decodeNextFrame()
+    // AND convertFrame(), which on 4K HDR content is tens of milliseconds.
+    // A HUD that blocks on that same mutex several times per rendered frame
+    // therefore stalls the render thread for far longer than a frame is
+    // worth: modelled at a 27 ms conversion with five calls per frame, the
+    // UI waited a median of 110 ms per frame against a 16.7 ms budget,
+    // which is what made turning the HUD on visibly drop the frame rate.
+    //
+    // These are display-only figures that change rarely (or never) during
+    // playback, so showing the previous value for one frame while the
+    // decoder is busy costs nothing and cannot be seen.
+    // A cached entry may only be *returned* once it holds a real reading.
+    // Falling back to an empty cache would report a 0x0 video or an
+    // "unknown" pixel format to a caller that simply happened to ask while
+    // the decode thread held the mutex -- which is wrong rather than
+    // merely stale, and is exactly what broke "Video width is populated
+    // correctly". So the first read of each property waits for the real
+    // value; every read after that can fall back.
+    mutable std::mutex m_videoInfoCacheMutex;
+    mutable ColorPipelineInfo m_cachedColorInfo;
+    mutable std::string m_cachedPixelFormat{"unknown"};
+    mutable bool m_cachedIsHardware = false;
+    mutable int m_cachedVideoWidth = 0;
+    mutable int m_cachedVideoHeight = 0;
+    mutable bool m_colorInfoCached = false;
+    mutable bool m_pixelFormatCached = false;
+    mutable bool m_isHardwareCached = false;
+    mutable bool m_videoWidthCached = false;
+    mutable bool m_videoHeightCached = false;
+    // Cleared whenever the decoder is replaced, so one file never reports
+    // the previous file's dimensions.
+    void invalidateVideoInfoCache() {
+        std::lock_guard<std::mutex> lock(m_videoInfoCacheMutex);
+        m_colorInfoCached = false;
+        m_pixelFormatCached = false;
+        m_isHardwareCached = false;
+        m_videoWidthCached = false;
+        m_videoHeightCached = false;
+    }
+    // openFile() runs on the UI thread but playlist advance calls it from
+    // the playback path, so the error it leaves behind is guarded.
+    mutable std::mutex m_lastOpenErrorMutex;
+    std::string m_lastOpenError;
+    void setLastOpenError(const std::string& reason) {
+        std::lock_guard<std::mutex> lock(m_lastOpenErrorMutex);
+        m_lastOpenError = reason;
+    }
     std::atomic<bool> m_seeking;
     std::atomic<bool> m_seeked;
     ThreadSafeQueue<DecodedFrame> m_decodedFrameQueue;
@@ -138,6 +240,69 @@ private:
     uint64_t m_seekStartEpoch = 0;
 
     std::atomic<ResolutionOption> m_resolutionOption;
+
+    // HDR -> SDR tone mapping. Read on the video thread once per frame and
+    // written from the UI thread, hence atomic rather than mutex-guarded:
+    // a toggle that lands mid-frame simply takes effect on the next one.
+    std::atomic<bool> m_hdrToneMapEnabled{true};
+    std::atomic<float> m_hdrTargetPeakNits{100.0f};
+    // 0 = derive the source peak from the frame's own metadata.
+    std::atomic<float> m_hdrSourcePeakNits{0.0f};
+    std::atomic<bool> m_hdrDynamicMetadata{true};
+    std::atomic<bool> m_hdrAdaptiveResolution{true};
+
+    // Size of the area video is drawn into, in pixels. Written by the
+    // render thread once per presented frame and read by the video thread
+    // once per decoded frame, so atomics rather than a mutex: the render
+    // thread must never block behind a conversion. 0 means the renderer
+    // has not reported a size yet, which leaves the cap disabled.
+    std::atomic<int> m_displayWidth{0};
+    std::atomic<int> m_displayHeight{0};
+
+    // Dimensions of the most recently converted frame. Cached here rather
+    // than recomputed from the resolution selector because the two can
+    // legitimately disagree -- the HDR path caps to the display size, and
+    // some hardware decoders emit sizes the codec context never mentions.
+    std::atomic<int> m_lastOutputWidth{0};
+    std::atomic<int> m_lastOutputHeight{0};
+
+    // Late-frame dropping. Touched only by the video thread, so plain
+    // ints. See shouldDropLateFrame() for what these mean.
+    int m_consecutiveLateDrops = 0;
+    
+
+    // How far behind the master clock a freshly decoded frame has to be
+    // before it is dropped instead of converted. Wide enough that ordinary
+    // scheduling jitter never trips it -- roughly six frames at 60 fps,
+    // three at 24 -- since a frame that is merely a little late is still
+    // worth showing.
+    static constexpr double kLateFrameDropSeconds = 0.10;
+
+    // Ceiling on how many frames in a row may be dropped this way. Under
+    // sustained overload the drop test would otherwise keep winning and
+    // the picture would freeze while the audio ran on; forcing one frame
+    // through every so often keeps the video moving, just at a lower rate.
+    static constexpr int kMaxConsecutiveLateDrops = 8;
+    // Holds the audio clock at the starting line until the video pipeline
+    // has a frame to show. See prerollVideo() for why.
+    void prerollVideo();
+    double m_lastPrerollSeconds = 0.0;
+    // Ceiling on that wait. A file whose first frame never arrives (a
+    // video stream the decoder cannot open, a corrupt leading GOP) must
+    // still play its audio rather than hanging on the play button.
+    static constexpr std::chrono::milliseconds kPrerollTimeout{2000};
+
+    // Minimum number of queued video packets before a late frame may be
+    // dropped -- below this the decoder is starved rather than congested,
+    // and dropping discards a frame with nothing to put in its place.
+    // See shouldDropLateFrame() for the measurements behind this.
+    static constexpr size_t kLateDropMinQueuedPackets = 16;
+
+    // True when the frame just decoded is so far behind the clock that
+    // converting it is wasted work: the renderer would drop it on arrival
+    // anyway (see the pop loop in main.cpp), and the time spent tone
+    // mapping it is time the decoder is not spending catching up.
+    bool shouldDropLateFrame(double framePts);
 
     naikav::playlist::Playlist m_playlist;
 
@@ -233,6 +398,19 @@ public:
     // playlistPrevious() / playlistPlayIndex()) calls this with false so it
     // doesn't clobber the list it's iterating.
     bool openFile(const std::string& filename, bool resetPlaylist = true);
+
+    // Whether the last play() had to wait for the video pipeline, and for
+    // how long. Diagnostics only -- see prerollVideo().
+    double getLastPrerollSeconds() const { return m_lastPrerollSeconds; }
+
+    // Why the last openFile() returned false, ready to show a user (e.g.
+    // "moov atom not found"). Empty after a successful open. Every caller
+    // that can fail should surface this -- an open failure that only
+    // reaches stderr is invisible in the MSVC build, which has no console.
+    std::string getLastOpenError() const {
+        std::lock_guard<std::mutex> lock(m_lastOpenErrorMutex);
+        return m_lastOpenError;
+    }
     void play();
     void pause();
     void seek(double seconds);
@@ -295,6 +473,66 @@ public:
     void setResolutionOption(ResolutionOption option);
     int getPlaybackWidth() const;
     int getPlaybackHeight() const;
+
+    // HDR -> SDR tone mapping. Takes effect on the next decoded frame, so
+    // unlike setResolutionOption() these need no seek to become visible.
+    bool isHdrToneMapEnabled() const { return m_hdrToneMapEnabled.load(); }
+    void setHdrToneMapEnabled(bool enabled);
+
+    // The two peak-luminance settings below apply live and do NOT write to
+    // disk or disturb playback -- the decoder re-reads them for every frame
+    // it converts, so a drag is visible immediately while playing at no
+    // cost beyond the store. Same rule as setAudioDspSettings(): call these
+    // on every change, then persistHdrSettings() once the interaction
+    // settles. Persisting per drag frame is not the harmless UI-thread
+    // write it is for the DSP panel -- making a change visible while
+    // *paused* needs a re-decode, and one seek per drag frame tears the
+    // pipeline down and refills it dozens of times a second.
+    float getHdrTargetPeakNits() const { return m_hdrTargetPeakNits.load(); }
+    void setHdrTargetPeakNits(float nits);
+
+    // Peak luminance to tone map *from*. 0 means "read it from the file"
+    // (mastering-display metadata reconciled with MaxCLL -- see
+    // selectSourcePeakNits()), which is right for any file whose metadata
+    // is honest; the override exists for the ones where it is not.
+    float getHdrSourcePeakNits() const { return m_hdrSourcePeakNits.load(); }
+    void setHdrSourcePeakNits(float nits);
+
+    // Writes the HDR settings to disk and, if playback is sitting on a
+    // frame, re-decodes it so the change becomes visible. Call once an
+    // interaction is done (ImGui::IsItemDeactivatedAfterEdit()), not on
+    // every intermediate value.
+    void persistHdrSettings();
+
+    // Follow HDR10+ / Dolby Vision per-frame metadata when the file has
+    // it. Applies live, like the peak settings.
+    bool isHdrDynamicMetadataEnabled() const { return m_hdrDynamicMetadata.load(); }
+    void setHdrDynamicMetadataEnabled(bool enabled) { m_hdrDynamicMetadata.store(enabled); }
+
+    // Shrink the tone-mapping target when the machine cannot hold the
+    // source's frame rate at full size. See AdaptiveToneMapScale.
+    bool isHdrAdaptiveResolutionEnabled() const { return m_hdrAdaptiveResolution.load(); }
+    void setHdrAdaptiveResolutionEnabled(bool enabled) { m_hdrAdaptiveResolution.store(enabled); }
+
+    // Tells the decoder how large the video is actually being drawn, so
+    // HDR frames are not tone mapped at a resolution the window cannot
+    // show (see capToDisplaySize). Lock-free and cheap enough to call
+    // every rendered frame; pass the renderer's output size in pixels,
+    // not the window size in points, or a HiDPI display gets a softer
+    // picture than it asked for.
+    void setDisplaySize(int width, int height) {
+        m_displayWidth.store(width > 0 ? width : 0, std::memory_order_relaxed);
+        m_displayHeight.store(height > 0 ? height : 0, std::memory_order_relaxed);
+    }
+    naikav::video::HdrToneMapSettings getHdrToneMapSettings() const {
+        naikav::video::HdrToneMapSettings s;
+        s.enabled = m_hdrToneMapEnabled.load();
+        s.targetPeakNits = m_hdrTargetPeakNits.load();
+        s.sourcePeakNits = m_hdrSourcePeakNits.load();
+        s.useDynamicMetadata = m_hdrDynamicMetadata.load();
+        s.adaptiveResolution = m_hdrAdaptiveResolution.load();
+        return s;
+    }
 
     // Audio DSP/loudness settings (EQ, compressor, limiter, crossover,
     // loudness target). Safe to call during playback -- see

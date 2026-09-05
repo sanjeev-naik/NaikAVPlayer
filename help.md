@@ -156,6 +156,29 @@ To build binaries for ARM64 target platforms (e.g., Raspberry Pi 4/5) from an x8
    cmake --build build-arm64 -j$(nproc)
    ```
 
+
+> [!IMPORTANT]
+> **ARM64 is the one configuration that links the system FFmpeg.** Everywhere
+> else — Windows and Linux x86_64 — CMake downloads a current bundled build.
+> On `aarch64` it deliberately does not, because the distro's FFmpeg is what
+> carries the V4L2 M2M hardware decoding a Raspberry Pi needs. That means the
+> ARM64 build compiles against whatever version the target ships, which can be
+> several major releases behind: Pi OS Bookworm is FFmpeg 5.1, Ubuntu 22.04 is
+> 4.4, while the bundled build is 8.x.
+>
+> Every version-sensitive API therefore goes through `src/core/FFmpegCompat.hpp`,
+> which is the single place any threshold is stated and which degrades each
+> feature to its pre-existing behaviour rather than failing to build. The tree
+> compiles cleanly against FFmpeg 4.4 through 8.x. Two consequences worth
+> knowing on a Pi: the HDR unpack runs single-threaded (the threaded swscale API
+> is FFmpeg 7.1+), and HDR10+/Dolby Vision per-frame metadata needs 7.0+, so
+> older systems tone map statically. Neither is an error; both are reported
+> honestly in the HDR panel.
+>
+> Passing `-DNAIKAV_FORCE_BUNDLED_FFMPEG=ON` overrides this and downloads the
+> bundled build on ARM64 too — which gets the newer features but **breaks V4L2
+> M2M hardware decoding**, so it is the wrong default for a Pi.
+
 #### B. Cross-Compiling for Windows on Linux (MinGW-w64)
 
 To build Windows 64-bit executables from a Linux development machine:
@@ -327,10 +350,21 @@ The user interface uses Dear ImGui with frosted translucency overlay, high-DPI f
 - **4 Color Palettes**: `Cyberpunk` (Cyan/Magenta), `Sunset Fire` (Amber/Hot Pink), `Mint Emerald` (Mint/Emerald), and `Electric Violet` (Aqua/Purple).
 
 ### Diagnostics HUD & Telemetry Metrics
-- **Hotkey `D`** or CLI flag `--metrics`: Toggles real-time HUD displaying player states, playback clock drift, hardware/software decoder details, queue depths, frame pacing, and HDR/Colorimetry characteristics.
+- **Hotkey `D`** or CLI flag `--metrics`: Toggles real-time HUD displaying player states, playback clock drift, hardware/software decoder details, queue depths, frame pacing, and HDR/Colorimetry characteristics. The HDR section is read-only here -- it reports the tone mapping state; the controls that change it live in the HDR panel (`C`).
+- **The overlay does not cost frames.** The five video properties it reads every frame are fetched with `try_lock` against the decoder mutex, falling back to the last known value when the video thread is mid-conversion. Before that, those reads blocked the render thread for a median of 80 ms per frame against a 16.7 ms budget -- turning the HUD on measurably slowed playback, which defeats the point of a diagnostic. A displayed value may therefore be one frame stale under load; these are properties that change rarely or never during playback.
 
 ### Audio Processing & DSP Panel
 - **Hotkey `A`** or Dock `[EQ]` Button: Toggles the dedicated Audio Processing overlay for parametric 5-band EQ, noise gate, compressors, limiter, crossover, EBU R128 loudness, 3D surround, stereo widener, balance, channel routing, and live FFT spectrum visualizer.
+
+### HDR Tone Mapping Panel
+- **Hotkey `C`** or Dock `[HDR]` Button: Toggles the HDR -> SDR tone mapping panel. (`C` for *color*; `H` is already taken by the subtitle-delay increment.)
+- **Source / Status**: Reports the file's HDR standard and whether the pipeline is actually tone mapping it, including the source and display peak luminances it resolved, and marks the line `[dynamic]` when a per-frame curve is genuinely in use.
+- **HDR -> SDR tone mapping**: Master on/off. Off shows the raw HDR signal, which a non-HDR display renders dark and desaturated -- useful for comparing the two side by side.
+- **Display peak**: Peak brightness of your display, 50-1000 nits. 100 nits is the SDR reference; raise it only for a brighter panel.
+- **Override source peak**: Off by default, in which case the peak the content was graded for is read from the file. Tick it to force a value (100-10000 nits, logarithmic) for files whose metadata is wrong. Seeded from whatever the automatic choice arrived at, so ticking the box does not itself change the picture. Too high and the picture comes out dim; too low and highlights clip.
+- **Follow HDR10+ / Dolby Vision metadata**: On by default. Maps each frame from the peak that frame actually reaches instead of mapping the whole file from one static peak. Only does anything for files that carry per-frame metadata — and a hardware decoder may strip it, in which case the status line will not say `[dynamic]` and the panel says so explicitly rather than looking broken.
+- **Adapt resolution to keep frame rate**: On by default. Tone maps at a smaller size when the machine cannot keep up and returns to full size when it can, showing the size currently in use. Costs sharpness under load; turning it off means late and dropped frames instead, which on heavy content looks like flashing.
+- Settings apply to the next decoded frame (no seek or reopen needed) and persist in `player_settings.txt` as `hdr_tone_map_enabled`, `hdr_target_peak_nits`, `hdr_source_peak_nits`, `hdr_dynamic_metadata` and `hdr_adaptive_resolution`. The two sliders apply live while dragging and only write to disk once released, so a drag does not re-seek the pipeline dozens of times a second. All remain adjustable while an SDR file is playing, in which case they apply to the next HDR file opened.
 
 ### Keyboard Shortcuts & Gestures
 
@@ -354,6 +388,7 @@ The user interface uses Dear ImGui with frosted translucency overlay, high-DPI f
 | **`Delete`** (in Playlist panel) | Remove selected item from playlist |
 | **`D`** | Toggle Diagnostics HUD overlay & Telemetry metrics |
 | **`A`** | Toggle Audio Processing panel (EQ, noise gate, compressor, multiband compressor, limiter, crossover, loudness, 3D surround, widener, balance, channel/device/format selection) |
+| **`C`** | Toggle HDR -> SDR Tone Mapping panel (on/off toggle, display peak luminance) |
 | **`Escape`** | Exit Fullscreen (if in fullscreen) or Exit application |
 
 ---
@@ -367,13 +402,13 @@ src/
 ├── app/       main.cpp — entry point, SDL window/event loop, render loop, CLI flags
 ├── audio/     AudioDecoder.{hpp,cpp}, AudioTrack.hpp — decode, resample, SDL callback, track models, output selectors
 │   └── dsp/   header-only DSP module (see Section 5b)
-├── core/      ThreadSafeQueue.hpp, MetricRing.hpp, PipelineMetrics.hpp
+├── core/      ThreadSafeQueue.hpp, MetricRing.hpp, PipelineMetrics.hpp, FFmpegCompat.hpp
 ├── media/     Demuxer.{hpp,cpp} — packet reading, multi-stream track enumeration and routing
 ├── player/    PlayerController.{hpp,cpp} — state machine, track switching, seeking, settings persistence
 ├── playlist/  header-only queue/repeat/shuffle/M3U8 module (see Section 5f)
 ├── subtitle/  SubtitleDecoder.{hpp,cpp}, SubtitleTrack.hpp — decoding, parsing, sync, sanitization
 ├── ui/        PlayerUI.{hpp,cpp} — ImGui controls dock, diagnostics HUD, audio panel, subtitle overlay
-└── video/     VideoDecoder.{hpp,cpp}, FrameExporter.hpp — HW/SW decode, frame conversion, PNG screenshot export
+└── video/     VideoDecoder.{hpp,cpp}, ToneMapper.hpp, FrameExporter.hpp — HW/SW decode, frame conversion, HDR→SDR tone mapping, PNG screenshot export
 ```
 
 
@@ -399,6 +434,12 @@ The single demuxer thread reads both the video and audio packet streams via `av_
 
 - **`push_wait_or_drop(value, timeoutMs, dropCleanup)`**: waits up to `timeoutMs` for room, then drops the oldest queued entry (invoking `dropCleanup` on it, if given) and pushes anyway. This is the structural backstop for the demuxer's video/audio packet pushes and the video decode thread's push into the decoded frame queue (all with a 500ms timeout) — no matter what stalls the consumer (a paused device, a wedged hardware decoder, a stuck render loop), the producer thread always returns and keeps making progress.
 - **`push_drop_oldest(value, dropCleanup)`**: never waits at all — drops the oldest entry immediately if full. Used for audio packets specifically while the audio consumer is known to be idle (paused, or mid seek catch-up), since waiting on a consumer that isn't running serves no purpose.
+
+> [!NOTE]
+> Queue capacities are counted in packets (video 100, subtitle 100) but what matters for the audio queue is the *time* it holds, and that varies by two orders of magnitude between codecs: an AAC packet is ~21 ms while a TrueHD access unit is under 1 ms. So the audio bound is chosen per file in `openFile()`:
+>
+> - **2400 packets when the file has video.** 150 was three seconds of AAC but only ~125 ms of TrueHD — not enough to cover the startup preroll, during which the demuxer filled the queue, blocked on it, and stopped delivering *video* packets too, starving the very frame the preroll was waiting for.
+> - **150 packets for audio-only.** Such a file never prerolls, and the larger bound is actively wrong there: the demuxer reads a short file to EOF and reports end-of-stream while playback is still paused at the start.
 
 This also replaced the previous PTS-based `throttleCatchupReadahead()` mechanism that capped video read-ahead during seek catch-up: the queue's own bounded-wait-then-drop behavior now throttles read-ahead naturally, tracking actual decoder throughput instead of a fixed "1 second past target" heuristic. See [Section 9](#9-troubleshooting) for the hang symptom this fixes, and `tests/tests.cpp` (`T7b`, `T7c`, and the "rapid consecutive seek recovery" integration case) for the regression coverage.
 
@@ -591,7 +632,7 @@ Accessors: `AudioDecoder::getCallbackCount()` / `getSilenceInjectionCount()` / `
 
 ### Standalone Diagnostic Harnesses
 
-Five self-contained programs under `tests/`, none of which are part of the `ctest` suite (only `NaikAVPlayer_tests` is registered via `add_test`). Two are CMake targets built alongside the app; three are built manually.
+Six self-contained programs under `tests/`, none of which are part of the `ctest` suite (only `NaikAVPlayer_tests` is registered via `add_test`). Three are CMake targets built alongside the app; three are built manually.
 
 **Built by CMake** (produced by a normal `cmake --build`, but never run by `ctest`):
 
@@ -599,6 +640,7 @@ Five self-contained programs under `tests/`, none of which are part of the `ctes
 |---|---|---|
 | `NaikAVPlayer_dsp_repro` | `tests/dsp_repro_standalone.cpp` | Exercises the DSP chain through the **real** SDL audio device path, with none of the `SDL_OpenAudioDeviceStream` mocking `tests.cpp` uses. That mock falls back to a disconnected `SDL_CreateAudioStream()` with no callback bound whenever the real device open fails in a sandboxed runner, meaning `decodeAndResample()` — and therefore the whole DSP chain — never actually executes under a real audio callback thread in the normal suite. This program makes it run, matching what the GUI app does. |
 | `NaikAVPlayer_colorinfo_race` | `tests/colorinfo_race_repro.cpp` | Stress-tests the `getColorInfo()` data race between the UI thread (which calls it every frame for the Diagnostics HUD) and the video decode thread, which concurrently mutates and frees the same `AVFrame`. A real render loop only calls it once per frame, so the race was hard to hit organically. |
+| `NaikAVPlayer_hdr_bench` | `tests/hdr_bench_standalone.cpp` | Per-frame decode and conversion cost of the HDR path against a real file, without the window, UI or audio in the way — which is how every tone-mapping figure in these docs was measured. Also the tool for checking that a change did not alter the picture: it prints an FNV checksum of the converted frame and `--dump <path>` writes the raw pixels for comparison between builds. |
 
 **Built manually** (not wired into CMake; the smoke test needs a real audio device):
 
@@ -607,6 +649,30 @@ Five self-contained programs under `tests/`, none of which are part of the `ctes
 | `tests/audio_underrun_smoke.cpp` | Drives the real `PlayerController` → `AudioDecoder` → SDL device path against a real media file, samples every queue depth over time, and reports M10-M12 with per-exit-path attribution. This is the tool that isolates a crackling report to a specific cause. |
 | `tests/audio_callback_bench.cpp` | Per-stage cost of the post-resample DSP path with every effect disabled, as a percentage of the realtime budget — i.e. what the callback still pays for unconditionally. |
 | `tests/resampler_bench.cpp` | `swr_convert` cost per `ResamplerQuality` tier at both matched (48k→48k) and converting (44.1k→48k) rates. |
+
+The HDR bench takes the file plus an optional frame count and any of:
+
+```text
+--window WxH      cap the tone-mapping target to a window size, as the player does
+--1080p | --720p  drive the resolution selector instead
+--no-tonemap      measure the plain SDR conversion path
+--no-dynamic      ignore HDR10+/Dolby Vision per-frame metadata
+--no-adaptive     hold a fixed target instead of adapting to the frame budget
+--trace-peaks     print the source and dynamic peak chosen for every frame
+--software        force software decoding (hardware decoders strip HDR side data)
+--dump <path>     write the converted frame's raw pixels for cross-build comparison
+```
+
+```bash
+build/NaikAVPlayer_hdr_bench <file> 60 --window 1920x1080
+```
+
+The bench sets the decoder's source frame rate from the stream exactly as `PlayerController` does, so the adaptive tone-map scaler has a budget to measure against and `--no-adaptive` is meaningful. It prints the budget it derived (`Video frame budget: 16.68 ms (59.9401 fps)`) — if that line is missing, the container declared no usable frame rate and adaptation is disabled for that file.
+
+> [!IMPORTANT]
+> **Build Release before drawing any conclusion about smoothness.** The tone mapper is a per-pixel loop; at `-O0` it is not vectorised and the AVX2 path does nothing at all. Measured on the 4K60 AV1 clip at an identical window and adaptive target (768x432): `-O0` 39.6 ms/frame (25 fps) against `-O2` 16.2 ms/frame (61.6 fps). A Debug build simply cannot hold 60 fps on that content, and no amount of tuning will change that.
+
+Two environment/compile switches exist for exercising code paths that a modern x86 machine would otherwise never take: `NAIKAV_NO_AVX2=1` forces the baseline tone mapper, and building with `-DNAIKAV_FORCE_LEGACY_SWS` takes the pre-FFmpeg-7.1 swscale path. Both exist so the ARM64/old-FFmpeg behaviour can be verified without that hardware.
 
 The manually-built ones compile with the compiler directly, since the DSP headers are header-only. Note the `-I src` — headers are included by subsystem-relative path:
 
@@ -619,6 +685,131 @@ The smoke test additionally links the player sources and FFmpeg/SDL3 — see the
 
 ---
 
+## 9. Troubleshooting
 
+Symptoms that are easy to misread as bugs, and the ones that really were.
 
+### `Could not initialize SDL3: No available audio device` at launch (Linux)
 
+SDL3 picks its audio backends at **CMake configure time** via `pkg-config`. With
+neither ALSA nor PipeWire/PulseAudio development headers installed it builds
+with only its `dummy`/`disk` drivers and fails at launch, even though the
+machine plainly has working sound. Install `libasound2-dev` and
+`libpipewire-0.3-dev` (or `libpulse-dev`) and **reconfigure from scratch** —
+re-running the build alone will not redetect them. The configure step now emits
+a hard error rather than letting this reach a launch failure. See
+[Section 1](#1-linux-binary-compatibility-limitation--prerequisites).
+
+### H.264 falls back to software decoding on a Raspberry Pi 5
+
+Expected. The BCM2712 SoC has no hardware H.264 M2M decode block — only HEVC,
+via `rpi-hevc-dec` — so `h264_v4l2m2m` cannot open for H.264 content and the
+pipeline falls back to software `h264` by design. HEVC content still uses the
+hardware path. Nothing is wrong; see [Section 5](#5-hardware-acceleration--dynamic-fallback).
+
+### Playback hangs after several rapid consecutive seeks
+
+Fixed. Previously the demuxer could block indefinitely pushing into a packet
+queue whose consumer was idle, which silently stopped delivery to *both*
+streams. All producer pushes are now bounded — see
+[Section 5a](#5a-pipeline-backpressure--deadlock-prevention). Regression
+coverage lives in `tests/tests.cpp` (`T7b`, `T7c`, and the rapid consecutive
+seek recovery case).
+
+### Audible clicking at higher resampler quality settings
+
+Fixed. `swr_convert()` legally returns 0 samples while the resampler fills its
+internal buffer, and soxr's latency grows with the precision tier. Treating
+that as "no audio" made the SDL callback memset a block of digital silence into
+an otherwise healthy stream — a hard discontinuity. It is now correctly treated
+as a buffering state. See [Section 5b](#5b-audio-dsp--loudness-pipeline).
+
+### Playback is not smooth, and the build is a Debug build
+
+Check this before anything else. The tone mapper is a per-pixel loop: at `-O0`
+it is not vectorised and the AVX2 path does nothing, so a Debug build is several
+times slower on exactly the work that decides whether HDR playback keeps up.
+Measured on the 4K60 AV1 clip, identical window and adaptive target (768x432):
+
+| Build | Per frame | Rate |
+| :--- | :--- | :--- |
+| `-O0` (Debug) | 39.6 ms | 25.2 fps |
+| `-O2` (Release) | 16.2 ms | 61.6 fps |
+
+Against a 59.94 fps source, Debug cannot keep up even pinned at the adaptive
+floor, while Release clears it. Configure with `-DCMAKE_BUILD_TYPE=Release` and
+re-measure; keep the Debug tree for debugging only. See
+[Section 2](#2-compilation--local-cross-compilation-guide).
+
+### Enabling the diagnostics HUD drops the frame rate
+
+Fixed. The video thread holds `m_videoDecoderMutex` across `decodeNextFrame()`
+and `convertFrame()` — tens of milliseconds on 4K HDR — and five of the
+properties the HUD read every frame took that same mutex, so the render thread
+queued behind the decoder. Modelled at a 27 ms conversion, the overlay cost a
+median of 80 ms per frame against a 16.7 ms budget.
+
+Those accessors now use `try_lock` and fall back to the last known value while
+the decoder is busy, which drops the cost to effectively zero. If you add a new
+UI accessor, follow that pattern rather than taking the decoder mutex directly —
+otherwise the same stall comes back. See
+[Section 4](#4-ui-controls--shortcuts).
+
+### Video looks like it is flashing or strobing, not merely slow
+
+The picture is arriving in bursts rather than at a steady rate. On content too
+heavy to decode and tone map in real time — 4K60 AV1 in software is the usual
+case, since there is no hardware AV1 decoder on most machines — frames overrun
+their budget, arrive late and get dropped in groups. Measured on the 60 fps LG
+demo clip: 10-44 fps delivered with gaps up to 200 ms.
+
+Leave **Adapt resolution to keep frame rate** on (HDR panel, `C`); it holds the
+frame rate by tone mapping smaller, which is far less objectionable than the
+stutter. Lowering the resolution selector or turning tone mapping off entirely
+also works. Note that shrinking the *window* helps on its own, because the HDR
+target is capped to the renderer's output size.
+
+### Video plays at a small fraction of its real frame rate
+
+Fixed, and worth recognising because the number is distinctive: playback settles
+at roughly **one ninth** of the source rate (2.7 fps on 23.976 fps content).
+That was the late-frame drop rule firing on every frame because the video clock
+sat at a constant offset behind the master clock, with the max-consecutive-drops
+rule letting exactly one frame in nine through.
+
+Dropping could never recover it: the demuxer is paced by audio consumption, so
+video receives packets at real time and cannot decode ahead. Two fixes — drops
+now require the packet queue to actually be backed up, and playback prerolls the
+first video frame before starting the audio clock so the offset never forms. See
+[Section 3](#3-running-the-player).
+
+### HDR content looks washed out or dim on a hardware decoder
+
+Hardware decoders hand back frames with **no side data attached**, so the
+mastering-display and MaxCLL values are simply absent and tone mapping would
+otherwise fall back to a generic 1000-nit assumption. The metadata is now
+recovered from the stream header, or failing that by decoding one frame in
+software when the file is opened — Matroska in particular keeps no stream-level
+copy at all. Confirm from the HDR panel (`C`), which reports the source peak it
+actually resolved; on a file mastered at 4000 nits with a MaxCLL of 683 it
+should read 683, not 1000.
+
+### A file will not open and nothing on screen says why
+
+Every open failure now reports its reason — a toast for the command line,
+drag-and-drop and the file picker, and the reason text inside the typed-path
+dialog's error popup. A truncated download reports `moov atom not found`; a file
+that is not media at all reports `Invalid data found when processing input`.
+`build/ffprobe.exe <file>` gives the same verdict independently if you want to
+confirm the file rather than the player.
+
+### The build fails on Raspberry Pi / ARM64 with unknown FFmpeg types
+
+Linux ARM64 links the **distro's** FFmpeg rather than the bundled one, because
+that is what carries V4L2 M2M hardware decoding — and it can be several major
+versions behind. Every version-sensitive API is guarded in
+`src/core/FFmpegCompat.hpp`, which builds against FFmpeg 4.4 through 8.x. If a
+new error of this kind appears, add a threshold there rather than at the call
+site. See [Section 2](#2-compilation--local-cross-compilation-guide).
+
+---

@@ -7,7 +7,9 @@
 #include <vector>
 #include <cstdlib>
 #include <cstdio>
+#include <fstream>
 #include <atomic>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <numeric>
@@ -1251,6 +1253,30 @@ int real_main(int argc, char* argv[]) {
         // -------------------------------------------------------------
         bool invalidSuccess = controller.openFile("non_existent_file.xyz");
         test_assert(!invalidSuccess, "Loading non-existent file returns false");
+
+        // A failed open must say *why*. Returning false and printing to a
+        // stderr nobody sees is what made a truncated download look like a
+        // broken player once already.
+        test_assert(!controller.getLastOpenError().empty(),
+                    "A failed open reports a reason via getLastOpenError()");
+
+        // A file that exists but is not media: the reason must come from
+        // the demuxer rather than being the generic fallback, and a
+        // subsequent successful open must clear it.
+        {
+            const char* junkPath = "not_a_media_file.tmp";
+            {
+                std::ofstream junk(junkPath, std::ios::binary);
+                junk << "this is definitely not a media container";
+            }
+            bool junkOpened = controller.openFile(junkPath);
+            test_assert(!junkOpened, "Loading a non-media file returns false");
+            test_assert(!controller.getLastOpenError().empty(),
+                        "A non-media file reports a reason via getLastOpenError()");
+            std::cout << "  (open failure reason: \"" << controller.getLastOpenError()
+                      << "\")" << std::endl;
+            std::remove(junkPath);
+        }
 
         // -------------------------------------------------------------
         // C. Standard Lifecycle (Load -> Play -> Pause -> Resume)
@@ -3229,6 +3255,603 @@ int main(int argc, char* argv[]) {
         std::filesystem::remove_all(tmpDir, rmEc);
 
         std::cout << "Playlist unit tests PASSED!" << std::endl;
+    }
+
+    // -------------------------------------------------------------
+    // Audio packet queue sizing (audioQueuePacketsForFormat). Pure
+    // arithmetic on a stream's declared packet length -- no SDL, no
+    // media file -- so it sits with the other pure-logic blocks here.
+    // -------------------------------------------------------------
+    {
+        std::cout << "Running audio queue sizing unit tests..." << std::endl;
+
+        // Ordinary codecs: three seconds already fits inside the floor,
+        // so the queue keeps exactly the bound that has always shipped
+        // and the demuxer's backpressure is unchanged.
+        test_assert(audioQueuePacketsForFormat(1024, 44100) == kAudioQueueMinPackets,
+                    "audioQueuePacketsForFormat() leaves AAC 44.1 kHz on the floor");
+        test_assert(audioQueuePacketsForFormat(1024, 48000) == kAudioQueueMinPackets,
+                    "audioQueuePacketsForFormat() leaves AAC 48 kHz on the floor");
+        test_assert(audioQueuePacketsForFormat(960, 48000) == kAudioQueueMinPackets,
+                    "audioQueuePacketsForFormat() leaves 20 ms Opus packets on the floor");
+
+        // TrueHD: 40 samples at 48 kHz is 0.83 ms per access unit, so
+        // three seconds needs 3600 of them -- the case the flat 150
+        // packets (~125 ms) could not cover, starving prerollVideo().
+        test_assert(audioQueuePacketsForFormat(40, 48000) == 3600,
+                    "audioQueuePacketsForFormat() sizes TrueHD to 3600 packets for 3 s");
+        test_assert(audioQueuePacketsForFormat(40, 48000) *
+                        (40.0 / 48000.0) >= kAudioQueueSeconds,
+                    "audioQueuePacketsForFormat() holds at least kAudioQueueSeconds of TrueHD");
+
+        // A stream that declares no packet length gets the floor rather
+        // than a division by zero -- this is what the pre-existing
+        // behaviour was for every file.
+        //
+        // The three below take the function's first branch, which cppcheck
+        // folds to a constant. That guard is exactly what is being pinned
+        // here: the call must return the floor rather than divide by zero.
+        // cppcheck-suppress knownConditionTrueFalse
+        test_assert(audioQueuePacketsForFormat(0, 48000) == kAudioQueueMinPackets,
+                    "audioQueuePacketsForFormat() falls back to the floor with no frame size");
+        // cppcheck-suppress knownConditionTrueFalse
+        test_assert(audioQueuePacketsForFormat(1024, 0) == kAudioQueueMinPackets,
+                    "audioQueuePacketsForFormat() falls back to the floor with no sample rate");
+        // cppcheck-suppress knownConditionTrueFalse
+        test_assert(audioQueuePacketsForFormat(-40, -48000) == kAudioQueueMinPackets,
+                    "audioQueuePacketsForFormat() falls back to the floor on negative input");
+
+        // The ceiling stops a pathologically short packet (a raw PCM
+        // stream declaring one sample per packet would want 144000)
+        // turning the queue into an unbounded read-ahead buffer.
+        test_assert(audioQueuePacketsForFormat(1, 48000) == kAudioQueueMaxPackets,
+                    "audioQueuePacketsForFormat() clamps a 1-sample packet to the ceiling");
+
+        // Shorter packets never ask for fewer of them.
+        size_t previous = 0;
+        bool monotonic = true;
+        for (int frameSize : {4096, 2048, 1024, 512, 256, 128, 64, 40, 16, 8, 4, 2, 1}) {
+            const size_t packets = audioQueuePacketsForFormat(frameSize, 48000);
+            if (packets < previous || packets < kAudioQueueMinPackets ||
+                packets > kAudioQueueMaxPackets) {
+                monotonic = false;
+                break;
+            }
+            previous = packets;
+        }
+        test_assert(monotonic,
+                    "audioQueuePacketsForFormat() rises with shorter packets and stays within its bounds");
+
+        std::cout << "Audio queue sizing unit tests PASSED!" << std::endl;
+    }
+
+    // -------------------------------------------------------------
+    // HDR tone mapping unit tests (naikav::video::ToneMapper). Pure
+    // math on lookup tables -- no SDL, no FFmpeg, no media file --
+    // so these sit alongside the Playlist tests above rather than in
+    // the real-media block below.
+    // -------------------------------------------------------------
+    {
+        using naikav::video::HdrTransfer;
+        using naikav::video::ToneMapper;
+
+        std::cout << "Running HDR ToneMapper unit tests..." << std::endl;
+
+        // --- transfer functions round-trip ---
+        {
+            bool roundTrips = true;
+            for (double nits : {0.1, 1.0, 10.0, 100.0, 203.0, 1000.0, 4000.0, 10000.0}) {
+                const double code = naikav::video::pqInverseEotf(nits / 10000.0);
+                const double back = naikav::video::pqEotf(code) * 10000.0;
+                if (std::fabs(back - nits) > nits * 1e-4) roundTrips = false;
+            }
+            test_assert(roundTrips, "PQ EOTF and its inverse round-trip across the full 0.1..10000 nit range");
+            test_assert(naikav::video::pqEotf(0.0) == 0.0 && naikav::video::pqEotf(1.0) == 1.0,
+                        "PQ EOTF pins both endpoints exactly");
+            test_assert(naikav::video::hlgInverseOetf(0.0) == 0.0 &&
+                            std::fabs(naikav::video::hlgInverseOetf(1.0) - 1.0) < 1e-6,
+                        "HLG inverse OETF maps signal 0 and 1 to scene light 0 and 1");
+            // The two HLG segments must agree at the 0.5 join, or the
+            // ramp shows a visible step there.
+            test_assert(std::fabs(naikav::video::hlgInverseOetf(0.5 - 1e-9) -
+                                  naikav::video::hlgInverseOetf(0.5 + 1e-9)) < 1e-6,
+                        "HLG inverse OETF is continuous across its 0.5 segment boundary");
+        }
+
+        // --- BT.2390 EETF ---
+        {
+            test_assert(naikav::video::bt2390Eetf(0.0, 1000.0, 100.0) == 0.0,
+                        "BT.2390 EETF maps black to black");
+            test_assert(std::fabs(naikav::video::bt2390Eetf(1000.0, 1000.0, 100.0) - 100.0) < 0.5,
+                        "BT.2390 EETF maps the source peak onto the target peak");
+            // Below the knee the curve must be the identity, otherwise
+            // ordinary SDR-range detail gets needlessly darkened.
+            test_assert(std::fabs(naikav::video::bt2390Eetf(10.0, 1000.0, 100.0) - 10.0) < 0.1,
+                        "BT.2390 EETF leaves sub-knee luminance untouched");
+            test_assert(naikav::video::bt2390Eetf(500.0, 1000.0, 100.0) < 500.0,
+                        "BT.2390 EETF compresses highlights above the knee");
+            bool eetfMonotonic = true;
+            double prevOut = -1.0;
+            for (int i = 0; i <= 1000; ++i) {
+                const double out = naikav::video::bt2390Eetf(i * 1.0, 1000.0, 100.0);
+                if (out < prevOut - 1e-9) eetfMonotonic = false;
+                prevOut = out;
+            }
+            test_assert(eetfMonotonic, "BT.2390 EETF is monotonic across the source range");
+            // A target brighter than the source has nothing to roll off.
+            test_assert(std::fabs(naikav::video::bt2390Eetf(100.0, 100.0, 1000.0) - 100.0) < 1e-6,
+                        "BT.2390 EETF is a pass-through when the target peak exceeds the source peak");
+        }
+
+        // Every ToneMapper below is heap-allocated rather than declared as
+        // a plain local. It carries its four lookup tables inline (~53 KB
+        // per instance), which is what a long-lived VideoDecoder member
+        // wants -- no indirection in the per-pixel loop -- but far too
+        // much for a stack local here: MSVC reserves main()'s entire frame
+        // on entry, and seven of these added ~373 KB to a function that
+        // was already using ~561 KB, overflowing the 1 MB stack before a
+        // single test could run. (MinGW's 2 MB reserve happened to absorb
+        // it, so this only ever showed up on the MSVC build.)
+        auto newToneMapper = [] { return std::make_unique<ToneMapper>(); };
+
+        // --- configure() ---
+        {
+            auto tmOwner = newToneMapper();
+            ToneMapper& tm = *tmOwner;
+            test_assert(!tm.isReady(), "ToneMapper is not ready before configure()");
+            test_assert(!tm.configure(HdrTransfer::None, 1000.0f, 100.0f),
+                        "ToneMapper::configure() rejects an SDR (None) transfer");
+            test_assert(!tm.isReady(), "ToneMapper stays unready after a rejected configure()");
+            test_assert(tm.configure(HdrTransfer::PQ, 1000.0f, 100.0f),
+                        "ToneMapper::configure() accepts PQ");
+            test_assert(tm.isReady() && tm.transfer() == HdrTransfer::PQ,
+                        "ToneMapper reports the configured transfer");
+            test_assert(tm.targetPeakNits() == 100.0f, "ToneMapper retains the configured target peak");
+            // A zero/negative source peak must fall back rather than
+            // divide through by it.
+            auto defaultedOwner = newToneMapper();
+            ToneMapper& defaulted = *defaultedOwner;
+            test_assert(defaulted.configure(HdrTransfer::PQ, 0.0f, 100.0f) &&
+                            defaulted.sourcePeakNits() == naikav::video::kDefaultSourcePeakNits,
+                        "ToneMapper::configure() substitutes the default source peak for a zero peak");
+            // Source peak below target must not invert the curve.
+            auto invertedOwner = newToneMapper();
+            ToneMapper& inverted = *invertedOwner;
+            test_assert(inverted.configure(HdrTransfer::PQ, 50.0f, 100.0f) &&
+                            inverted.sourcePeakNits() > inverted.targetPeakNits(),
+                        "ToneMapper::configure() keeps the source peak above the target peak");
+        }
+
+        // --- the mapped picture itself ---
+        {
+            auto tmOwner = newToneMapper();
+            ToneMapper& tm = *tmOwner;
+            tm.configure(HdrTransfer::PQ, 1000.0f, 100.0f);
+
+            auto codeFor = [](double nits) {
+                return static_cast<uint16_t>(
+                    std::lround(naikav::video::pqInverseEotf(nits / 10000.0) * 65535.0));
+            };
+            auto grey = [&](double nits) {
+                uint8_t r = 0, g = 0, b = 0;
+                const uint16_t c = codeFor(nits);
+                tm.mapPixel(c, c, c, r, g, b);
+                return r;
+            };
+
+            uint8_t r = 0, g = 0, b = 0;
+            tm.mapPixel(0, 0, 0, r, g, b);
+            test_assert(r == 0 && g == 0 && b == 0, "ToneMapper maps code 0 to black");
+
+            const uint16_t peak = codeFor(1000.0);
+            tm.mapPixel(peak, peak, peak, r, g, b);
+            test_assert(r == 255 && g == 255 && b == 255,
+                        "ToneMapper maps the source peak to full-scale white");
+
+            tm.mapPixel(65535, 65535, 65535, r, g, b);
+            test_assert(r == 255, "ToneMapper clamps above-peak input rather than wrapping");
+
+            // The bug this whole path exists to fix: 100 nits is SDR
+            // reference white inside HDR content. Truncating the PQ code
+            // to 8 bits renders it at 130/255, which is what made HDR
+            // look dark. It must land far brighter than that.
+            const int oldTruncated = codeFor(100.0) >> 8;
+            test_assert(oldTruncated < 140,
+                        "PQ code truncation really does put 100-nit white near half scale");
+            test_assert(grey(100.0) > 200,
+                        "Tone mapping lifts 100-nit reference white to near display white");
+            test_assert(grey(100.0) > oldTruncated + 60,
+                        "Tone mapping is dramatically brighter than raw PQ truncation at reference white");
+
+            // Neutral in must stay neutral out: the BT.2020 -> BT.709
+            // matrix rows each sum to 1, and the gamut clip must not
+            // disturb that.
+            bool neutral = true, monotonic = true;
+            int prev = -1;
+            for (int i = 0; i <= 65535; i += 7) {
+                uint8_t rr = 0, gg = 0, bb = 0;
+                tm.mapPixel(static_cast<uint16_t>(i), static_cast<uint16_t>(i),
+                            static_cast<uint16_t>(i), rr, gg, bb);
+                if (rr != gg || gg != bb) neutral = false;
+                if (rr < prev) monotonic = false;
+                prev = rr;
+            }
+            test_assert(neutral, "ToneMapper keeps neutral greys neutral through the gamut conversion");
+            test_assert(monotonic, "ToneMapper's grey ramp is monotonic across the full 16-bit input range");
+
+            // Out-of-gamut BT.2020 primaries must desaturate into range,
+            // not wrap around or produce garbage.
+            const uint16_t hi = codeFor(100.0);
+            tm.mapPixel(hi, 0, 0, r, g, b);
+            test_assert(r > g && r > b, "ToneMapper keeps a saturated BT.2020 red dominated by red");
+            tm.mapPixel(0, 0, hi, r, g, b);
+            test_assert(b > r && b > g, "ToneMapper keeps a saturated BT.2020 blue dominated by blue");
+        }
+
+        // --- HLG ---
+        {
+            auto hlgOwner = newToneMapper();
+            ToneMapper& hlg = *hlgOwner;
+            test_assert(hlg.configure(HdrTransfer::HLG, 1000.0f, 100.0f),
+                        "ToneMapper::configure() accepts HLG");
+            uint8_t r = 0, g = 0, b = 0;
+            hlg.mapPixel(0, 0, 0, r, g, b);
+            test_assert(r == 0, "HLG maps signal 0 to black");
+            hlg.mapPixel(65535, 65535, 65535, r, g, b);
+            test_assert(r == 255, "HLG maps full signal to full-scale white");
+            bool monotonic = true;
+            int prev = -1;
+            for (int i = 0; i <= 65535; i += 13) {
+                uint8_t rr = 0, gg = 0, bb = 0;
+                hlg.mapPixel(static_cast<uint16_t>(i), static_cast<uint16_t>(i),
+                             static_cast<uint16_t>(i), rr, gg, bb);
+                if (rr < prev) monotonic = false;
+                if (rr != gg || gg != bb) monotonic = false;
+                prev = rr;
+            }
+            test_assert(monotonic, "HLG's grey ramp is monotonic and stays neutral");
+        }
+
+        // --- process(): block path must match the scalar reference ---
+        {
+            auto tmOwner = newToneMapper();
+            ToneMapper& tm = *tmOwner;
+            tm.configure(HdrTransfer::PQ, 1000.0f, 100.0f);
+
+            // Deliberately not a multiple of the internal block size, so
+            // the partial trailing block is exercised too.
+            const int w = 203;
+            const int h = 5;
+            std::vector<uint16_t> src(static_cast<size_t>(w) * h * 3);
+            for (size_t i = 0; i < src.size(); ++i) {
+                src[i] = static_cast<uint16_t>((i * 2654435761u) & 0xFFFF);
+            }
+            std::vector<uint8_t> got(static_cast<size_t>(w) * h * 3, 0);
+            tm.process(reinterpret_cast<const uint8_t*>(src.data()), w * 6,
+                       got.data(), w * 3, w, h);
+
+            bool matches = true;
+            for (int y = 0; y < h && matches; ++y) {
+                for (int x = 0; x < w; ++x) {
+                    const size_t o = (static_cast<size_t>(y) * w + x) * 3;
+                    uint8_t er = 0, eg = 0, eb = 0;
+                    tm.mapPixel(src[o], src[o + 1], src[o + 2], er, eg, eb);
+                    if (got[o] != er || got[o + 1] != eg || got[o + 2] != eb) {
+                        matches = false;
+                        break;
+                    }
+                }
+            }
+            test_assert(matches,
+                        "ToneMapper::process()'s blocked path matches mapPixel() exactly, including the partial tail block");
+
+            // Multi-threaded and single-threaded must agree bit for bit.
+            const int bigW = 640, bigH = 360;
+            std::vector<uint16_t> bigSrc(static_cast<size_t>(bigW) * bigH * 3);
+            for (size_t i = 0; i < bigSrc.size(); ++i) {
+                bigSrc[i] = static_cast<uint16_t>((i * 40503u + 7u) & 0xFFFF);
+            }
+            std::vector<uint8_t> mt(static_cast<size_t>(bigW) * bigH * 3, 0);
+            std::vector<uint8_t> st(static_cast<size_t>(bigW) * bigH * 3, 1);
+            tm.process(reinterpret_cast<const uint8_t*>(bigSrc.data()), bigW * 6,
+                       mt.data(), bigW * 3, bigW, bigH);
+            tm.process(reinterpret_cast<const uint8_t*>(bigSrc.data()), bigW * 6,
+                       st.data(), bigW * 3, bigW, bigH, 1);
+            test_assert(mt == st,
+                        "ToneMapper::process() produces identical output threaded and single-threaded");
+
+            // An unconfigured mapper must not write through the pointers.
+            auto unsetOwner = newToneMapper();
+            const ToneMapper& unset = *unsetOwner;
+            std::vector<uint8_t> untouched(32 * 3, 0xAB);
+            unset.process(reinterpret_cast<const uint8_t*>(src.data()), w * 6,
+                          untouched.data(), 32 * 3, 4, 1);
+            test_assert(untouched[0] == 0xAB, "ToneMapper::process() no-ops before configure()");
+            // Null/degenerate arguments must be rejected, not crash.
+            tm.process(nullptr, w * 6, got.data(), w * 3, w, h);
+            tm.process(reinterpret_cast<const uint8_t*>(src.data()), w * 6, nullptr, w * 3, w, h);
+            tm.process(reinterpret_cast<const uint8_t*>(src.data()), w * 6, got.data(), w * 3, 0, h);
+            test_assert(true, "ToneMapper::process() tolerates null buffers and zero dimensions");
+        }
+
+        // --- VideoDecoder's frame-level HDR classification ---
+        {
+            AVFrame* f = av_frame_alloc();
+            test_assert(f != nullptr, "Allocated a probe AVFrame for HDR classification");
+            f->color_trc = AVCOL_TRC_BT709;
+            test_assert(VideoDecoder::hdrTransferOf(f) == HdrTransfer::None,
+                        "hdrTransferOf() reports None for a BT.709 frame");
+            f->color_trc = AVCOL_TRC_SMPTE2084;
+            test_assert(VideoDecoder::hdrTransferOf(f) == HdrTransfer::PQ,
+                        "hdrTransferOf() reports PQ for an ST 2084 frame");
+            f->color_trc = AVCOL_TRC_ARIB_STD_B67;
+            test_assert(VideoDecoder::hdrTransferOf(f) == HdrTransfer::HLG,
+                        "hdrTransferOf() reports HLG for an ARIB STD-B67 frame");
+            // cppcheck-suppress knownConditionTrueFalse
+            // hdrTransferOf() returns None for null by its first branch, so
+            // cppcheck folds this to a constant. That is exactly the
+            // contract being pinned here -- the call must not dereference.
+            test_assert(VideoDecoder::hdrTransferOf(nullptr) == HdrTransfer::None,
+                        "hdrTransferOf() tolerates a null frame");
+            test_assert(VideoDecoder::masteringPeakNits(f) == 0.0f,
+                        "masteringPeakNits() returns 0 when the frame carries no mastering metadata");
+            test_assert(VideoDecoder::masteringPeakNits(nullptr) == 0.0f,
+                        "masteringPeakNits() tolerates a null frame");
+
+            AVMasteringDisplayMetadata* md = av_mastering_display_metadata_create_side_data(f);
+            if (md) {
+                md->has_luminance = 1;
+                md->max_luminance = av_make_q(4000, 1);
+                test_assert(std::fabs(VideoDecoder::masteringPeakNits(f) - 4000.0f) < 0.5f,
+                            "masteringPeakNits() reads the mastering display's peak luminance");
+                md->has_luminance = 0;
+                test_assert(VideoDecoder::masteringPeakNits(f) == 0.0f,
+                            "masteringPeakNits() ignores mastering metadata with no luminance set");
+            }
+
+            // MaxCLL, the other half of what selectSourcePeakNits() weighs.
+            test_assert(VideoDecoder::contentLightPeakNits(f) == 0.0f,
+                        "contentLightPeakNits() returns 0 when the frame carries no content light metadata");
+            test_assert(VideoDecoder::contentLightPeakNits(nullptr) == 0.0f,
+                        "contentLightPeakNits() tolerates a null frame");
+
+            AVContentLightMetadata* cl = av_content_light_metadata_create_side_data(f);
+            if (cl) {
+                // 683 nits over a 4000-nit mastering display is the real
+                // shape of the problem -- see the Birds of Prey HDR10+
+                // clip, whose grade reaches barely a sixth of the monitor
+                // it was delivered on.
+                cl->MaxCLL = 683;
+                test_assert(std::fabs(VideoDecoder::contentLightPeakNits(f) - 683.0f) < 0.5f,
+                            "contentLightPeakNits() reads MaxCLL from content light level metadata");
+                test_assert(selectSourcePeakNits(0.0f, 4000.0f,
+                                                 VideoDecoder::contentLightPeakNits(f)) == 683.0f,
+                            "A 4000-nit grade whose MaxCLL is 683 is tone mapped from 683");
+                // MaxCLL of 0 is the encoder's "unknown", not a real peak.
+                cl->MaxCLL = 0;
+                test_assert(VideoDecoder::contentLightPeakNits(f) == 0.0f,
+                            "contentLightPeakNits() treats a zero MaxCLL as unknown");
+            }
+            av_frame_free(&f);
+        }
+
+        // capToDisplaySize(), the HDR path's guard against tone mapping
+        // more pixels than the window can actually show.
+        {
+            int w = 0, h = 0;
+
+            // A 4K frame in the default 1024x576 window: the box is
+            // already a multiple of the quantisation step, so the fit
+            // is exact and the aspect ratio is preserved.
+            w = 3840; h = 2160;
+            capToDisplaySize(w, h, 1024, 576);
+            test_assert(w == 1024 && h == 576, "capToDisplaySize() fits a 4K frame to a 1024x576 display area");
+
+            // Never upscales: a target already inside the box is left
+            // exactly as it was, rather than being stretched to fill it.
+            w = 1280; h = 720;
+            capToDisplaySize(w, h, 3840, 2160);
+            test_assert(w == 1280 && h == 720, "capToDisplaySize() leaves a target smaller than the display area alone");
+
+            // Equal sizes are "already fits", not a rescale.
+            w = 1920; h = 1080;
+            capToDisplaySize(w, h, 1920, 1080);
+            test_assert(w == 1920 && h == 1080, "capToDisplaySize() no-ops when the target exactly fills the display area");
+
+            // The box is rounded up to kDisplayCapStep so a window
+            // being dragged does not reallocate on every pixel: 1000x570
+            // rounds to 1024x576, which a 16:9 source fills exactly.
+            w = 3840; h = 2160;
+            capToDisplaySize(w, h, 1000, 570);
+            test_assert(w == 1024 && h == 576, "capToDisplaySize() quantises the display box up to the step size");
+
+            // Aspect is taken from the tighter axis: a 4:3 source in a
+            // wide box is limited by height, not width.
+            w = 1440; h = 1080;
+            capToDisplaySize(w, h, 1920, 540);
+            test_assert(h == 576 && w == 768, "capToDisplaySize() fits to the constraining axis for a 4:3 source");
+
+            // Results stay even, matching getTargetDimensions().
+            w = 1999; h = 1111;
+            capToDisplaySize(w, h, 333, 333);
+            test_assert(w % 2 == 0 && h % 2 == 0, "capToDisplaySize() produces even dimensions");
+            test_assert(w <= 384 && h <= 384, "capToDisplaySize() stays within the quantised box");
+
+            // A display size of zero or less means "unknown" and
+            // disables the cap entirely -- this is what the bench
+            // harness and every non-player caller gets.
+            w = 3840; h = 2160;
+            capToDisplaySize(w, h, 0, 0);
+            test_assert(w == 3840 && h == 2160, "capToDisplaySize() is a no-op when the display size is unknown");
+            capToDisplaySize(w, h, -100, -100);
+            test_assert(w == 3840 && h == 2160, "capToDisplaySize() is a no-op for a negative display size");
+
+            // A degenerate target is left alone rather than divided by.
+            w = 0; h = 0;
+            capToDisplaySize(w, h, 1024, 576);
+            test_assert(w == 0 && h == 0, "capToDisplaySize() tolerates a zero-sized target");
+        }
+
+        // selectSourcePeakNits(), which reconciles the two peak figures a
+        // file can carry with the user's override.
+        {
+            // The override wins outright -- that is what it is for. Even
+            // when both metadata figures are present and disagree with it.
+            test_assert(selectSourcePeakNits(600.0f, 4000.0f, 1000.0f) == 600.0f,
+                        "selectSourcePeakNits() prefers an explicit override over metadata");
+            test_assert(selectSourcePeakNits(600.0f, 0.0f, 0.0f) == 600.0f,
+                        "selectSourcePeakNits() honours an override when the file carries no metadata");
+
+            // The common HDR10 case: graded on a 4000-nit reference
+            // monitor, but nothing in the picture exceeds 1000. Mapping
+            // from 4000 would spend most of the curve on range the file
+            // never uses and the result would come out dim.
+            test_assert(selectSourcePeakNits(0.0f, 4000.0f, 1000.0f) == 1000.0f,
+                        "selectSourcePeakNits() prefers MaxCLL over a higher mastering peak");
+
+            // MaxCLL above the mastering display is metadata that
+            // contradicts itself: content cannot out-run the monitor it
+            // was graded on, so the mastering peak is the ceiling.
+            test_assert(selectSourcePeakNits(0.0f, 1000.0f, 4000.0f) == 1000.0f,
+                        "selectSourcePeakNits() caps MaxCLL at the mastering peak");
+
+            // Either figure alone is used as-is.
+            test_assert(selectSourcePeakNits(0.0f, 4000.0f, 0.0f) == 4000.0f,
+                        "selectSourcePeakNits() falls back to the mastering peak alone");
+            test_assert(selectSourcePeakNits(0.0f, 0.0f, 1000.0f) == 1000.0f,
+                        "selectSourcePeakNits() falls back to MaxCLL alone");
+
+            // Nothing known at all returns 0, which leaves the tone
+            // mapper on its own default rather than mapping from zero.
+            test_assert(selectSourcePeakNits(0.0f, 0.0f, 0.0f) == 0.0f,
+                        "selectSourcePeakNits() returns 0 when nothing is known");
+
+            // Negatives are treated as absent, not as small peaks.
+            test_assert(selectSourcePeakNits(-1.0f, 0.0f, 1000.0f) == 1000.0f,
+                        "selectSourcePeakNits() treats a negative override as absent");
+            test_assert(selectSourcePeakNits(0.0f, -1.0f, -1.0f) == 0.0f,
+                        "selectSourcePeakNits() treats negative metadata as absent");
+        }
+
+        // selectSourcePeakNits() with dynamic metadata in play.
+        {
+            // Dynamic supersedes both static figures: that is the point of
+            // per-frame metadata.
+            test_assert(selectSourcePeakNits(0.0f, 4000.0f, 1000.0f, 300.0f) == 300.0f,
+                        "selectSourcePeakNits() prefers the dynamic peak over static metadata");
+            // Capped by the mastering display, which is a physical ceiling.
+            test_assert(selectSourcePeakNits(0.0f, 1000.0f, 0.0f, 4000.0f) == 1000.0f,
+                        "selectSourcePeakNits() caps the dynamic peak at the mastering peak");
+            // But deliberately NOT capped by MaxCLL -- the two disagree by
+            // small margins in real files (the HDR10+ clip reports a
+            // per-frame 700 against a MaxCLL of 683), and clamping would
+            // discard the dynamic value on most frames.
+            test_assert(selectSourcePeakNits(0.0f, 4000.0f, 683.0f, 700.0f) == 700.0f,
+                        "selectSourcePeakNits() does not let MaxCLL clamp the dynamic peak");
+            // An explicit override still beats everything.
+            test_assert(selectSourcePeakNits(500.0f, 4000.0f, 1000.0f, 300.0f) == 500.0f,
+                        "selectSourcePeakNits() prefers an override over the dynamic peak");
+            // No dynamic metadata leaves the static behaviour untouched.
+            test_assert(selectSourcePeakNits(0.0f, 4000.0f, 1000.0f, 0.0f) == 1000.0f,
+                        "selectSourcePeakNits() falls back to static metadata with no dynamic peak");
+        }
+
+        // DynamicPeakTracker: smooth within a shot, snap on a cut.
+        {
+            DynamicPeakTracker t;
+            test_assert(t.update(0.0f) == 0.0f,
+                        "DynamicPeakTracker reports nothing without dynamic metadata");
+
+            // First value is taken as-is (quantised up).
+            float first = t.update(700.0f);
+            test_assert(first >= 700.0f && first <= 725.0f,
+                        "DynamicPeakTracker adopts the first frame's peak");
+
+            // A small change is eased into, not followed exactly.
+            t.reset();
+            t.update(700.0f);
+            t.update(600.0f);
+            test_assert(t.smoothedNits() > 650.0f,
+                        "DynamicPeakTracker eases within-shot drift rather than tracking it exactly");
+
+            // A large jump is a cut and is followed immediately.
+            t.reset();
+            t.update(700.0f);
+            t.update(200.0f);
+            test_assert(std::fabs(t.smoothedNits() - 200.0f) < 1.0f,
+                        "DynamicPeakTracker snaps to a scene cut instead of fading into it");
+
+            // reset() clears the smoothing so a seek does not leak across.
+            t.reset();
+            test_assert(t.smoothedNits() == 0.0f, "DynamicPeakTracker::reset() clears the smoothed peak");
+
+            // Output is quantised, so the tone mapper is not rebuilding
+            // its tables for every one-nit wobble.
+            t.reset();
+            float q = t.update(613.0f);
+            test_assert(std::fmod(q, kDynamicPeakQuantNits) == 0.0f,
+                        "DynamicPeakTracker quantises its reported peak");
+        }
+
+        // AdaptiveToneMapScale: shrink under overrun, recover slowly.
+        {
+            AdaptiveToneMapScale a;
+            test_assert(a.scale() == 1.0f, "AdaptiveToneMapScale starts at full size");
+
+            // An unknown frame rate must not move it at all.
+            a.update(100.0, 0.0);
+            test_assert(a.scale() == 1.0f, "AdaptiveToneMapScale does nothing without a frame budget");
+
+            // Overrunning the budget steps the target down, but only after
+            // a few frames -- one expensive frame is not a trend.
+            a.reset();
+            a.update(20.0, 16.7);
+            test_assert(a.scale() == 1.0f, "AdaptiveToneMapScale ignores a single overrunning frame");
+            a.update(20.0, 16.7);
+            a.update(20.0, 16.7);
+            test_assert(a.scale() < 1.0f, "AdaptiveToneMapScale shrinks after sustained overrun");
+
+            // It never shrinks past the floor however bad things get.
+            a.reset();
+            for (int i = 0; i < 500; ++i) a.update(500.0, 16.7);
+            test_assert(a.scale() >= kAdaptiveMinScale - 1e-6f,
+                        "AdaptiveToneMapScale never shrinks past its floor");
+
+            // Plenty of headroom grows it back, but slowly, and never
+            // beyond full size.
+            for (int i = 0; i < 2000; ++i) a.update(1.0, 16.7);
+            test_assert(a.scale() == 1.0f, "AdaptiveToneMapScale recovers to full size given headroom");
+
+            // Sitting inside the deadband holds it steady.
+            a.reset();
+            for (int i = 0; i < 200; ++i) a.update(16.7 * 0.55, 16.7);
+            test_assert(a.scale() == 1.0f, "AdaptiveToneMapScale holds steady inside the deadband");
+
+            a.reset();
+            test_assert(a.scale() == 1.0f, "AdaptiveToneMapScale::reset() restores full size");
+        }
+
+        // applyAdaptiveScale() keeps targets legal.
+        {
+            int w = 1024, h = 576;
+            applyAdaptiveScale(w, h, 0.5f);
+            test_assert(w == 512 && h == 288, "applyAdaptiveScale() halves a target");
+            test_assert(w % 2 == 0 && h % 2 == 0, "applyAdaptiveScale() produces even dimensions");
+
+            w = 1024; h = 576;
+            applyAdaptiveScale(w, h, 1.0f);
+            test_assert(w == 1024 && h == 576, "applyAdaptiveScale() is a no-op at full scale");
+
+            w = 1024; h = 576;
+            applyAdaptiveScale(w, h, 0.0f);
+            test_assert(w == 1024 && h == 576, "applyAdaptiveScale() ignores a degenerate scale");
+
+            w = 2; h = 2;
+            applyAdaptiveScale(w, h, 0.01f);
+            test_assert(w >= 2 && h >= 2, "applyAdaptiveScale() never produces a zero-sized target");
+        }
+
+        std::cout << "HDR ToneMapper unit tests PASSED!" << std::endl;
     }
 
     // 7. Run additional coverage tests to hit remaining uncovered branches!

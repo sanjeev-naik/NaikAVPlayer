@@ -1,4 +1,5 @@
 #include "audio/AudioDecoder.hpp"
+#include "core/FFmpegCompat.hpp"
 #include "audio/dsp/DspMath.hpp"
 #include <iostream>
 #include <algorithm>
@@ -929,9 +930,11 @@ void AudioDecoder::decodeAndResample() {
             }
 
             if (m_seekGeneration) {
-                uint64_t packetGeneration = static_cast<uint64_t>(
-                    reinterpret_cast<uintptr_t>(packet->opaque));
-                if (packetGeneration != m_seekGeneration->load(std::memory_order_relaxed)) {
+                const uint64_t currentGeneration =
+                    m_seekGeneration->load(std::memory_order_relaxed);
+                const uint64_t packetGeneration =
+                    naikavPacketGeneration(packet, currentGeneration);
+                if (packetGeneration != currentGeneration) {
                     // Stale pre-seek packet (see VideoDecoder's identical
                     // check and Demuxer.hpp's m_seekGeneration comment).
                     // Drop it and try the next one instead of decoding it.
