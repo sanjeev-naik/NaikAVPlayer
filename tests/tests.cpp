@@ -3287,10 +3287,17 @@ int main(int argc, char* argv[]) {
         // A stream that declares no packet length gets the floor rather
         // than a division by zero -- this is what the pre-existing
         // behaviour was for every file.
+        //
+        // The three below take the function's first branch, which cppcheck
+        // folds to a constant. That guard is exactly what is being pinned
+        // here: the call must return the floor rather than divide by zero.
+        // cppcheck-suppress knownConditionTrueFalse
         test_assert(audioQueuePacketsForFormat(0, 48000) == kAudioQueueMinPackets,
                     "audioQueuePacketsForFormat() falls back to the floor with no frame size");
+        // cppcheck-suppress knownConditionTrueFalse
         test_assert(audioQueuePacketsForFormat(1024, 0) == kAudioQueueMinPackets,
                     "audioQueuePacketsForFormat() falls back to the floor with no sample rate");
+        // cppcheck-suppress knownConditionTrueFalse
         test_assert(audioQueuePacketsForFormat(-40, -48000) == kAudioQueueMinPackets,
                     "audioQueuePacketsForFormat() falls back to the floor on negative input");
 
