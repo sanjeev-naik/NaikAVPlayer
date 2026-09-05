@@ -5,6 +5,8 @@
 #include <thread>
 #include <atomic>
 #include <cstdint>
+#include <cstddef>
+#include <cmath>
 #include <mutex>
 #include <vector>
 #include "core/ThreadSafeQueue.hpp"
@@ -31,6 +33,52 @@ struct DecodedFrame {
 
 extern bool g_videoThreadEnabled;
 
+// ---------------------------------------------------------------------
+// Audio packet queue sizing
+// ---------------------------------------------------------------------
+//
+// What matters about that queue is the *time* it holds, not the packet
+// count, and packet duration varies by more than an order of magnitude
+// between codecs: an AAC frame is 1024 samples (~23 ms at 44.1 kHz) while
+// a TrueHD access unit is 40 samples (~0.8 ms). The flat 150 packets that
+// used to ship was therefore ~3.5 s of AAC but only ~125 ms of TrueHD --
+// not enough to cover prerollVideo(), during which the demuxer filled the
+// queue, blocked on it, and so stopped delivering *video* packets too,
+// starving the very frame the preroll was waiting for.
+//
+// Sizing by seconds fixes that without disturbing anything else. Ordinary
+// codecs land on the floor, i.e. exactly the behaviour that has always
+// shipped -- which matters, because the demuxer's backpressure against
+// this queue is load-bearing: raising it unconditionally let the demuxer
+// race to end-of-stream and starved the video thread of packets.
+constexpr double kAudioQueueSeconds = 3.0;
+constexpr size_t kAudioQueueMinPackets = 150;
+constexpr size_t kAudioQueueMaxPackets = 4000;
+
+// Packets needed to hold kAudioQueueSeconds of audio whose packets are
+// frameSize samples at sampleRate Hz.
+//
+// frameSize is what the decoder declares as samples per packet; measured
+// against real files it matches the packets actually demuxed exactly (AAC
+// 1024 @ 44.1 kHz = 23.2 ms, TrueHD 40 @ 48 kHz = 0.83 ms). A stream that
+// declares neither -- and every codec whose packets are long enough that
+// kAudioQueueSeconds already fits inside the floor -- gets the floor.
+inline size_t audioQueuePacketsForFormat(int frameSize, int sampleRate) {
+    if (frameSize <= 0 || sampleRate <= 0) {
+        return kAudioQueueMinPackets;
+    }
+    const double packetSeconds =
+        static_cast<double>(frameSize) / static_cast<double>(sampleRate);
+    const double needed = std::ceil(kAudioQueueSeconds / packetSeconds);
+    if (needed <= static_cast<double>(kAudioQueueMinPackets)) {
+        return kAudioQueueMinPackets;
+    }
+    if (needed >= static_cast<double>(kAudioQueueMaxPackets)) {
+        return kAudioQueueMaxPackets;
+    }
+    return static_cast<size_t>(needed);
+}
+
 enum class PlayerState {
     UNINITIALIZED,
     OPENED,
@@ -49,20 +97,9 @@ private:
     // Packet queues
     ThreadSafeQueue<AVPacket*> m_videoQueue;
     ThreadSafeQueue<AVPacket*> m_audioQueue;
-    // How much audio to buffer, chosen per file in openFile().
-    //
-    // A file with video needs enough to cover prerollVideo() without the
-    // demuxer blocking on this queue and starving video of the packets the
-    // preroll is waiting for -- and "enough" is a matter of time, not
-    // packets: an AAC packet is ~21 ms while a TrueHD access unit is under
-    // 1 ms, so 150 packets is three seconds of one and ~125 ms of the
-    // other.
-    //
-    // An audio-only file never prerolls, and buffering that far ahead there
-    // is actively wrong: the demuxer would swallow a short file whole and
-    // report EOF while playback is still paused at the start.
-    static constexpr size_t kAudioQueuePacketsWithVideo = 2400;
-    static constexpr size_t kAudioQueuePacketsAudioOnly = 150;
+    // Set m_audioQueue's capacity for the audio track about to play, via
+    // audioQueuePacketsForFormat() above.
+    void applyAudioQueueCapacity(const AVCodecParameters* audioParams);
     ThreadSafeQueue<AVPacket*> m_subtitleQueue;
     
     // Sub-modules

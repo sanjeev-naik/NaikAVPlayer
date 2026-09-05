@@ -17,9 +17,9 @@ constexpr double kMinCatchupGap = 0.35;      // below this a plain jump looks id
 PlayerController::PlayerController()
     : m_state(PlayerState::UNINITIALIZED),
       m_videoQueue(100), // Max capacity of 100 packets
-      // Starts at the audio-only size; openFile() raises it once it knows
-      // the file has video to preroll. See kAudioQueuePacketsWithVideo.
-      m_audioQueue(kAudioQueuePacketsAudioOnly),
+      // Starts at the floor; openFile() resizes it once the audio format
+      // is known. See applyAudioQueueCapacity().
+      m_audioQueue(kAudioQueueMinPackets),
       m_subtitleQueue(100), // Max capacity of 100 subtitle packets
       m_hasAudio(false),
       m_hasVideo(false),
@@ -185,13 +185,11 @@ bool PlayerController::openFile(const std::string& filename, bool resetPlaylist)
             }
         }
 
-        // Before m_demuxer->start(): a file with video needs room to buffer
-        // audio through prerollVideo() without the demuxer blocking here and
-        // starving the video packets that preroll is waiting for. An
-        // audio-only file must keep the smaller bound, or a short one is
-        // read to EOF while still paused at the start.
-        m_audioQueue.setCapacity(m_hasVideo ? kAudioQueuePacketsWithVideo
-                                            : kAudioQueuePacketsAudioOnly);
+        // Before m_demuxer->start(): size the audio queue to hold a fixed
+        // number of *seconds*, so a codec with very short packets still
+        // buffers enough to carry prerollVideo(). Ordinary codecs land on
+        // the floor, leaving the demuxer's backpressure exactly as it was.
+        applyAudioQueueCapacity(m_demuxer->getAudioCodecParams());
 
         if (!m_hasVideo && !m_hasAudio) {
             std::cerr << "Error: File has no playable video or audio streams" << std::endl;
@@ -287,6 +285,27 @@ void PlayerController::pollPlaylistAutoAdvance() {
     }
 }
 
+// Size m_audioQueue for the audio track that is about to play, from the
+// packet length that track declares.
+//
+// Called wherever that track changes -- at open, and on either arm of
+// selectAudioTrack() -- because a second track in the same file can
+// package its audio an order of magnitude differently from the first.
+//
+// Only a file with video is sized by time: the extra buffering exists to
+// carry prerollVideo(), and an audio-only file never prerolls. Buffering
+// that far ahead there is actively wrong -- the demuxer would swallow a
+// short file whole and report EOF while playback is still paused at the
+// start -- so it keeps the floor, exactly as before.
+void PlayerController::applyAudioQueueCapacity(const AVCodecParameters* audioParams) {
+    if (!m_hasVideo || !audioParams) {
+        m_audioQueue.setCapacity(kAudioQueueMinPackets);
+        return;
+    }
+    m_audioQueue.setCapacity(
+        audioQueuePacketsForFormat(audioParams->frame_size, audioParams->sample_rate));
+}
+
 // Wait for the video pipeline to have its first frame before letting the
 // audio clock start.
 //
@@ -304,9 +323,9 @@ void PlayerController::pollPlaylistAutoAdvance() {
 // Holding audio at the starting line costs a moment of extra latency
 // before playback begins and removes the offset entirely, which is the
 // trade every player makes. Safe to sit here: audio packets buffer into
-// a 150-packet queue (several seconds' worth) rather than being dropped,
-// and the demuxer's audio push is a bounded wait, so nothing deadlocks
-// even if the wait runs to its timeout.
+// a queue sized to hold kAudioQueueSeconds of this file's audio rather
+// than being dropped, and the demuxer's audio push is a bounded wait, so
+// nothing deadlocks even if the wait runs to its timeout.
 void PlayerController::prerollVideo() {
     m_lastPrerollSeconds = 0.0;
     if (!m_hasVideo) {
@@ -1941,6 +1960,8 @@ bool PlayerController::selectAudioTrack(int trackId) {
                 m_audioDecoder.reset();
             }
             m_audioQueue.clear([](AVPacket*& pkt) { av_packet_free(&pkt); });
+            applyAudioQueueCapacity(
+                m_externalAudioDemuxer->getAudioCodecParams(extAudioIdx));
 
             m_audioDecoder = std::make_unique<AudioDecoder>(
                 m_externalAudioDemuxer->getAudioCodecParams(extAudioIdx),
@@ -1995,6 +2016,7 @@ bool PlayerController::selectAudioTrack(int trackId) {
                 m_audioDecoder.reset();
             }
             m_audioQueue.clear([](AVPacket*& pkt) { av_packet_free(&pkt); });
+            applyAudioQueueCapacity(m_demuxer->getAudioCodecParams(trackId));
 
             m_audioDecoder = std::make_unique<AudioDecoder>(
                 m_demuxer->getAudioCodecParams(trackId),

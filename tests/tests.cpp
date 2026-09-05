@@ -3258,6 +3258,67 @@ int main(int argc, char* argv[]) {
     }
 
     // -------------------------------------------------------------
+    // Audio packet queue sizing (audioQueuePacketsForFormat). Pure
+    // arithmetic on a stream's declared packet length -- no SDL, no
+    // media file -- so it sits with the other pure-logic blocks here.
+    // -------------------------------------------------------------
+    {
+        std::cout << "Running audio queue sizing unit tests..." << std::endl;
+
+        // Ordinary codecs: three seconds already fits inside the floor,
+        // so the queue keeps exactly the bound that has always shipped
+        // and the demuxer's backpressure is unchanged.
+        test_assert(audioQueuePacketsForFormat(1024, 44100) == kAudioQueueMinPackets,
+                    "audioQueuePacketsForFormat() leaves AAC 44.1 kHz on the floor");
+        test_assert(audioQueuePacketsForFormat(1024, 48000) == kAudioQueueMinPackets,
+                    "audioQueuePacketsForFormat() leaves AAC 48 kHz on the floor");
+        test_assert(audioQueuePacketsForFormat(960, 48000) == kAudioQueueMinPackets,
+                    "audioQueuePacketsForFormat() leaves 20 ms Opus packets on the floor");
+
+        // TrueHD: 40 samples at 48 kHz is 0.83 ms per access unit, so
+        // three seconds needs 3600 of them -- the case the flat 150
+        // packets (~125 ms) could not cover, starving prerollVideo().
+        test_assert(audioQueuePacketsForFormat(40, 48000) == 3600,
+                    "audioQueuePacketsForFormat() sizes TrueHD to 3600 packets for 3 s");
+        test_assert(audioQueuePacketsForFormat(40, 48000) *
+                        (40.0 / 48000.0) >= kAudioQueueSeconds,
+                    "audioQueuePacketsForFormat() holds at least kAudioQueueSeconds of TrueHD");
+
+        // A stream that declares no packet length gets the floor rather
+        // than a division by zero -- this is what the pre-existing
+        // behaviour was for every file.
+        test_assert(audioQueuePacketsForFormat(0, 48000) == kAudioQueueMinPackets,
+                    "audioQueuePacketsForFormat() falls back to the floor with no frame size");
+        test_assert(audioQueuePacketsForFormat(1024, 0) == kAudioQueueMinPackets,
+                    "audioQueuePacketsForFormat() falls back to the floor with no sample rate");
+        test_assert(audioQueuePacketsForFormat(-40, -48000) == kAudioQueueMinPackets,
+                    "audioQueuePacketsForFormat() falls back to the floor on negative input");
+
+        // The ceiling stops a pathologically short packet (a raw PCM
+        // stream declaring one sample per packet would want 144000)
+        // turning the queue into an unbounded read-ahead buffer.
+        test_assert(audioQueuePacketsForFormat(1, 48000) == kAudioQueueMaxPackets,
+                    "audioQueuePacketsForFormat() clamps a 1-sample packet to the ceiling");
+
+        // Shorter packets never ask for fewer of them.
+        size_t previous = 0;
+        bool monotonic = true;
+        for (int frameSize : {4096, 2048, 1024, 512, 256, 128, 64, 40, 16, 8, 4, 2, 1}) {
+            const size_t packets = audioQueuePacketsForFormat(frameSize, 48000);
+            if (packets < previous || packets < kAudioQueueMinPackets ||
+                packets > kAudioQueueMaxPackets) {
+                monotonic = false;
+                break;
+            }
+            previous = packets;
+        }
+        test_assert(monotonic,
+                    "audioQueuePacketsForFormat() rises with shorter packets and stays within its bounds");
+
+        std::cout << "Audio queue sizing unit tests PASSED!" << std::endl;
+    }
+
+    // -------------------------------------------------------------
     // HDR tone mapping unit tests (naikav::video::ToneMapper). Pure
     // math on lookup tables -- no SDL, no FFmpeg, no media file --
     // so these sit alongside the Playlist tests above rather than in
