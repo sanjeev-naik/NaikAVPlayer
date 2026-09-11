@@ -632,6 +632,23 @@ void VideoDecoder::releaseHdrContexts() {
   }
   m_hdrTargetWidth = 0;
   m_hdrTargetHeight = 0;
+
+  // The picture-adjustment context lives and dies with these: it is the
+  // same kind of resource, allocated lazily by the same conversion step,
+  // and nothing else in the decoder holds a reference to it.
+  if (m_colorRgbCtx) {
+#if NAIKAV_HAVE_SWS_THREADED
+    sws_free_context(&m_colorRgbCtx);
+#else
+    sws_freeContext(m_colorRgbCtx);
+    m_colorRgbCtx = nullptr;
+#endif
+  }
+  m_colorSrcWidth = 0;
+  m_colorSrcHeight = 0;
+  m_colorSrcFormat = AV_PIX_FMT_NONE;
+  m_colorTargetWidth = 0;
+  m_colorTargetHeight = 0;
 }
 
 // HDR -> SDR path. Runs instead of the plain sws_scale fallback whenever
@@ -654,7 +671,8 @@ void VideoDecoder::releaseHdrContexts() {
 // also shrinks the per-pixel tone mapping work rather than adding to it.
 bool VideoDecoder::toneMapFrame(const AVFrame *srcFrame, int targetW,
                                 int targetH,
-                                const naikav::video::HdrToneMapSettings &settings) {
+                                const naikav::video::HdrToneMapSettings &settings,
+                                const naikav::video::ColorAdjustSettings &color) {
   if (!srcFrame || targetW <= 0 || targetH <= 0) {
     return false;
   }
@@ -699,7 +717,12 @@ bool VideoDecoder::toneMapFrame(const AVFrame *srcFrame, int targetW,
   const float srcPeak = selectSourcePeakNits(settings.sourcePeakNits,
                                             masteringNits, contentLightNits,
                                             dynamicPeak);
-  if (!m_toneMapper.configure(transfer, srcPeak, settings.targetPeakNits)) {
+  // The picture adjustment rides along in the tables rather than as a
+  // second pass over the frame -- see ToneMapper::configure(). The guard
+  // inside configure() means passing it every frame costs a comparison,
+  // not a rebuild.
+  if (!m_toneMapper.configure(transfer, srcPeak, settings.targetPeakNits,
+                              color)) {
     return false;
   }
 
@@ -899,9 +922,221 @@ bool VideoDecoder::toneMapFrame(const AVFrame *srcFrame, int targetW,
   return true;
 }
 
+#if !NAIKAV_HAVE_SWS_THREADED
+// Which YUV -> RGB coefficients a frame's colorspace tag calls for.
+//
+// swscale defaults to BT.601 when it is not told otherwise, and putting
+// BT.601 coefficients through a BT.709 HD source is a visible hue error
+// -- greens and reds land in the wrong place. The plain YUV path never
+// had to care, because it stays in YUV and hands SDL the tag to convert
+// from (see getSDLColorspace in main.cpp); the moment this path converts
+// to RGB itself, the choice becomes ours to get right.
+//
+// The unspecified case mirrors getSDLColorspace's fallback exactly, so
+// that switching the picture adjustment on does not change the
+// colorimetry of a stream that never declared any.
+static int swsColorspaceFor(const AVFrame *frame) {
+  switch (frame->colorspace) {
+  case AVCOL_SPC_BT709:
+    return SWS_CS_ITU709;
+  case AVCOL_SPC_BT2020_NCL:
+  case AVCOL_SPC_BT2020_CL:
+    return SWS_CS_BT2020;
+  case AVCOL_SPC_BT470BG:
+  case AVCOL_SPC_SMPTE170M:
+    return SWS_CS_SMPTE170M;
+  case AVCOL_SPC_SMPTE240M:
+    return SWS_CS_SMPTE240M;
+  default:
+    return (frame->width >= 1280 || frame->height >= 720) ? SWS_CS_ITU709
+                                                          : SWS_CS_SMPTE170M;
+  }
+}
+#endif  // !NAIKAV_HAVE_SWS_THREADED
+
+// Picture-adjustment path for frames the tone mapper does not handle:
+// SDR sources, and HDR ones with tone mapping switched off. Runs instead
+// of the plain sws_scale fallback whenever a slider has been moved off
+// neutral.
+//
+// Output is RGB24, not YUV420P, which is the same choice toneMapFrame()
+// makes and for the same two reasons. The adjustment is defined on
+// gamma-encoded R'G'B' (see ColorAdjust.hpp) and applying it in
+// subsampled YUV would need a chroma upsample first, which costs more
+// than converting outright; and the renderer already uploads RGB24
+// directly, so there is no conversion back.
+//
+// Cost is one swscale pass plus a few float ops per pixel. It is paid
+// only while the adjustment is active: at neutral, convertFrame() never
+// calls this and the frame keeps its zero-copy or YUV420P route.
+bool VideoDecoder::colorAdjustFrame(
+    const AVFrame *srcFrame, int targetW, int targetH,
+    const naikav::video::ColorAdjustSettings &color) {
+  if (!srcFrame || targetW <= 0 || targetH <= 0) {
+    return false;
+  }
+  if (!m_colorAdjuster.configure(color)) {
+    // Neutral after clamping. Refusing here rather than producing an
+    // untouched RGB24 frame keeps the caller on the cheaper YUV path.
+    return false;
+  }
+
+  // sws_alloc_context() rather than sws_getContext(), for the reason
+  // toneMapFrame() gives: only the former exposes `threads`, and swscale
+  // slices a conversion across cores only when it has a thread count and
+  // is driven through sws_scale_frame(). This conversion is the whole
+  // added cost of the picture adjustment on a non-tone-mapped source, and
+  // single-threaded on a 4K frame that is tens of milliseconds -- past
+  // the frame budget on its own, which is what turns a slider drag into
+  // dropped frames.
+#if NAIKAV_HAVE_SWS_THREADED
+  if (!m_colorRgbCtx) {
+    m_colorRgbCtx = sws_alloc_context();
+    if (!m_colorRgbCtx) {
+      std::cerr << "Error: Could not allocate colour adjustment context"
+                << std::endl;
+      return false;
+    }
+    m_colorRgbCtx->threads = 0;  // one thread per core
+  }
+
+  // Kernel by direction, the same three cases and the same reasoning as
+  // the HDR unpack: nothing but chroma is resampled at native size,
+  // an area average is both better and cheaper when downscaling, and
+  // bicubic is for the upscale that has nothing to average over.
+  if (targetW == srcFrame->width && targetH == srcFrame->height) {
+    m_colorRgbCtx->flags = SWS_BILINEAR;
+  } else if (targetW <= srcFrame->width && targetH <= srcFrame->height) {
+    m_colorRgbCtx->flags = SWS_AREA;
+  } else {
+    m_colorRgbCtx->flags = SWS_BICUBIC;
+  }
+#else
+  // Legacy swscale: the context is opaque, the kernel goes in through
+  // sws_getCachedContext(), and there is no way to ask for more than one
+  // thread. Same picture, slower.
+  int legacyFlags;
+  if (targetW == srcFrame->width && targetH == srcFrame->height) {
+    legacyFlags = SWS_BILINEAR;
+  } else if (targetW <= srcFrame->width && targetH <= srcFrame->height) {
+    legacyFlags = SWS_AREA;
+  } else {
+    legacyFlags = SWS_BICUBIC;
+  }
+  const AVPixelFormat srcFormat = static_cast<AVPixelFormat>(srcFrame->format);
+  m_colorRgbCtx = sws_getCachedContext(
+      m_colorRgbCtx, srcFrame->width, srcFrame->height, srcFormat, targetW,
+      targetH, AV_PIX_FMT_RGB24, legacyFlags, nullptr, nullptr, nullptr);
+  if (!m_colorRgbCtx) {
+    std::cerr << "Error: Could not allocate colour adjustment context"
+              << std::endl;
+    return false;
+  }
+  {
+    // swscale defaults to BT.601 when it is not told otherwise, and
+    // BT.601 coefficients through a BT.709 HD source is a visible hue
+    // error. The plain YUV path never had to care -- it stays in YUV and
+    // hands SDL the tag to convert from (getSDLColorspace in main.cpp) --
+    // but the moment this path converts to RGB itself the choice is ours.
+    const int *invTable = sws_getCoefficients(swsColorspaceFor(srcFrame));
+    const int *table = sws_getCoefficients(SWS_CS_ITU709);
+    const int srcRange = (srcFrame->color_range == AVCOL_RANGE_JPEG) ? 1 : 0;
+    const int dstRange = 1;  // RGB output is always full range
+    // Neutral brightness/contrast/saturation on purpose. swscale has
+    // knobs of the same name, but they act on the YUV values with no
+    // defined colour model behind them; the adjustment this path exists
+    // for is applied afterwards, in encoded RGB, where it means the same
+    // thing as it does on the HDR path.
+    sws_setColorspaceDetails(m_colorRgbCtx, invTable, srcRange, table,
+                             dstRange, 0, 1 << 16, 1 << 16);
+  }
+#endif
+
+  m_colorSrcWidth = srcFrame->width;
+  m_colorSrcHeight = srcFrame->height;
+  m_colorSrcFormat = static_cast<AVPixelFormat>(srcFrame->format);
+  m_colorTargetWidth = targetW;
+  m_colorTargetHeight = targetH;
+
+  // A fresh output frame per call, for the reason toneMapFrame() gives:
+  // the decoded-frame queue still holds references to earlier outputs, so
+  // a recycled buffer would be rewritten under a frame still in flight.
+  AVFrame *outFrame = av_frame_alloc();
+  if (!outFrame) {
+    return false;
+  }
+  outFrame->format = AV_PIX_FMT_RGB24;
+  outFrame->width = targetW;
+  outFrame->height = targetH;
+  outFrame->pts = srcFrame->pts;
+  outFrame->pkt_dts = srcFrame->pkt_dts;
+  outFrame->color_range = AVCOL_RANGE_JPEG;
+  outFrame->colorspace = AVCOL_SPC_RGB;
+  // Carried through rather than rewritten: this path converts the
+  // packing and the YUV matrix, not the transfer function, so on a
+  // tone-mapping-off HDR frame the values really are still PQ or HLG and
+  // saying otherwise would be false. Equal to the source's on purpose --
+  // a mismatch here is what makes swscale insert a primaries or transfer
+  // conversion of its own on top of the packing change.
+  outFrame->color_primaries = srcFrame->color_primaries;
+  outFrame->color_trc = srcFrame->color_trc;
+
+  if (av_frame_get_buffer(outFrame, 32) < 0) {
+    std::cerr << "Error: Could not allocate colour adjusted output frame"
+              << std::endl;
+    av_frame_free(&outFrame);
+    return false;
+  }
+
+#if NAIKAV_HAVE_SWS_THREADED
+  // The dynamic API takes every colour property off the frames rather
+  // than from the context, so a stream that leaves its matrix
+  // unspecified would be converted with BT.601 coefficients -- a visible
+  // hue error on any BT.709 HD source. Say what it is explicitly, on a
+  // reference, using the same size-based fallback getSDLColorspace()
+  // applies, so that switching the adjustment on cannot change the
+  // colorimetry of a stream that never declared any.
+  const AVFrame *convertSrc = srcFrame;
+  AVFrame *taggedSrc = nullptr;
+  if (srcFrame->colorspace == AVCOL_SPC_UNSPECIFIED) {
+    taggedSrc = av_frame_alloc();
+    if (taggedSrc && av_frame_ref(taggedSrc, srcFrame) >= 0) {
+      taggedSrc->colorspace = (srcFrame->width >= 1280 || srcFrame->height >= 720)
+                                  ? AVCOL_SPC_BT709
+                                  : AVCOL_SPC_SMPTE170M;
+      convertSrc = taggedSrc;
+    } else if (taggedSrc) {
+      av_frame_free(&taggedSrc);
+    }
+  }
+
+  const int scaled = sws_scale_frame(m_colorRgbCtx, outFrame, convertSrc);
+  av_frame_free(&taggedSrc);
+#else
+  const int scaled =
+      sws_scale(m_colorRgbCtx, srcFrame->data, srcFrame->linesize, 0,
+                srcFrame->height, outFrame->data, outFrame->linesize);
+#endif
+  if (scaled < 0) {
+    std::cerr << "Error: colour adjustment unpack to RGB24 failed: " << scaled
+              << std::endl;
+    av_frame_free(&outFrame);
+    return false;
+  }
+
+  m_colorAdjuster.processRgb24(outFrame->data[0], outFrame->linesize[0],
+                               targetW, targetH);
+
+  av_frame_unref(m_yuvFrame);
+  av_frame_move_ref(m_yuvFrame, outFrame);
+  av_frame_free(&outFrame);
+  return true;
+}
+
 bool VideoDecoder::convertFrame(ResolutionOption option,
-                                naikav::video::HdrToneMapSettings toneMap,
-                                int displayWidth, int displayHeight) {
+                                const naikav::video::HdrToneMapSettings& toneMap,
+                                int displayWidth, int displayHeight,
+                                const naikav::video::ColorAdjustSettings& colorAdjust) {
   struct ConvertTimeTracker {
       std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
       MetricRing<256>& ring;
@@ -964,7 +1199,19 @@ bool VideoDecoder::convertFrame(ResolutionOption option,
       toneMap.enabled &&
       hdrTransferOf(srcFrame) != naikav::video::HdrTransfer::None;
 
-  bool useNative = isTargetOriginal && !wantsToneMap &&
+  // A picture adjustment off neutral has to break the native passthrough
+  // for the same reason tone mapping does, and one further one: that path
+  // hands the decoder's own frame straight through by reference, so there
+  // is no buffer of ours to write adjusted pixels into, and writing into
+  // that one would corrupt a frame the decoder still owns.
+  //
+  // An active picture adjustment that requires software conversion (brightness, contrast,
+  // or saturation) has to break native passthrough because it modifies pixel codes on CPU.
+  // In contrast, pure white-balance adjustments (temperature and tint) are handled via GPU
+  // texture modulation at render time, preserving the zero-copy native path with 0% CPU overhead.
+  const bool wantsColorAdjust = colorAdjust.requiresSoftwareConversion();
+
+  bool useNative = isTargetOriginal && !wantsToneMap && !wantsColorAdjust &&
                    (srcFrame->format == AV_PIX_FMT_YUV420P ||
                     srcFrame->format == AV_PIX_FMT_YUVJ420P ||
                     srcFrame->format == AV_PIX_FMT_NV12 ||
@@ -995,7 +1242,7 @@ bool VideoDecoder::convertFrame(ResolutionOption option,
     }
 
     const auto toneMapStart = std::chrono::steady_clock::now();
-    if (toneMapFrame(srcFrame, targetW, targetH, toneMap)) {
+    if (toneMapFrame(srcFrame, targetW, targetH, toneMap, colorAdjust)) {
       if (toneMap.adaptiveResolution) {
         const double toneMapMs =
             std::chrono::duration<double, std::milli>(
@@ -1013,6 +1260,7 @@ bool VideoDecoder::convertFrame(ResolutionOption option,
       m_allocatedTargetWidth = targetW;
       m_allocatedTargetHeight = targetH;
       m_lastFrameToneMapped = true;
+      m_lastFrameColorAdjusted = !colorAdjust.isNeutral();
       if (tempCpuFrame) {
         av_frame_free(&tempCpuFrame);
       }
@@ -1029,6 +1277,45 @@ bool VideoDecoder::convertFrame(ResolutionOption option,
               << std::endl;
   }
   m_lastFrameToneMapped = false;
+  m_lastFrameColorAdjusted = false;
+
+  if (wantsColorAdjust) {
+    // Capped to the display area for the same reason the tone-map branch
+    // above is: the cost here is strictly per output pixel, and the
+    // letterbox blit throws away anything larger than the window can
+    // show, so converting a full 4K frame for a 1080p window is work
+    // spent on pixels nobody sees. Measured on a 4K source with
+    // saturation off neutral, that was 42 ms a frame uncapped against
+    // roughly a quarter of that into a 1080p window -- the difference
+    // between dropping frames while a slider is being dragged and not.
+    //
+    // This does mean an active adjustment can hand back fewer pixels
+    // than the resolution selector asked for, which the plain YUV path
+    // never does. The trade is the same one the tone mapper already
+    // makes, and getPlaybackWidth()/Height() report what was really
+    // produced, so the HUD stays honest about it.
+    capToDisplaySize(targetW, targetH, displayWidth, displayHeight);
+    if (colorAdjustFrame(srcFrame, targetW, targetH, colorAdjust)) {
+      m_allocatedFormat = static_cast<AVPixelFormat>(srcFrame->format);
+      m_allocatedWidth = srcFrame->width;
+      m_allocatedHeight = srcFrame->height;
+      m_allocatedTargetWidth = targetW;
+      m_allocatedTargetHeight = targetH;
+      m_lastFrameColorAdjusted = true;
+      if (tempCpuFrame) {
+        av_frame_free(&tempCpuFrame);
+      }
+      av_frame_unref(m_decodedFrame);
+      return true;
+    }
+
+    // Same fallthrough reasoning as the tone-map path: an unadjusted
+    // picture beats no picture, and the HUD reports that the adjustment
+    // is not active rather than claiming it is.
+    std::cerr << "Warning: colour adjustment unavailable for this frame; "
+                 "falling back to direct conversion"
+              << std::endl;
+  }
 
   if (useNative) {
     // Keep track of the format/resolution for native frames
@@ -1037,6 +1324,7 @@ bool VideoDecoder::convertFrame(ResolutionOption option,
     m_allocatedFormat = static_cast<AVPixelFormat>(srcFrame->format);
     m_allocatedTargetWidth = targetW;
     m_allocatedTargetHeight = targetH;
+    m_lastFrameColorAdjusted = !colorAdjust.isNeutral();
 
     av_frame_unref(m_yuvFrame);
 
@@ -1141,6 +1429,7 @@ bool VideoDecoder::convertFrame(ResolutionOption option,
   if (tempCpuFrame) {
     av_frame_free(&tempCpuFrame);
   }
+  m_lastFrameColorAdjusted = !colorAdjust.isNeutral();
   av_frame_unref(m_decodedFrame);
   return true;
 }
@@ -1434,6 +1723,7 @@ ColorPipelineInfo VideoDecoder::getColorInfo() const {
   //    standard without this says nothing about whether the picture on
   //    screen was converted for an SDR display or just truncated.
   info.toneMapped = m_lastFrameToneMapped;
+  info.colorAdjusted = m_lastFrameColorAdjusted;
   if (m_lastFrameToneMapped && m_toneMapper.isReady()) {
     info.toneMapSourceNits = m_toneMapper.sourcePeakNits();
     info.toneMapTargetNits = m_toneMapper.targetPeakNits();

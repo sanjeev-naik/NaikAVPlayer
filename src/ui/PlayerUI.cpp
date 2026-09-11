@@ -250,6 +250,11 @@ void PlayerUI::draw(int windowWidth, int windowHeight,
     drawHdrPanel(windowWidth, windowHeight);
   }
 
+  // 3e. Picture / Colour Adjustment Panel
+  if (state != PlayerState::UNINITIALIZED && m_showColorPanel) {
+    drawColorPanel(windowWidth, windowHeight);
+  }
+
   // 4. Bottom Controls Bar Dock
   if (state != PlayerState::UNINITIALIZED && m_controlsVisible) {
     drawControlsBar(windowWidth, windowHeight);
@@ -1232,6 +1237,7 @@ void PlayerUI::drawControlsBar(int windowWidth, int windowHeight) {
   const float playlistButtonWidth = 32.0f;
   const float eqButtonWidth = 32.0f;
   const float hdrButtonWidth = 36.0f;
+  const float colorButtonWidth = 44.0f;
   const float muteButtonWidth = 32.0f;
   const float volumeSliderWidth = 70.0f;
   const float barRightPadding = 14.0f;
@@ -1249,8 +1255,8 @@ void PlayerUI::drawControlsBar(int windowWidth, int windowHeight) {
                                   stopBtnWidth + groupItemSpacing + seekBtnWidth + groupItemSpacing + loopBtnWidth;
 
   float rightGroupWidth = resolutionGroupWidth + speedButtonWidth + audioTrackButtonWidth + subButtonWidth +
-                          playlistButtonWidth + eqButtonWidth + hdrButtonWidth + muteButtonWidth +
-                          volumeSliderWidth + groupItemSpacing * 8.0f;
+                          playlistButtonWidth + eqButtonWidth + hdrButtonWidth + colorButtonWidth +
+                          muteButtonWidth + volumeSliderWidth + groupItemSpacing * 9.0f;
 
   float minCenterX = openButtonWidth + 16.0f;
   float maxCenterX = barWidth - rightGroupWidth - centerButtonsGroupWidth - barRightPadding - 10.0f;
@@ -1661,6 +1667,33 @@ void PlayerUI::drawControlsBar(int windowWidth, int windowHeight) {
 
   ImGui::SameLine(0.0f, groupItemSpacing);
 
+  // Color button -- opens the picture adjustment panel. Highlighted when
+  // the panel is open, as the buttons above are, and additionally tinted
+  // when the adjustment itself is off neutral: this is the one panel
+  // whose settings keep changing the picture after it is closed, so
+  // there has to be something on screen saying so.
+  const bool colorAdjustActive = m_controller.isColorAdjustActive();
+  bool colorButtonHighlighted = m_showColorPanel || colorAdjustActive;
+  if (colorButtonHighlighted) {
+    ImGui::PushStyleColor(ImGuiCol_Button,
+                          m_showColorPanel
+                              ? ImVec4(0.12f, 0.53f, 0.90f, 0.80f)
+                              : ImVec4(0.90f, 0.55f, 0.12f, 0.80f));
+  }
+  if (ImGui::Button("Color", ImVec2(colorButtonWidth, 28))) {
+    toggleColorPanel();
+  }
+  if (colorButtonHighlighted) {
+    ImGui::PopStyleColor();
+  }
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip(colorAdjustActive
+                          ? "Picture Adjustment (active) - [Shift+C]"
+                          : "Picture Adjustment - [Shift+C]");
+  }
+
+  ImGui::SameLine(0.0f, groupItemSpacing);
+
   // Mute button
   if (m_isMuted) {
     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(1.00f, 0.20f, 0.20f, 0.80f));
@@ -1840,6 +1873,18 @@ void PlayerUI::drawDiagnosticsHUD(int windowWidth, int windowHeight) {
         ImGui::TextColored(ImVec4(0.95f, 0.35f, 0.35f, 1.0f),
                            "Off (HDR shown uncorrected)");
       }
+    }
+
+    // Shown for every source, unlike the tone-mapping line above: the
+    // picture adjustment applies to all of them, so "off" is a real
+    // answer here rather than "not applicable". Read-only, like the rest
+    // of the HUD -- the controls live in the picture panel (Shift+C).
+    ImGui::Text("Picture Adjust: ");
+    ImGui::SameLine();
+    if (colorInfo.colorAdjusted) {
+      ImGui::TextColored(ImVec4(0.0f, 0.83f, 0.4f, 1.0f), "Active");
+    } else {
+      ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Neutral");
     }
   } else {
     ImGui::Text("Media Type: ");
@@ -3050,6 +3095,186 @@ void PlayerUI::drawHdrPanel(int windowWidth, int windowHeight) {
       ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.75f, 1.0f),
                          "  Tone mapping at %dx%d", pw, ph);
     }
+  }
+
+  if (m_hudFont)
+    ImGui::PopFont();
+
+  ImGui::End();
+}
+
+// Picture adjustment: brightness, contrast, saturation, white balance.
+//
+// Unlike the HDR panel next door, nothing here is gated on what the
+// source is. The tone mapper's controls are peak-luminance figures for a
+// curve that only exists on a PQ or HLG source, so on an SDR file they
+// correctly read "not applicable"; these act on the encoded picture and
+// so mean the same thing on every file the player can open.
+void PlayerUI::drawColorPanel(int windowWidth, int windowHeight) {
+  if (!m_showColorPanel)
+    return;
+
+  const float panelWidth = 380.0f;
+
+  // Offset down from the HDR panel's corner so that opening both does not
+  // stack one exactly on top of the other.
+  ImGui::SetNextWindowPos(ImVec2(windowWidth - panelWidth - 20.0f, 100.0f),
+                          ImGuiCond_FirstUseEver);
+  ImGui::SetNextWindowSize(ImVec2(panelWidth, 0.0f), ImGuiCond_FirstUseEver);
+
+  const float maxPanelHeight = std::max(160.0f, windowHeight - 80.0f);
+  ImGui::SetNextWindowSizeConstraints(ImVec2(panelWidth, 0.0f),
+                                      ImVec2(FLT_MAX, maxPanelHeight));
+
+  // ImGuiWindowFlags_NoNav for the reason the HDR and playlist panels
+  // have it: without it, focusing this window claims
+  // io.WantCaptureKeyboard and swallows the global Space/seek bindings
+  // while it is open.
+  if (!ImGui::Begin("Picture Adjustment", &m_showColorPanel,
+                    ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav |
+                        ImGuiWindowFlags_AlwaysAutoResize)) {
+    ImGui::End();
+    return;
+  }
+
+  if (m_hudFont)
+    ImGui::PushFont(m_hudFont);
+
+  ColorPipelineInfo colorInfo = m_controller.getColorInfo();
+  naikav::video::ColorAdjustSettings settings =
+      m_controller.getColorAdjustSettings();
+
+  // Status first, same as the HDR panel: say what the pipeline is doing
+  // before offering the controls that change it.
+  ImGui::Text("Status: ");
+  ImGui::SameLine();
+  if (colorInfo.colorAdjusted) {
+    ImGui::TextColored(ImVec4(0.0f, 0.83f, 0.4f, 1.0f), "Active%s",
+                       colorInfo.toneMapped ? "  [folded into tone mapping]"
+                                            : (settings.isGpuModulationEligible()
+                                                   ? "  [GPU accelerated]"
+                                                   : "  [software pass]"));
+  } else if (!settings.isNeutral()) {
+    // Off neutral, but no converted frame has carried the settings yet --
+    // between opening a file and the first frame, or after a conversion
+    // failed and fell back to the unadjusted path. Saying "active" here
+    // would be a claim the pipeline has not backed up.
+    ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.35f, 1.0f), "Pending");
+  } else {
+    ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Neutral (no change)");
+  }
+
+  ImGui::Separator();
+
+  // Every slider below applies live and defers the disk write, for the
+  // reason PlayerController::setColorAdjustSettings() documents: the
+  // picture has to track the drag, but persisting per drag frame would
+  // mean one seek per drag frame while paused, which tears the pipeline
+  // down and refills it dozens of times a second.
+  bool changed = false;
+  bool settled = false;
+
+  ImGui::SetNextItemWidth(180.0f);
+  changed |= ImGui::SliderFloat("Brightness", &settings.brightness,
+                                naikav::video::kColorBrightnessMin,
+                                naikav::video::kColorBrightnessMax, "%.0f");
+  settled |= ImGui::IsItemDeactivatedAfterEdit();
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("Shifts every code value up or down. Lifts or crushes\n"
+                      "black along with everything else -- for opening up a\n"
+                      "dark picture, contrast is usually the better control.");
+  }
+
+  ImGui::SetNextItemWidth(180.0f);
+  changed |= ImGui::SliderFloat("Contrast", &settings.contrast,
+                                naikav::video::kColorContrastMin,
+                                naikav::video::kColorContrastMax, "%.2f");
+  settled |= ImGui::IsItemDeactivatedAfterEdit();
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("Stretches the picture away from mid grey. Above 1\n"
+                      "clips highlights and shadows; below 1 flattens.");
+  }
+
+  ImGui::SetNextItemWidth(180.0f);
+  changed |= ImGui::SliderFloat("Saturation", &settings.saturation,
+                                naikav::video::kColorSaturationMin,
+                                naikav::video::kColorSaturationMax, "%.2f");
+  settled |= ImGui::IsItemDeactivatedAfterEdit();
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("Distance of each pixel from its own brightness.\n"
+                      "0 is monochrome, 1 leaves the picture alone.");
+  }
+
+  ImGui::Separator();
+
+  // Logarithmic, because a linear kelvin slider spends two thirds of its
+  // travel above neutral while the eye reads the scale closer to evenly
+  // in mireds. Log on kelvin is a good enough stand-in for that, and it
+  // is the same flag the HDR panel's source-peak slider uses.
+  ImGui::SetNextItemWidth(180.0f);
+  changed |= ImGui::SliderFloat("Temperature", &settings.temperatureK,
+                                naikav::video::kColorTemperatureMin,
+                                naikav::video::kColorTemperatureMax, "%.0f K",
+                                ImGuiSliderFlags_Logarithmic);
+  settled |= ImGui::IsItemDeactivatedAfterEdit();
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("White point to render as white. Lower is warmer and\n"
+                      "higher is cooler -- the same direction as a camera's\n"
+                      "white-balance dial, which is the opposite of what a\n"
+                      "hotter number suggests.\n\n"
+                      "6500 K is neutral and costs nothing.");
+  }
+
+  ImGui::SetNextItemWidth(180.0f);
+  changed |= ImGui::SliderFloat("Tint", &settings.tint,
+                                naikav::video::kColorTintMin,
+                                naikav::video::kColorTintMax, "%.0f");
+  settled |= ImGui::IsItemDeactivatedAfterEdit();
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("The green-magenta axis, at right angles to\n"
+                      "temperature. Negative is green, positive magenta.");
+  }
+
+  if (changed) {
+    m_controller.setColorAdjustSettings(settings);
+  }
+  if (settled) {
+    m_controller.persistColorSettings();
+  }
+
+  ImGui::Separator();
+
+  if (ImGui::Button("Reset to neutral")) {
+    m_controller.resetColorAdjustSettings();
+    m_controller.persistColorSettings();
+    showToast("Picture adjustment reset", false, 2.0);
+  }
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("Back to the identity, which also puts the pipeline\n"
+                      "back on its cheaper path -- see the note below.");
+  }
+
+  // Worth stating plainly, because it is not guessable: on a source the
+  // tone mapper handles this is free, folded into tables that were being
+  // built anyway. On anything else it is the difference between handing
+  // the decoder's own frame straight to the renderer and running a full
+  // conversion pass over every frame.
+  ImGui::Separator();
+  if (settings.isNeutral()) {
+    ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.75f, 1.0f),
+                       "Neutral costs nothing -- frames take the same\n"
+                       "path they would with this panel closed.");
+  } else if (colorInfo.toneMapped) {
+    ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.75f, 1.0f),
+                       "Free on this file: folded into tone mapping.");
+  } else if (settings.isGpuModulationEligible()) {
+    ImGui::TextColored(ImVec4(0.0f, 0.83f, 0.4f, 1.0f),
+                       "Hardware accelerated: white balance & tint\n"
+                       "applied on GPU with zero CPU overhead.");
+  } else {
+    ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.75f, 1.0f),
+                       "Costs one conversion pass per frame while off\n"
+                       "neutral. Reset above to get that back.");
   }
 
   if (m_hudFont)

@@ -350,7 +350,7 @@ The user interface uses Dear ImGui with frosted translucency overlay, high-DPI f
 - **4 Color Palettes**: `Cyberpunk` (Cyan/Magenta), `Sunset Fire` (Amber/Hot Pink), `Mint Emerald` (Mint/Emerald), and `Electric Violet` (Aqua/Purple).
 
 ### Diagnostics HUD & Telemetry Metrics
-- **Hotkey `D`** or CLI flag `--metrics`: Toggles real-time HUD displaying player states, playback clock drift, hardware/software decoder details, queue depths, frame pacing, and HDR/Colorimetry characteristics. The HDR section is read-only here -- it reports the tone mapping state; the controls that change it live in the HDR panel (`C`).
+- **Hotkey `D`** or CLI flag `--metrics`: Toggles real-time HUD displaying player states, playback clock drift, hardware/software decoder details, queue depths, frame pacing, and HDR/Colorimetry characteristics. The HDR section is read-only here -- it reports the tone mapping state and whether the picture adjustment is active; the controls that change them live in the HDR panel (`C`) and the picture adjustment panel (`Shift+C`).
 - **The overlay does not cost frames.** The five video properties it reads every frame are fetched with `try_lock` against the decoder mutex, falling back to the last known value when the video thread is mid-conversion. Before that, those reads blocked the render thread for a median of 80 ms per frame against a 16.7 ms budget -- turning the HUD on measurably slowed playback, which defeats the point of a diagnostic. A displayed value may therefore be one frame stale under load; these are properties that change rarely or never during playback.
 
 ### Audio Processing & DSP Panel
@@ -365,6 +365,26 @@ The user interface uses Dear ImGui with frosted translucency overlay, high-DPI f
 - **Follow HDR10+ / Dolby Vision metadata**: On by default. Maps each frame from the peak that frame actually reaches instead of mapping the whole file from one static peak. Only does anything for files that carry per-frame metadata — and a hardware decoder may strip it, in which case the status line will not say `[dynamic]` and the panel says so explicitly rather than looking broken.
 - **Adapt resolution to keep frame rate**: On by default. Tone maps at a smaller size when the machine cannot keep up and returns to full size when it can, showing the size currently in use. Costs sharpness under load; turning it off means late and dropped frames instead, which on heavy content looks like flashing.
 - Settings apply to the next decoded frame (no seek or reopen needed) and persist in `player_settings.txt` as `hdr_tone_map_enabled`, `hdr_target_peak_nits`, `hdr_source_peak_nits`, `hdr_dynamic_metadata` and `hdr_adaptive_resolution`. The two sliders apply live while dragging and only write to disk once released, so a drag does not re-seek the pipeline dozens of times a second. All remain adjustable while an SDR file is playing, in which case they apply to the next HDR file opened.
+
+### Picture Adjustment Panel
+- **Hotkey `Shift+C`** or Dock `[Color]` Button: Toggles the picture adjustment panel — brightness, contrast, saturation and white balance. Shares the `C` mnemonic with the HDR panel because the two are the colour pair; every plain letter that would have read as *picture* was already bound.
+- **Applies to every source, HDR and SDR alike.** This is the difference between this panel and the HDR one next door: the tone mapper's controls are peak-luminance figures for a curve that only exists on a PQ or HLG source, so on an SDR file they correctly read *not applicable*. These act on the encoded picture, so they mean the same thing on every file the player can open.
+- **Status**: `Neutral`, `Pending` (settings are off neutral but no converted frame has carried them yet), or `Active` — marked `[folded into tone mapping]` when the frame is also being tone mapped, or `[hardware accelerated]` when white balance & tint are applied on the GPU.
+- **Brightness** (-100 to +100): Additive offset in 8-bit code units. Lifts or crushes black along with everything else; for opening up a dark picture, contrast is usually the better control.
+- **Contrast** (0.25 to 3.0): Multiplier about mid grey. Mid grey is the pivot and survives any setting; above 1 clips both ends.
+- **Saturation** (0.0 to 3.0): Distance of each pixel from its own BT.709 luma. 0 is monochrome.
+- **Temperature** (3000 K to 12000 K, logarithmic): The white point to render as white. **Lower is warmer, higher is cooler** — the same direction as a camera's white-balance dial, which is the opposite of what a hotter number suggests. 6500 K is neutral. These are real white-point gains derived from the Planckian locus (Kim et al. cubic fit), not a cosmetic tint, so the ends of the range are genuinely strong. Logarithmic because a linear kelvin slider would spend two thirds of its travel above neutral.
+- **Tint** (-100 to +100): The green-magenta axis, at right angles to temperature. Negative green, positive magenta.
+- **Reset to neutral**: Back to the identity, which also puts the pipeline back on its cheaper path.
+- **Cost & Acceleration Tiers**:
+  - **Neutral**: An exact no-op — frames take the same path they would with the panel closed, byte for byte.
+  - **Folded into Tone Mapping**: On an HDR source being tone mapped, the adjustment is **free**: white balance, brightness, and contrast fold directly into the tone mapper's existing output lookup table, and saturation runs inside the existing tone mapping loop.
+  - **Hardware Accelerated on GPU (White Balance & Tint)**: When adjusting temperature or tint alone while brightness, contrast, and saturation remain neutral, the video pipeline **stays on the zero-copy native hardware path** (`useNative = true`) in planar YUV. Linear per-channel gains are applied directly on the GPU during texture presentation via SDL3's `SDL_SetTextureColorModFloat`. CPU overhead is **~0%**, allowing high-framerate 4K and smooth playback even on low-power devices like Raspberry Pi. The panel displays: *"Hardware accelerated: white balance & tint applied on GPU with zero CPU overhead."*
+  - **Software CPU Conversion (Non-Linear Controls)**: Adjusting brightness, contrast, or saturation requires pixel-level manipulation that cannot be handled via a single texture multiplier. This falls back to the multi-threaded CPU conversion pass (`ColorAdjuster`).
+- **Resolution while active**: When software CPU conversion is active, the adjusted path converts at no more than the size the window can actually show (`capToDisplaySize`), because the cost is strictly per output pixel and the letterbox blit discards the rest. So an active adjustment can hand back fewer pixels than the resolution selector asked for — the plain YUV path never does this. On a 4K source with saturation off neutral that is the difference between 42 ms and roughly a quarter of that into a 1080p window. The Diagnostics HUD reports the size really produced.
+- Settings apply to the next decoded frame (no seek or reopen needed) and persist in `player_settings.txt` as `color_brightness`, `color_contrast`, `color_saturation`, `color_temperature_k` and `color_tint`. Sliders apply live while dragging and only write to disk once released, for the same reason the HDR sliders do: while paused, persisting means a re-decode, and one per drag frame would tear the pipeline down dozens of times a second. Values loaded from the settings file are range-checked against the same limits the sliders use, so a hand-edited file cannot park the pipeline somewhere the UI has no way to undo.
+- **One corner worth knowing**: on an HDR file with tone mapping switched *off*, turning an adjustment on also changes how the uncorrected picture is tagged for the display (packed RGB is always presented as sRGB, where the YUV path would have been presented as BT.2020), so the picture shifts by more than the adjustment alone. That mode is a deliberately uncorrected view in the first place; with tone mapping on, which is the default, this does not arise.
+- The Diagnostics HUD (`D`) carries a matching read-only `Picture Adjust:` line. Unlike its `Tone Mapping:` line, that one is shown for every source — *off* is a real answer here rather than *not applicable*.
 
 ### Keyboard Shortcuts & Gestures
 
@@ -389,6 +409,7 @@ The user interface uses Dear ImGui with frosted translucency overlay, high-DPI f
 | **`D`** | Toggle Diagnostics HUD overlay & Telemetry metrics |
 | **`A`** | Toggle Audio Processing panel (EQ, noise gate, compressor, multiband compressor, limiter, crossover, loudness, 3D surround, widener, balance, channel/device/format selection) |
 | **`C`** | Toggle HDR -> SDR Tone Mapping panel (on/off toggle, display peak luminance) |
+| **`Shift+C`** | Toggle Picture Adjustment panel (brightness, contrast, saturation, colour temperature, tint) |
 | **`Escape`** | Exit Fullscreen (if in fullscreen) or Exit application |
 
 ---
@@ -408,7 +429,7 @@ src/
 ├── playlist/  header-only queue/repeat/shuffle/M3U8 module (see Section 5f)
 ├── subtitle/  SubtitleDecoder.{hpp,cpp}, SubtitleTrack.hpp — decoding, parsing, sync, sanitization
 ├── ui/        PlayerUI.{hpp,cpp} — ImGui controls dock, diagnostics HUD, audio panel, subtitle overlay
-└── video/     VideoDecoder.{hpp,cpp}, ToneMapper.hpp, FrameExporter.hpp — HW/SW decode, frame conversion, HDR→SDR tone mapping, PNG screenshot export
+└── video/     VideoDecoder.{hpp,cpp}, ToneMapper.hpp, ColorAdjust.hpp, FrameExporter.hpp — HW/SW decode, frame conversion, HDR→SDR tone mapping, picture adjustment, PNG screenshot export
 ```
 
 
@@ -640,7 +661,7 @@ Six self-contained programs under `tests/`, none of which are part of the `ctest
 |---|---|---|
 | `NaikAVPlayer_dsp_repro` | `tests/dsp_repro_standalone.cpp` | Exercises the DSP chain through the **real** SDL audio device path, with none of the `SDL_OpenAudioDeviceStream` mocking `tests.cpp` uses. That mock falls back to a disconnected `SDL_CreateAudioStream()` with no callback bound whenever the real device open fails in a sandboxed runner, meaning `decodeAndResample()` — and therefore the whole DSP chain — never actually executes under a real audio callback thread in the normal suite. This program makes it run, matching what the GUI app does. |
 | `NaikAVPlayer_colorinfo_race` | `tests/colorinfo_race_repro.cpp` | Stress-tests the `getColorInfo()` data race between the UI thread (which calls it every frame for the Diagnostics HUD) and the video decode thread, which concurrently mutates and frees the same `AVFrame`. A real render loop only calls it once per frame, so the race was hard to hit organically. |
-| `NaikAVPlayer_hdr_bench` | `tests/hdr_bench_standalone.cpp` | Per-frame decode and conversion cost of the HDR path against a real file, without the window, UI or audio in the way — which is how every tone-mapping figure in these docs was measured. Also the tool for checking that a change did not alter the picture: it prints an FNV checksum of the converted frame and `--dump <path>` writes the raw pixels for comparison between builds. |
+| `NaikAVPlayer_hdr_bench` | `tests/hdr_bench_standalone.cpp` | Per-frame decode and conversion cost of the HDR path against a real file, without the window, UI or audio in the way — which is how every tone-mapping figure in these docs was measured. Also the tool for checking that a change did not alter the picture: it prints an FNV checksum of the converted frame and `--dump <path>` writes the raw pixels for comparison between builds. `--brightness/--contrast/--saturation/--temperature/--tint` drive the picture adjustment, and `--drag` moves the tint a little on every frame the way a slider being dragged does — which is what a settled value alone cannot measure, since the cost of a changed value is in rebuilding tables rather than in using them. Note that this clip opens on black, where saturation and white balance are correctly no-ops; ask for a few hundred frames before comparing checksums. |
 
 **Built manually** (not wired into CMake; the smoke test needs a real audio device):
 

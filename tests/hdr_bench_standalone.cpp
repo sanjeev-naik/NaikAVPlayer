@@ -40,7 +40,8 @@ int main(int argc, char** argv) {
         std::fprintf(stderr,
                      "usage: %s <file> [frames] [--no-tonemap] [--1080p|--720p] "
                      "[--window WxH] [--no-dynamic] [--trace-peaks] [--software] [--no-adaptive] "
-                     "[--dump PATH]\n",
+                     "[--dump PATH] [--tint N] [--saturation N] [--brightness N] "
+                     "[--contrast N] [--temperature K] [--drag]\n",
                      argv[0]);
         return 2;
     }
@@ -54,6 +55,12 @@ int main(int argc, char** argv) {
     bool adaptiveRes = true;
     const char* dumpPath = nullptr;
     bool tracePeaks = false;
+    naikav::video::ColorAdjustSettings color;
+    // --drag re-sends a slightly different value on every frame, which is
+    // what a slider being dragged actually does to the pipeline. Without
+    // it a bench run only ever measures the settled case and misses
+    // anything that rebuilds tables on a changed value.
+    bool dragColor = false;
 
     for (int i = 2; i < argc; ++i) {
         std::string a = argv[i];
@@ -63,6 +70,12 @@ int main(int argc, char** argv) {
         else if (a == "--software") g_disableHardwareDecoders = true;
         else if (a == "--no-adaptive") adaptiveRes = false;
         else if (a == "--dump" && i + 1 < argc) dumpPath = argv[++i];
+        else if (a == "--tint" && i + 1 < argc) color.tint = static_cast<float>(std::atof(argv[++i]));
+        else if (a == "--saturation" && i + 1 < argc) color.saturation = static_cast<float>(std::atof(argv[++i]));
+        else if (a == "--brightness" && i + 1 < argc) color.brightness = static_cast<float>(std::atof(argv[++i]));
+        else if (a == "--contrast" && i + 1 < argc) color.contrast = static_cast<float>(std::atof(argv[++i]));
+        else if (a == "--temperature" && i + 1 < argc) color.temperatureK = static_cast<float>(std::atof(argv[++i]));
+        else if (a == "--drag") dragColor = true;
         else if (a == "--1080p") res = ResolutionOption::R_1080P;
         else if (a == "--720p") res = ResolutionOption::R_720P;
         else if (a == "--window" && i + 1 < argc) {
@@ -139,8 +152,15 @@ int main(int argc, char** argv) {
         auto t1 = std::chrono::steady_clock::now();
         if (!ok) continue;
 
+        naikav::video::ColorAdjustSettings frameColor = color;
+        if (dragColor) {
+            // A real drag moves the value a little every frame. The step
+            // is large enough to clear the neutrality tolerance and small
+            // enough to stay a plausible slider movement.
+            frameColor.tint = color.tint + 0.2f * static_cast<float>(produced % 50);
+        }
         auto t2 = std::chrono::steady_clock::now();
-        bool conv = dec.convertFrame(res, tm, dispW, dispH);
+        bool conv = dec.convertFrame(res, tm, dispW, dispH, frameColor);
         auto t3 = std::chrono::steady_clock::now();
         if (!conv) continue;
 
@@ -193,6 +213,10 @@ int main(int argc, char** argv) {
     ColorPipelineInfo info = dec.getColorInfo();
 
     const double d = medianOf(decodeMs), c = medianOf(convertMs);
+    std::printf("color: brightness=%.0f contrast=%.2f saturation=%.2f temp=%.0fK tint=%.0f%s (%s)\n",
+                color.brightness, color.contrast, color.saturation,
+                color.temperatureK, color.tint, dragColor ? " [drag]" : "",
+                color.isNeutral() && !dragColor ? "neutral" : "active");
     std::printf("frames=%d  out=%s %dx%d  toneMapped=%s  displayCap=%s\n",
                 produced, outFmt, out ? out->width : 0, out ? out->height : 0,
                 info.toneMapped ? "yes" : "no",

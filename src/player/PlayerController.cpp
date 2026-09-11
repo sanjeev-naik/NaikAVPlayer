@@ -1209,7 +1209,8 @@ void PlayerController::videoThreadLoop() {
                     converted = m_videoDecoder->convertFrame(
                         m_resolutionOption.load(), getHdrToneMapSettings(),
                         m_displayWidth.load(std::memory_order_relaxed),
-                        m_displayHeight.load(std::memory_order_relaxed));
+                        m_displayHeight.load(std::memory_order_relaxed),
+                        getColorAdjustSettings());
                     if (converted) {
                         srcFrame = m_videoDecoder->getYUVFrame();
                         if (srcFrame && srcFrame->data[0]) {
@@ -1345,6 +1346,11 @@ void PlayerController::loadSettings() {
     m_hdrToneMapEnabled.store(true);
     m_hdrTargetPeakNits.store(100.0f);
     m_hdrSourcePeakNits.store(0.0f);
+    m_colorBrightness.store(0.0f);
+    m_colorContrast.store(1.0f);
+    m_colorSaturation.store(1.0f);
+    m_colorTemperatureK.store(naikav::video::kColorTemperatureNeutral);
+    m_colorTint.store(0.0f);
     m_hdrDynamicMetadata.store(true);
     m_hdrAdaptiveResolution.store(true);
     m_audioDspSettings = naikav::dsp::AudioDspSettings{};
@@ -1503,6 +1509,39 @@ void PlayerController::loadSettings() {
                 if (v == 0.0f || (v >= 100.0f && v <= 10000.0f)) {
                     m_hdrSourcePeakNits.store(v);
                 }
+            } else if (key == "color_brightness") {
+                // Range-checked against the same constants the sliders
+                // use, so a hand-edited file cannot park the pipeline
+                // somewhere the UI has no way to bring it back from.
+                float v = std::stof(value);
+                if (v >= naikav::video::kColorBrightnessMin &&
+                    v <= naikav::video::kColorBrightnessMax) {
+                    m_colorBrightness.store(v);
+                }
+            } else if (key == "color_contrast") {
+                float v = std::stof(value);
+                if (v >= naikav::video::kColorContrastMin &&
+                    v <= naikav::video::kColorContrastMax) {
+                    m_colorContrast.store(v);
+                }
+            } else if (key == "color_saturation") {
+                float v = std::stof(value);
+                if (v >= naikav::video::kColorSaturationMin &&
+                    v <= naikav::video::kColorSaturationMax) {
+                    m_colorSaturation.store(v);
+                }
+            } else if (key == "color_temperature_k") {
+                float v = std::stof(value);
+                if (v >= naikav::video::kColorTemperatureMin &&
+                    v <= naikav::video::kColorTemperatureMax) {
+                    m_colorTemperatureK.store(v);
+                }
+            } else if (key == "color_tint") {
+                float v = std::stof(value);
+                if (v >= naikav::video::kColorTintMin &&
+                    v <= naikav::video::kColorTintMax) {
+                    m_colorTint.store(v);
+                }
             } else if (key == "playlist_current_index") {
                 m_pendingPlaylistCurrentIndex = std::stoi(value);
             } else if (key == "playlist_repeat_mode") {
@@ -1589,6 +1628,11 @@ void PlayerController::saveSettings() {
     f << "hdr_source_peak_nits=" << m_hdrSourcePeakNits.load() << "\n";
     f << "hdr_dynamic_metadata=" << (m_hdrDynamicMetadata.load() ? 1 : 0) << "\n";
     f << "hdr_adaptive_resolution=" << (m_hdrAdaptiveResolution.load() ? 1 : 0) << "\n";
+    f << "color_brightness=" << m_colorBrightness.load() << "\n";
+    f << "color_contrast=" << m_colorContrast.load() << "\n";
+    f << "color_saturation=" << m_colorSaturation.load() << "\n";
+    f << "color_temperature_k=" << m_colorTemperatureK.load() << "\n";
+    f << "color_tint=" << m_colorTint.load() << "\n";
     f << "playlist_current_index=" << m_playlist.getCurrentIndex() << "\n";
     f << "playlist_repeat_mode=" << static_cast<int>(m_playlist.getRepeatMode()) << "\n";
     f << "playlist_shuffle=" << (m_playlist.isShuffle() ? 1 : 0) << "\n";
@@ -1654,6 +1698,35 @@ void PlayerController::setHdrSourcePeakNits(float nits) {
     // reference, below which there is nothing to tone map down from.
     m_hdrSourcePeakNits.store(nits <= 0.0f ? 0.0f
                                            : std::clamp(nits, 100.0f, 10000.0f));
+}
+
+void PlayerController::setColorAdjustSettings(
+    const naikav::video::ColorAdjustSettings& s) {
+    // Clamped on the way in rather than trusted: this is reachable from a
+    // settings file as well as from the sliders, and the conversion path
+    // downstream assumes the values are inside the documented ranges.
+    // Store only -- the save and the paused re-decode are deferred to
+    // persistColorSettings(), for the reason the header gives.
+    const naikav::video::ColorAdjustSettings c = naikav::video::clampColorAdjust(s);
+    m_colorBrightness.store(c.brightness);
+    m_colorContrast.store(c.contrast);
+    m_colorSaturation.store(c.saturation);
+    m_colorTemperatureK.store(c.temperatureK);
+    m_colorTint.store(c.tint);
+}
+
+void PlayerController::resetColorAdjustSettings() {
+    setColorAdjustSettings(naikav::video::ColorAdjustSettings{});
+}
+
+void PlayerController::persistColorSettings() {
+    saveSettings();
+    // Identical nudge to persistHdrSettings(), and for the identical
+    // reason: a paused player is not decoding anything, so without a
+    // re-decode the change would not appear until playback resumed.
+    if (m_hasVideo && (m_state == PlayerState::OPENED || m_state == PlayerState::PAUSED)) {
+        seek(getCurrentTime());
+    }
 }
 
 void PlayerController::persistHdrSettings() {

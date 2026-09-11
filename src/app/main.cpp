@@ -2,6 +2,7 @@
 #include "player/PlayerController.hpp"
 #include "playlist/MediaFileFilter.hpp"
 #include "ui/PlayerUI.hpp"
+#include "video/ColorAdjust.hpp"
 #include "video/FrameExporter.hpp"
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h>
@@ -635,8 +636,16 @@ int main(int argc, char *argv[]) {
           playerUI.togglePlaylistPanel();
           break;
         // `C` for color, since `H` is already the subtitle-delay increment.
+        // Shift+C opens the picture adjustment panel rather than claiming
+        // a second, unrelated letter: the two panels are the colour pair,
+        // and every plain letter that would have read as "picture" is
+        // already bound to something else.
         case SDLK_C:
-          playerUI.toggleHdrPanel();
+          if (event.key.mod & SDL_KMOD_SHIFT) {
+            playerUI.toggleColorPanel();
+          } else {
+            playerUI.toggleHdrPanel();
+          }
           break;
         default:
           break;
@@ -866,6 +875,18 @@ int main(int argc, char *argv[]) {
 
     // A. Draw Centered Letterboxed Video Frame
     if (videoTexture) {
+      // Apply GPU color modulation (white balance: temperature & tint)
+      // when eligible and not already folded into CPU software conversion or HDR tone mapping
+      const auto colorSettings = controller.getColorAdjustSettings();
+      const auto colorInfo = controller.getColorInfo();
+      if (!colorInfo.toneMapped && colorSettings.isGpuModulationEligible()) {
+        float rMod = 1.0f, gMod = 1.0f, bMod = 1.0f;
+        naikav::video::getGpuColorModulation(colorSettings, rMod, gMod, bMod);
+        SDL_SetTextureColorModFloat(videoTexture, rMod, gMod, bMod);
+      } else {
+        SDL_SetTextureColorModFloat(videoTexture, 1.0f, 1.0f, 1.0f);
+      }
+
       SDL_FRect dstRect;
       float windowAspect = static_cast<float>(winWidth) / winHeight;
       float videoAspect = static_cast<float>(texWidth) / texHeight;

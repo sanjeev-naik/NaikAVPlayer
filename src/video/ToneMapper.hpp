@@ -36,6 +36,8 @@
 #include <thread>
 #include <vector>
 
+#include "video/ColorAdjust.hpp"
+
 // The per-pixel path is called millions of times per frame, and both
 // compilers decline to inline it on size grounds when left to their own
 // judgement -- which turns every pixel into a real call and costs more
@@ -282,7 +284,15 @@ public:
     // Rebuilding is ~10k transcendental evaluations, so it is guarded on
     // the parameters actually changing -- in practice it runs once per
     // file, not per frame.
-    bool configure(HdrTransfer transfer, float srcPeakNits, float dstPeakNits) {
+    //
+    // `color` is the picture adjustment (see ColorAdjust.hpp). It is a
+    // parameter of the tables rather than a separate pass because all of
+    // it except saturation is per-channel affine on exactly the values
+    // the output table already holds, so folding it in there makes white
+    // balance, brightness and contrast cost nothing per pixel. Leaving it
+    // at its default keeps the original single-table path, bit for bit.
+    bool configure(HdrTransfer transfer, float srcPeakNits, float dstPeakNits,
+                   const ColorAdjustSettings& color = ColorAdjustSettings{}) {
         if (transfer == HdrTransfer::None) {
             m_ready = false;
             return false;
@@ -296,21 +306,48 @@ public:
         // curve stays well-conditioned.
         srcPeakNits = std::max(srcPeakNits, dstPeakNits * 1.0001f);
 
-        if (m_ready && transfer == m_transfer &&
-            srcPeakNits == m_srcPeakNits && dstPeakNits == m_dstPeakNits) {
+        // Two independent rebuild triggers, because they cost wildly
+        // different amounts and change on wildly different schedules.
+        //
+        // The curve tables are tens of thousands of pow() calls -- the
+        // EOTF, the BT.2390 gain curve and the HLG OOTF between them --
+        // and their inputs (transfer, source peak, target peak) settle
+        // once per file. The colour tables are 12k multiply-adds and
+        // their input changes on *every frame* while a slider is being
+        // dragged. Rebuilding the first group for a change to the second
+        // put those pow() calls on the decode thread once per frame for
+        // the length of a drag, which is exactly long enough to make
+        // playback stutter while the user is watching the picture to
+        // judge the setting they are dragging.
+        const bool curvesChanged = !m_ready || transfer != m_transfer ||
+                                   srcPeakNits != m_srcPeakNits ||
+                                   dstPeakNits != m_dstPeakNits;
+        const bool colorChanged = !m_ready || !sameColorAdjust(color, m_color);
+        if (!curvesChanged && !colorChanged) {
             return true;
         }
 
         m_transfer = transfer;
         m_srcPeakNits = srcPeakNits;
         m_dstPeakNits = dstPeakNits;
-        buildTables();
+        if (colorChanged) {
+            m_color = color;
+            m_colorXf = makeEncodedColorTransform(color);
+        }
+        if (curvesChanged) {
+            buildTables();
+        }
+        if (m_colorXf.active) {
+            buildColorTables();
+        }
         m_ready = true;
         return true;
     }
 
     bool isReady() const { return m_ready; }
     HdrTransfer transfer() const { return m_transfer; }
+    const ColorAdjustSettings& colorAdjust() const { return m_color; }
+    bool colorAdjustActive() const { return m_colorXf.active; }
     float sourcePeakNits() const { return m_srcPeakNits; }
     float targetPeakNits() const { return m_dstPeakNits; }
 
@@ -402,6 +439,23 @@ private:
     // normalized display light -> 8-bit BT.709 code.
     std::array<uint8_t, kOetfLutSize> m_oetf{};
 
+    // The BT.709 OETF's output in float, before quantisation and before
+    // any picture adjustment. Exists so that a colour change can rebuild
+    // the adjusted tables below with a multiply-add per entry instead of
+    // re-evaluating the OETF -- see buildColorTables().
+    std::array<float, kOetfLutSize> m_oetfBase{};
+
+    // The same table, per channel and in float, holding the encoded value
+    // *after* white balance, contrast and brightness have been folded in.
+    // Only built (and only read) when the picture adjustment is off
+    // neutral: an untouched picture keeps using m_oetf above and produces
+    // exactly the bytes it always did. Float rather than uint8 because a
+    // non-neutral saturation still has to mix these three values, and
+    // quantising before that step would band the result.
+    std::array<std::array<float, kOetfLutSize>, 3> m_oetfAdj{};
+    ColorAdjustSettings m_color{};
+    EncodedColorTransform m_colorXf{};
+
     void buildTables() {
         const double srcPeak = m_srcPeakNits;
         const double dstPeak = m_dstPeakNits;
@@ -463,9 +517,61 @@ private:
         for (int i = 0; i < kOetfLutSize; ++i) {
             const double l = static_cast<double>(i) / (kOetfLutSize - 1);
             const double e = bt709Oetf(l);
+            m_oetfBase[i] = static_cast<float>(e);
             int v = static_cast<int>(std::lround(e * 255.0));
             m_oetf[i] = static_cast<uint8_t>(std::clamp(v, 0, 255));
         }
+    }
+
+    // The picture adjustment's half of the tables. Kept apart from
+    // buildTables() because this is what a slider drag re-runs on every
+    // frame: it reads the curve the OETF loop above already produced and
+    // applies one multiply-add per entry, so a colour change costs no
+    // transcendentals at all.
+    //
+    // Deliberately unclamped: a contrast above 1 pushes the ends of this
+    // table outside [0,1], and clamping here would flatten highlights
+    // that a saturation below 1 is about to pull back into range. The
+    // single clamp happens at the quantisation step.
+    void buildColorTables() {
+        for (int c = 0; c < 3; ++c) {
+            const float scale = m_colorXf.scale[c];
+            const float pedestal = m_colorXf.pedestal;
+            for (int i = 0; i < kOetfLutSize; ++i) {
+                m_oetfAdj[c][i] = scale * m_oetfBase[i] + pedestal;
+            }
+        }
+    }
+
+    // Encode one already-tone-mapped BT.709 pixel to 8 bits, applying
+    // whatever part of the picture adjustment did not fold into the
+    // tables. Three shapes, cheapest first, because the branch is uniform
+    // across a whole frame and the common case has to stay free.
+    NAIKAV_TM_INLINE void encodePixel(float r7, float g7, float b7,
+                                      uint8_t& r8, uint8_t& g8,
+                                      uint8_t& b8) const {
+        if (!m_colorXf.active) {
+            r8 = m_oetf[toOetfIndex(r7)];
+            g8 = m_oetf[toOetfIndex(g7)];
+            b8 = m_oetf[toOetfIndex(b7)];
+            return;
+        }
+
+        float r = m_oetfAdj[0][toOetfIndex(r7)];
+        float g = m_oetfAdj[1][toOetfIndex(g7)];
+        float b = m_oetfAdj[2][toOetfIndex(b7)];
+        if (m_colorXf.mixesChannels) {
+            m_colorXf.applySaturation(r, g, b);
+        }
+        r8 = quantizeCode(r);
+        g8 = quantizeCode(g);
+        b8 = quantizeCode(b);
+    }
+
+    NAIKAV_TM_INLINE static uint8_t quantizeCode(float v) {
+        const int i =
+            static_cast<int>(std::clamp(v, 0.0f, 1.0f) * 255.0f + 0.5f);
+        return static_cast<uint8_t>(std::clamp(i, 0, 255));
     }
 
     static int chooseWorkerCount(int width, int height) {
@@ -569,10 +675,8 @@ private:
         //    instead swing the hue.
         desaturateIntoRange(r7, g7, b7);
 
-        // 5. Encode to 8-bit BT.709.
-        r8 = m_oetf[toOetfIndex(r7)];
-        g8 = m_oetf[toOetfIndex(g7)];
-        b8 = m_oetf[toOetfIndex(b7)];
+        // 5. Encode to 8-bit BT.709, carrying the picture adjustment.
+        encodePixel(r7, g7, b7, r8, g8, b8);
     }
 
     // Pull an out-of-gamut color toward its own luminance until every
@@ -689,9 +793,8 @@ private:
 
                 // Phase 3: encode, the second unavoidable gather.
                 for (int i = 0; i < n; ++i) {
-                    d[3 * i + 0] = m_oetf[toOetfIndex(lr[i])];
-                    d[3 * i + 1] = m_oetf[toOetfIndex(lg[i])];
-                    d[3 * i + 2] = m_oetf[toOetfIndex(lb[i])];
+                    encodePixel(lr[i], lg[i], lb[i], d[3 * i + 0],
+                                d[3 * i + 1], d[3 * i + 2]);
                 }
             }
         }

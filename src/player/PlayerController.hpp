@@ -251,6 +251,19 @@ private:
     std::atomic<bool> m_hdrDynamicMetadata{true};
     std::atomic<bool> m_hdrAdaptiveResolution{true};
 
+    // Picture adjustment. Same threading story as the HDR settings above
+    // -- written from the UI thread, read once per frame on the video
+    // thread -- and stored as five separate atomics rather than one
+    // mutex-guarded struct for the same reason: a drag that lands
+    // mid-frame simply takes effect on the next one, and there is no
+    // invariant tying the five values together that a torn read could
+    // break.
+    std::atomic<float> m_colorBrightness{0.0f};
+    std::atomic<float> m_colorContrast{1.0f};
+    std::atomic<float> m_colorSaturation{1.0f};
+    std::atomic<float> m_colorTemperatureK{naikav::video::kColorTemperatureNeutral};
+    std::atomic<float> m_colorTint{0.0f};
+
     // Size of the area video is drawn into, in pixels. Written by the
     // render thread once per presented frame and read by the video thread
     // once per decoded frame, so atomics rather than a mutex: the render
@@ -533,6 +546,41 @@ public:
         s.adaptiveResolution = m_hdrAdaptiveResolution.load();
         return s;
     }
+
+    // Picture adjustment: brightness, contrast, saturation and white
+    // balance. Unlike the HDR settings above these apply to *any* source
+    // -- they act on the encoded picture, not on a tone curve, so there
+    // is nothing about them that needs the file to be HDR.
+    //
+    // Same apply-live-then-persist contract as the peak-luminance
+    // settings: the setters only store, so a slider drag is visible
+    // immediately while playing at the cost of one atomic write, and
+    // persistColorSettings() does the disk write and the paused
+    // re-decode once the interaction settles.
+    naikav::video::ColorAdjustSettings getColorAdjustSettings() const {
+        naikav::video::ColorAdjustSettings s;
+        s.brightness = m_colorBrightness.load();
+        s.contrast = m_colorContrast.load();
+        s.saturation = m_colorSaturation.load();
+        s.temperatureK = m_colorTemperatureK.load();
+        s.tint = m_colorTint.load();
+        return s;
+    }
+    void setColorAdjustSettings(const naikav::video::ColorAdjustSettings& s);
+
+    // Back to the identity. Separate from setColorAdjustSettings() with a
+    // default-constructed struct only so the UI's Reset button reads as
+    // what it does at the call site.
+    void resetColorAdjustSettings();
+
+    // Whether the adjustment is doing anything at all. The UI uses it to
+    // say so; the pipeline decides for itself, per frame, from the
+    // settings it is handed.
+    bool isColorAdjustActive() const {
+        return !getColorAdjustSettings().isNeutral();
+    }
+
+    void persistColorSettings();
 
     // Audio DSP/loudness settings (EQ, compressor, limiter, crossover,
     // loudness target). Safe to call during playback -- see

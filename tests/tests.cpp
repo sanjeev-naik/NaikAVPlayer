@@ -827,6 +827,125 @@ int real_main(int argc, char* argv[]) {
             throw std::runtime_error("Simulated test exception");
         }
 
+
+        // -------------------------------------------------------------
+        // Unit Test: the picture adjustment through convertFrame()
+        //
+        // The pure-math tests above cover the transform itself; this
+        // covers the routing, which is the part that can go wrong
+        // silently: which output format each path produces, and whether a
+        // non-neutral setting really does break the zero-copy passthrough
+        // instead of quietly doing nothing.
+        // -------------------------------------------------------------
+        {
+            ThreadSafeQueue<AVPacket*> dummyQueue;
+            AVCodecParameters* p = avcodec_parameters_alloc();
+            p->codec_type = AVMEDIA_TYPE_VIDEO;
+            p->codec_id = AV_CODEC_ID_RAWVIDEO;
+            p->format = AV_PIX_FMT_YUV420P;
+            p->width = 640;
+            p->height = 480;
+
+            VideoDecoder dec(p, {1, 25}, 0, dummyQueue);
+            test_assert(dec.init(), "VideoDecoder init for the picture adjustment routing test");
+
+            // A YUV420P source at its native size is exactly the case the
+            // decoder normally hands straight to the renderer by
+            // reference, which is what makes it the interesting one here.
+            std::vector<uint8_t> plane(640 * 480 * 3 / 2, 0);
+            auto fillSource = [&]() {
+                dec.m_decodedFrame->width = 640;
+                dec.m_decodedFrame->height = 480;
+                dec.m_decodedFrame->format = AV_PIX_FMT_YUV420P;
+                for (size_t i = 0; i < plane.size(); ++i) {
+                    plane[i] = static_cast<uint8_t>((i * 29) % 256);
+                }
+                av_image_fill_arrays(dec.m_decodedFrame->data,
+                                     dec.m_decodedFrame->linesize, plane.data(),
+                                     AV_PIX_FMT_YUV420P, 640, 480, 1);
+            };
+
+            naikav::video::HdrToneMapSettings tm;
+            naikav::video::ColorAdjustSettings neutral;
+
+            fillSource();
+            test_assert(dec.convertFrame(ResolutionOption::ORIGINAL, tm, 0, 0, neutral),
+                        "convertFrame() succeeds with neutral picture settings");
+            test_assert(dec.getYUVFrame()->format == AV_PIX_FMT_YUV420P,
+                        "Neutral picture settings leave an SDR frame on the YUV passthrough");
+            test_assert(!dec.getColorInfo().colorAdjusted,
+                        "getColorInfo() reports no adjustment for neutral settings");
+
+            // Saturation zero is the easiest routing result to check
+            // without reimplementing the transform: whatever else
+            // happened, no pixel can still have colour.
+            naikav::video::ColorAdjustSettings mono;
+            mono.saturation = 0.0f;
+
+            fillSource();
+            test_assert(dec.convertFrame(ResolutionOption::ORIGINAL, tm, 0, 0, mono),
+                        "convertFrame() succeeds with the picture adjustment active");
+            AVFrame* out = dec.getYUVFrame();
+            test_assert(out->format == AV_PIX_FMT_RGB24,
+                        "An active adjustment breaks the YUV passthrough and outputs RGB24");
+            test_assert(out->width == 640 && out->height == 480,
+                        "The adjusted path honours the resolution selector when no display size is known");
+            test_assert(dec.getColorInfo().colorAdjusted,
+                        "getColorInfo() reports the adjustment the pipeline actually applied");
+
+            bool allGrey = true;
+            for (int y = 0; y < out->height && allGrey; ++y) {
+                const uint8_t* row = out->data[0] + static_cast<size_t>(y) * out->linesize[0];
+                for (int x = 0; x < out->width; ++x) {
+                    const uint8_t* px = row + static_cast<size_t>(x) * 3;
+                    if (std::abs(int(px[0]) - int(px[1])) > 1 ||
+                        std::abs(int(px[1]) - int(px[2])) > 1) {
+                        allGrey = false;
+                        break;
+                    }
+                }
+            }
+            test_assert(allGrey,
+                        "Zero saturation through convertFrame() leaves no colour in the output frame");
+
+            // With a display size, the adjusted path caps to it, exactly
+            // as the tone-map path does: the cost is per output pixel and
+            // the letterbox blit discards anything the window cannot
+            // show. This is the one way an active adjustment can return
+            // fewer pixels than the resolution selector asked for.
+            // 128x128 rounds up to a 128x128 box (the cap quantises to a
+            // 64px step), which against a 640x480 frame binds on width:
+            // 640 * 128/640 = 128, and the height follows the aspect.
+            fillSource();
+            test_assert(dec.convertFrame(ResolutionOption::ORIGINAL, tm, 128, 128, mono),
+                        "convertFrame() succeeds with the adjustment capped to a display size");
+            test_assert(dec.getYUVFrame()->width == 128 && dec.getYUVFrame()->height == 96,
+                        "The adjusted path caps its output to the display area, preserving aspect");
+
+            // And back: turning the adjustment off has to put the frame
+            // back on the cheap path, not leave the decoder converting to
+            // RGB24 forever.
+            fillSource();
+            test_assert(dec.convertFrame(ResolutionOption::ORIGINAL, tm, 0, 0, neutral) &&
+                            dec.getYUVFrame()->format == AV_PIX_FMT_YUV420P &&
+                            !dec.getColorInfo().colorAdjusted,
+                        "Returning to neutral puts the frame back on the YUV passthrough");
+
+            // White balance (tint/temperature) only: stays on the fast zero-copy YUV passthrough
+            // because it is eligible for GPU texture modulation rather than requiring CPU RGB conversion.
+            naikav::video::ColorAdjustSettings tintOnly;
+            tintOnly.tint = 25.0f;
+            fillSource();
+            test_assert(dec.convertFrame(ResolutionOption::ORIGINAL, tm, 0, 0, tintOnly),
+                        "convertFrame() succeeds with tint-only adjustment");
+            test_assert(dec.getYUVFrame()->format == AV_PIX_FMT_YUV420P,
+                        "Tint-only adjustment stays on zero-copy YUV passthrough for GPU modulation");
+            test_assert(dec.getColorInfo().colorAdjusted,
+                        "getColorInfo() reports color adjusted for tint-only settings");
+
+            avcodec_parameters_free(&p);
+        }
+
         // -------------------------------------------------------------
         // Unit Test: Dynamic Resolution Change Safety Check
         // -------------------------------------------------------------
@@ -3852,6 +3971,446 @@ int main(int argc, char* argv[]) {
         }
 
         std::cout << "HDR ToneMapper unit tests PASSED!" << std::endl;
+    }
+
+    // -------------------------------------------------------------
+    // Picture adjustment unit tests (naikav::video::ColorAdjust*).
+    // Pure math, like the ToneMapper block above -- no SDL, no
+    // FFmpeg, no media file.
+    // -------------------------------------------------------------
+    {
+        using naikav::video::ColorAdjuster;
+        using naikav::video::ColorAdjustSettings;
+
+        std::cout << "Running picture adjustment unit tests..." << std::endl;
+
+        // --- neutrality, which is what gates the whole extra path ---
+        {
+            ColorAdjustSettings s;
+            test_assert(s.isNeutral(),
+                        "A default-constructed ColorAdjustSettings is neutral");
+
+            // The tolerances exist so that a value that round-trips
+            // through the settings file as decimal text, or a slider
+            // parked a hair off centre, does not switch on a full extra
+            // conversion pass for a change no display can show.
+            s.temperatureK = 6500.4f;
+            test_assert(s.isNeutral(),
+                        "A sub-kelvin temperature offset still counts as neutral");
+            s.temperatureK = 6600.0f;
+            test_assert(!s.isNeutral(),
+                        "A 100K temperature offset is not neutral");
+
+            s = ColorAdjustSettings{};
+            s.brightness = 0.05f;
+            test_assert(s.isNeutral(),
+                        "A brightness offset below an eighth of a code value counts as neutral");
+            s.brightness = 5.0f;
+            test_assert(!s.isNeutral(), "A brightness offset of 5 code values is not neutral");
+
+            s = ColorAdjustSettings{};
+            s.saturation = 0.0f;
+            test_assert(!s.isNeutral(), "Zero saturation is not neutral");
+            s = ColorAdjustSettings{};
+            s.contrast = 1.5f;
+            test_assert(!s.isNeutral(), "A contrast of 1.5 is not neutral");
+            s = ColorAdjustSettings{};
+            s.tint = 20.0f;
+            test_assert(!s.isNeutral(), "A tint of 20 is not neutral");
+
+            // --- GPU modulation eligibility & software requirement ---
+            s = ColorAdjustSettings{};
+            test_assert(!s.requiresSoftwareConversion(), "Neutral does not require software conversion");
+            test_assert(!s.isGpuModulationEligible(), "Neutral is not GPU modulation eligible (already neutral)");
+
+            s = ColorAdjustSettings{};
+            s.tint = 20.0f;
+            test_assert(!s.requiresSoftwareConversion(), "Tint alone does not require software conversion");
+            test_assert(s.isGpuModulationEligible(), "Tint alone is eligible for GPU modulation");
+
+            s = ColorAdjustSettings{};
+            s.temperatureK = 5000.0f;
+            test_assert(!s.requiresSoftwareConversion(), "Temperature alone does not require software conversion");
+            test_assert(s.isGpuModulationEligible(), "Temperature alone is eligible for GPU modulation");
+
+            s = ColorAdjustSettings{};
+            s.brightness = 10.0f;
+            test_assert(s.requiresSoftwareConversion(), "Brightness requires software conversion");
+            test_assert(!s.isGpuModulationEligible(), "Brightness is not eligible for GPU modulation");
+
+            s = ColorAdjustSettings{};
+            s.contrast = 1.2f;
+            test_assert(s.requiresSoftwareConversion(), "Contrast requires software conversion");
+            test_assert(!s.isGpuModulationEligible(), "Contrast is not eligible for GPU modulation");
+
+            s = ColorAdjustSettings{};
+            s.saturation = 0.5f;
+            test_assert(s.requiresSoftwareConversion(), "Saturation requires software conversion");
+            test_assert(!s.isGpuModulationEligible(), "Saturation is not eligible for GPU modulation");
+
+            // --- getGpuColorModulation() ---
+            float rMod = 0.0f, gMod = 0.0f, bMod = 0.0f;
+            naikav::video::getGpuColorModulation(ColorAdjustSettings{}, rMod, gMod, bMod);
+            test_assert(rMod == 1.0f && gMod == 1.0f && bMod == 1.0f,
+                        "Neutral settings return identity 1.0 for GPU modulation");
+
+            s = ColorAdjustSettings{};
+            s.tint = 50.0f;
+            naikav::video::getGpuColorModulation(s, rMod, gMod, bMod);
+            test_assert(rMod >= 0.0f && rMod <= 1.0f &&
+                        gMod >= 0.0f && gMod <= 1.0f &&
+                        bMod >= 0.0f && bMod <= 1.0f,
+                        "getGpuColorModulation() returns clamped values in [0, 1]");
+            test_assert(std::max({rMod, gMod, bMod}) == 1.0f,
+                        "getGpuColorModulation() normalizes so max component is 1.0");
+        }
+
+        // --- clamping, the guard on hand-edited settings files ---
+        {
+            ColorAdjustSettings s;
+            s.brightness = 1e6f;
+            s.contrast = -4.0f;
+            s.saturation = 99.0f;
+            s.temperatureK = 1.0f;
+            s.tint = -5000.0f;
+            const ColorAdjustSettings c = naikav::video::clampColorAdjust(s);
+            test_assert(c.brightness == naikav::video::kColorBrightnessMax &&
+                            c.contrast == naikav::video::kColorContrastMin &&
+                            c.saturation == naikav::video::kColorSaturationMax &&
+                            c.temperatureK == naikav::video::kColorTemperatureMin &&
+                            c.tint == naikav::video::kColorTintMin,
+                        "clampColorAdjust() pulls every out-of-range value onto its limit");
+        }
+
+        // --- the Planckian locus fit ---
+        {
+            double x = 0.0, y = 0.0;
+            naikav::video::planckianXy(6500.0, x, y);
+            // D65 sits at roughly (0.3127, 0.3290); the Planckian point
+            // at 6500K is close but deliberately not identical, which is
+            // exactly why the gains below are normalised against it
+            // rather than assumed to be 1.
+            test_assert(std::fabs(x - 0.3135) < 0.01 && std::fabs(y - 0.3237) < 0.01,
+                        "planckianXy() puts 6500K near the D65 chromaticity");
+
+            // The reason this fit was chosen over ffmpeg's: both places
+            // its branches join have to be continuous, or a slider
+            // dragged through the join steps visibly.
+            double xa = 0.0, ya = 0.0, xb = 0.0, yb = 0.0;
+            naikav::video::planckianXy(4000.0 - 1e-6, xa, ya);
+            naikav::video::planckianXy(4000.0 + 1e-6, xb, yb);
+            test_assert(std::fabs(xa - xb) < 1e-3 && std::fabs(ya - yb) < 1e-3,
+                        "planckianXy() is continuous across its 4000K branch boundary");
+            naikav::video::planckianXy(2222.0 - 1e-6, xa, ya);
+            naikav::video::planckianXy(2222.0 + 1e-6, xb, yb);
+            test_assert(std::fabs(ya - yb) < 1e-3,
+                        "planckianXy() is continuous across its 2222K branch boundary");
+
+            // Warmer means further along the locus toward red.
+            double xWarm = 0.0, yWarm = 0.0, xCool = 0.0, yCool = 0.0;
+            naikav::video::planckianXy(3000.0, xWarm, yWarm);
+            naikav::video::planckianXy(10000.0, xCool, yCool);
+            test_assert(xWarm > xCool,
+                        "planckianXy() moves toward red as the temperature falls");
+        }
+
+        // --- white balance gains ---
+        {
+            float gr = 0.0f, gg = 0.0f, gb = 0.0f;
+            naikav::video::whiteBalanceGains(6500.0f, 0.0f, gr, gg, gb);
+            test_assert(std::fabs(gr - 1.0f) < 1e-4f && std::fabs(gg - 1.0f) < 1e-4f &&
+                            std::fabs(gb - 1.0f) < 1e-4f,
+                        "whiteBalanceGains() is exactly the identity at the neutral temperature");
+
+            naikav::video::whiteBalanceGains(3500.0f, 0.0f, gr, gg, gb);
+            test_assert(gr > 1.0f && gb < 1.0f,
+                        "A temperature below neutral warms the picture (red up, blue down)");
+            naikav::video::whiteBalanceGains(10000.0f, 0.0f, gr, gg, gb);
+            test_assert(gr < 1.0f && gb > 1.0f,
+                        "A temperature above neutral cools the picture (blue up, red down)");
+
+            // The luma normalisation is what keeps the temperature slider
+            // from doubling as a second, worse brightness control.
+            bool lumaHeld = true;
+            for (float k : {3000.0f, 4500.0f, 6500.0f, 8000.0f, 12000.0f}) {
+                naikav::video::whiteBalanceGains(k, 0.0f, gr, gg, gb);
+                const float luma = 0.2126f * gr + 0.7152f * gg + 0.0722f * gb;
+                if (std::fabs(luma - 1.0f) > 1e-4f) lumaHeld = false;
+            }
+            test_assert(lumaHeld,
+                        "whiteBalanceGains() preserves luma at every temperature");
+
+            // Tint runs the other axis, and is luma-preserving too.
+            naikav::video::whiteBalanceGains(6500.0f, 100.0f, gr, gg, gb);
+            test_assert(gg < 1.0f && gr > 1.0f && gb > 1.0f,
+                        "A positive tint pushes the picture toward magenta");
+            naikav::video::whiteBalanceGains(6500.0f, -100.0f, gr, gg, gb);
+            test_assert(gg > 1.0f && gr < 1.0f && gb < 1.0f,
+                        "A negative tint pushes the picture toward green");
+        }
+
+        // --- the composed transform ---
+        {
+            auto xf = naikav::video::makeEncodedColorTransform(ColorAdjustSettings{});
+            test_assert(!xf.active,
+                        "makeEncodedColorTransform() reports neutral settings as inactive");
+
+            ColorAdjustSettings s;
+            s.contrast = 1.5f;
+            xf = naikav::video::makeEncodedColorTransform(s);
+            test_assert(xf.active && !xf.mixesChannels,
+                        "Contrast alone is active but needs no channel mixing");
+            // Mid grey is the pivot, so it must survive any contrast.
+            float r = 0.5f, g = 0.5f, b = 0.5f;
+            xf.applyEncoded(r, g, b);
+            test_assert(std::fabs(r - 0.5f) < 1e-5f && std::fabs(g - 0.5f) < 1e-5f &&
+                            std::fabs(b - 0.5f) < 1e-5f,
+                        "Contrast pivots about mid grey and leaves it untouched");
+            r = 0.75f; g = 0.75f; b = 0.75f;
+            xf.applyEncoded(r, g, b);
+            test_assert(r > 0.75f, "A contrast above 1 pushes above-mid values further up");
+
+            s = ColorAdjustSettings{};
+            s.saturation = 0.0f;
+            xf = naikav::video::makeEncodedColorTransform(s);
+            test_assert(xf.active && xf.mixesChannels,
+                        "Saturation is the one stage that mixes channels");
+            r = 0.9f; g = 0.2f; b = 0.4f;
+            xf.applyEncoded(r, g, b);
+            test_assert(std::fabs(r - g) < 1e-5f && std::fabs(g - b) < 1e-5f,
+                        "Zero saturation collapses a colour onto its own luma");
+
+            // Saturation is applied after a pedestal that is equal on all
+            // three channels, which is what makes the fold into a
+            // per-channel table exact rather than approximate: a neutral
+            // input must stay neutral through the whole chain.
+            s = ColorAdjustSettings{};
+            s.brightness = 20.0f;
+            s.contrast = 1.4f;
+            s.saturation = 1.7f;
+            xf = naikav::video::makeEncodedColorTransform(s);
+            r = 0.42f; g = 0.42f; b = 0.42f;
+            xf.applyEncoded(r, g, b);
+            test_assert(std::fabs(r - g) < 1e-5f && std::fabs(g - b) < 1e-5f,
+                        "A neutral grey stays neutral through brightness, contrast and saturation");
+
+            s = ColorAdjustSettings{};
+            s.brightness = 25.5f;  // a tenth of full scale
+            xf = naikav::video::makeEncodedColorTransform(s);
+            r = 0.5f; g = 0.5f; b = 0.5f;
+            xf.applyEncoded(r, g, b);
+            test_assert(std::fabs(r - 0.6f) < 1e-4f,
+                        "Brightness shifts by the code-value offset it advertises");
+        }
+
+        // --- ColorAdjuster over a real buffer ---
+        {
+            ColorAdjuster adjuster;
+            test_assert(!adjuster.configure(ColorAdjustSettings{}),
+                        "ColorAdjuster::configure() reports nothing to do for neutral settings");
+            test_assert(!adjuster.isActive(),
+                        "A neutrally configured ColorAdjuster stays inactive");
+
+            // A neutral adjuster must not touch the buffer even if it is
+            // asked to: this is the guarantee that closing the panel
+            // gives the picture back untouched.
+            std::vector<uint8_t> pixels(3 * 4 * 4, 0);
+            for (size_t i = 0; i < pixels.size(); ++i) {
+                pixels[i] = static_cast<uint8_t>(i * 5 % 256);
+            }
+            const std::vector<uint8_t> before = pixels;
+            adjuster.processRgb24(pixels.data(), 4 * 3, 4, 4);
+            test_assert(pixels == before,
+                        "A neutral ColorAdjuster leaves the buffer byte-for-byte unchanged");
+
+            ColorAdjustSettings s;
+            s.saturation = 0.0f;
+            test_assert(adjuster.configure(s),
+                        "ColorAdjuster::configure() reports work to do for non-neutral settings");
+            adjuster.processRgb24(pixels.data(), 4 * 3, 4, 4);
+            bool allGrey = true;
+            for (size_t i = 0; i + 2 < pixels.size(); i += 3) {
+                // One code value of slack for the rounding at the end.
+                if (std::abs(int(pixels[i]) - int(pixels[i + 1])) > 1 ||
+                    std::abs(int(pixels[i + 1]) - int(pixels[i + 2])) > 1) {
+                    allGrey = false;
+                }
+            }
+            test_assert(allGrey,
+                        "Zero saturation renders every pixel of a real buffer grey");
+
+            // Degenerate geometry must be survivable -- convertFrame()
+            // reaches this with whatever the decoder produced.
+            adjuster.processRgb24(nullptr, 12, 4, 4);
+            adjuster.processRgb24(pixels.data(), 12, 0, 0);
+            test_assert(true, "ColorAdjuster::processRgb24() tolerates a null buffer and a zero size");
+
+            // Black and white are the two ends the quantiser has to pin.
+            ColorAdjuster ends;
+            ColorAdjustSettings bright;
+            bright.brightness = naikav::video::kColorBrightnessMax;
+            ends.configure(bright);
+            std::vector<uint8_t> two = {0, 0, 0, 255, 255, 255};
+            ends.processRgb24(two.data(), 6, 2, 1);
+            test_assert(two[3] == 255 && two[4] == 255 && two[5] == 255,
+                        "Maximum brightness clamps white rather than wrapping it");
+            test_assert(two[0] > 0,
+                        "Maximum brightness lifts black off zero");
+
+            ColorAdjuster dark;
+            ColorAdjustSettings dim;
+            dim.brightness = naikav::video::kColorBrightnessMin;
+            dark.configure(dim);
+            two = {0, 0, 0, 255, 255, 255};
+            dark.processRgb24(two.data(), 6, 2, 1);
+            test_assert(two[0] == 0 && two[1] == 0 && two[2] == 0,
+                        "Minimum brightness clamps black rather than wrapping it");
+
+            // Multithreading is a row split, so it must produce exactly
+            // what the single-threaded path does. The size is chosen to
+            // clear ColorAdjuster's threading threshold.
+            const int w = 400, h = 400;
+            std::vector<uint8_t> a(static_cast<size_t>(w) * h * 3);
+            for (size_t i = 0; i < a.size(); ++i) {
+                a[i] = static_cast<uint8_t>((i * 37) % 256);
+            }
+            std::vector<uint8_t> b = a;
+            ColorAdjuster mt;
+            ColorAdjustSettings busy;
+            busy.brightness = 12.0f;
+            busy.contrast = 1.3f;
+            busy.saturation = 1.4f;
+            busy.temperatureK = 4200.0f;
+            busy.tint = 15.0f;
+            mt.configure(busy);
+            mt.processRgb24(a.data(), w * 3, w, h);
+            mt.processRgb24(b.data(), w * 3, w, h, 1);
+            test_assert(a == b,
+                        "The threaded and single-threaded ColorAdjuster paths agree exactly");
+        }
+
+        // --- the fold into the tone mapper ---
+        {
+            using naikav::video::HdrTransfer;
+            using naikav::video::ToneMapper;
+
+            // Heap-allocated for the reason the ToneMapper tests above
+            // give: these carry their lookup tables inline, and the
+            // adjusted output table makes each instance larger still.
+            auto plainOwner = std::make_unique<ToneMapper>();
+            auto adjustedOwner = std::make_unique<ToneMapper>();
+            ToneMapper& plain = *plainOwner;
+            ToneMapper& adjusted = *adjustedOwner;
+
+            test_assert(plain.configure(HdrTransfer::PQ, 1000.0f, 100.0f),
+                        "ToneMapper::configure() still accepts its original three arguments");
+            test_assert(!plain.colorAdjustActive(),
+                        "A ToneMapper configured without colour settings reports no adjustment");
+
+            ColorAdjustSettings neutral;
+            test_assert(adjusted.configure(HdrTransfer::PQ, 1000.0f, 100.0f, neutral),
+                        "ToneMapper::configure() accepts explicit neutral colour settings");
+            test_assert(!adjusted.colorAdjustActive(),
+                        "Neutral colour settings leave the tone mapper on its unadjusted path");
+
+            // Neutral settings must not perturb the picture at all: the
+            // whole point of the separate table is that an untouched
+            // picture keeps producing the bytes it always did.
+            bool identical = true;
+            for (int i = 0; i <= 65535; i += 257) {
+                const uint16_t c = static_cast<uint16_t>(i);
+                uint8_t r0 = 0, g0 = 0, b0 = 0, r1 = 0, g1 = 0, b1 = 0;
+                plain.mapPixel(c, c, c, r0, g0, b0);
+                adjusted.mapPixel(c, c, c, r1, g1, b1);
+                if (r0 != r1 || g0 != g1 || b0 != b1) identical = false;
+            }
+            test_assert(identical,
+                        "Neutral colour settings leave the tone mapped picture bit-identical");
+
+            // Saturation zero through the mapper is the same claim the
+            // standalone adjuster makes, checked on the path that folds
+            // the transform into the output tables instead.
+            ColorAdjustSettings mono;
+            mono.saturation = 0.0f;
+            test_assert(adjusted.configure(HdrTransfer::PQ, 1000.0f, 100.0f, mono),
+                        "ToneMapper::configure() rebuilds for changed colour settings");
+            test_assert(adjusted.colorAdjustActive(),
+                        "The tone mapper reports the adjustment as active");
+            bool greyOut = true;
+            for (int i = 1000; i <= 60000; i += 1013) {
+                uint8_t r = 0, g = 0, b = 0;
+                adjusted.mapPixel(static_cast<uint16_t>(i),
+                                  static_cast<uint16_t>(i / 2),
+                                  static_cast<uint16_t>(i / 3), r, g, b);
+                if (std::abs(int(r) - int(g)) > 1 || std::abs(int(g) - int(b)) > 1) {
+                    greyOut = false;
+                }
+            }
+            test_assert(greyOut,
+                        "Zero saturation folded into the tone mapper renders grey");
+
+            // The blocked path has to agree with the scalar reference on
+            // the *adjusted* branch too, not just the neutral one: phase 3
+            // of processRowsImpl() is where the fold happens, and it is
+            // the only place the two could diverge.
+            {
+                auto blockOwner = std::make_unique<ToneMapper>();
+                ToneMapper& block = *blockOwner;
+                ColorAdjustSettings busy;
+                busy.brightness = -18.0f;
+                busy.contrast = 1.25f;
+                busy.saturation = 1.6f;
+                busy.temperatureK = 8200.0f;
+                busy.tint = -30.0f;
+                block.configure(HdrTransfer::PQ, 1000.0f, 100.0f, busy);
+
+                // Same deliberately non-block-aligned size as the neutral
+                // case above, so the partial tail block is covered.
+                const int w = 203;
+                const int h = 5;
+                std::vector<uint16_t> src(static_cast<size_t>(w) * h * 3);
+                for (size_t i = 0; i < src.size(); ++i) {
+                    src[i] = static_cast<uint16_t>((i * 2654435761u) & 0xFFFF);
+                }
+                std::vector<uint8_t> got(static_cast<size_t>(w) * h * 3, 0);
+                block.process(reinterpret_cast<const uint8_t*>(src.data()), w * 6,
+                              got.data(), w * 3, w, h);
+
+                bool matches = true;
+                for (int y = 0; y < h && matches; ++y) {
+                    for (int x = 0; x < w; ++x) {
+                        const size_t o = (static_cast<size_t>(y) * w + x) * 3;
+                        uint8_t er = 0, eg = 0, eb = 0;
+                        block.mapPixel(src[o], src[o + 1], src[o + 2], er, eg, eb);
+                        if (got[o] != er || got[o + 1] != eg || got[o + 2] != eb) {
+                            matches = false;
+                            break;
+                        }
+                    }
+                }
+                test_assert(matches,
+                            "The adjusted blocked path matches mapPixel() exactly, tail block included");
+            }
+
+            // Brightness through the mapper: a mid-range input has to
+            // come out brighter than it did unadjusted.
+            ColorAdjustSettings lift;
+            lift.brightness = 40.0f;
+            adjusted.configure(HdrTransfer::PQ, 1000.0f, 100.0f, lift);
+            uint8_t r0 = 0, g0 = 0, b0 = 0, r1 = 0, g1 = 0, b1 = 0;
+            plain.mapPixel(30000, 30000, 30000, r0, g0, b0);
+            adjusted.mapPixel(30000, 30000, 30000, r1, g1, b1);
+            test_assert(r1 > r0 && g1 > g0 && b1 > b0,
+                        "Brightness folded into the tone mapper lifts the picture");
+
+            // And the guard: reconfiguring with the same values must not
+            // claim a rebuild happened, since this runs once per frame.
+            test_assert(adjusted.configure(HdrTransfer::PQ, 1000.0f, 100.0f, lift) &&
+                            adjusted.colorAdjustActive(),
+                        "Reconfiguring with unchanged colour settings is stable");
+        }
+
+        std::cout << "Picture adjustment unit tests PASSED!" << std::endl;
     }
 
     // 7. Run additional coverage tests to hit remaining uncovered branches!

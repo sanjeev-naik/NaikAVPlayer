@@ -8,6 +8,7 @@
 #include "core/ThreadSafeQueue.hpp"
 #include "core/MetricRing.hpp"
 #include "video/ToneMapper.hpp"
+#include "video/ColorAdjust.hpp"
 #include <chrono>
 
 extern "C" {
@@ -337,6 +338,11 @@ struct ColorPipelineInfo {
     // The smoothed per-frame peak itself, before it is reconciled with
     // the static metadata. 0 when there is no dynamic metadata.
     float toneMapDynamicNits = 0.0f;
+    // True once the picture adjustment has actually been applied to a
+    // converted frame. Same rule as toneMapped: what the pipeline did,
+    // not what the settings ask for -- the two differ for a frame the
+    // conversion failed on and fell back from.
+    bool colorAdjusted = false;
 };
 
 class VideoDecoder {
@@ -377,6 +383,29 @@ private:
     AVFrame* m_hdrRgbFrame = nullptr;  // RGB48 (native endian), BT.2020, HDR-encoded
     int m_hdrTargetWidth = 0;
     int m_hdrTargetHeight = 0;
+
+    // Picture adjustment for sources the tone mapper never touches. The
+    // HDR path needs none of this -- ToneMapper::configure() folds the
+    // same settings into its own output tables, so an HDR frame is
+    // adjusted for free on its way through the mapper it was already
+    // going through. This context exists for everything else: SDR, and
+    // HDR with tone mapping switched off.
+    //
+    // Its own SwsContext rather than a second use of m_swsCtx, for the
+    // same reason m_hdrToRgbCtx has one: the target pixel format differs
+    // (RGB24 here, YUV420P there), and sharing would rebuild the context
+    // on every frame whenever both paths were reachable.
+    naikav::video::ColorAdjuster m_colorAdjuster;
+    SwsContext* m_colorRgbCtx = nullptr;
+    int m_colorSrcWidth = 0;
+    int m_colorSrcHeight = 0;
+    AVPixelFormat m_colorSrcFormat = AV_PIX_FMT_NONE;
+    int m_colorTargetWidth = 0;
+    int m_colorTargetHeight = 0;
+    // Whether the most recently converted frame had the picture
+    // adjustment applied to it, by either path. Same racy-but-benign
+    // read from the HUD as m_lastFrameToneMapped below.
+    bool m_lastFrameColorAdjusted = false;
     // Whether the most recently converted frame went through the tone
     // mapper. Read by getColorInfo(), which the UI thread calls under the
     // same mutex that guards convertFrame(), so a plain bool is enough.
@@ -422,7 +451,10 @@ private:
 
     void releaseHdrContexts();
     bool toneMapFrame(const AVFrame* srcFrame, int targetW, int targetH,
-                      const naikav::video::HdrToneMapSettings& settings);
+                      const naikav::video::HdrToneMapSettings& settings,
+                      const naikav::video::ColorAdjustSettings& color);
+    bool colorAdjustFrame(const AVFrame* srcFrame, int targetW, int targetH,
+                          const naikav::video::ColorAdjustSettings& color);
 
     std::atomic<double> m_currentFramePts;
     std::atomic<bool> m_flushRequested;
@@ -482,10 +514,17 @@ public:
     // (see capToDisplaySize) and are ignored on the SDR path, which has
     // to honour the resolution selector exactly. 0 means "unknown", which
     // disables the cap.
+    //
+    // colorAdjust is last rather than next to toneMap, where it would
+    // read better, so that the existing four-argument call sites keep
+    // compiling unchanged. Neutral settings cost nothing: the frame takes
+    // exactly the path it took before this parameter existed.
     bool convertFrame(ResolutionOption option = ResolutionOption::ORIGINAL,
-                      naikav::video::HdrToneMapSettings toneMap =
+                      const naikav::video::HdrToneMapSettings& toneMap =
                           naikav::video::HdrToneMapSettings{},
-                      int displayWidth = 0, int displayHeight = 0);
+                      int displayWidth = 0, int displayHeight = 0,
+                      const naikav::video::ColorAdjustSettings& colorAdjust =
+                          naikav::video::ColorAdjustSettings{});
 
     // The HDR transfer function a frame carries, or None for SDR. Static
     // and frame-driven rather than codec-driven: HLG and PQ are per-frame
