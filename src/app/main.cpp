@@ -2,6 +2,7 @@
 #include "player/PlayerController.hpp"
 #include "playlist/MediaFileFilter.hpp"
 #include "ui/PlayerUI.hpp"
+#include "video/ColorAdjust.hpp"
 #include "video/FrameExporter.hpp"
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h>
@@ -257,6 +258,15 @@ static SDL_Colorspace getSDLColorspace(const AVFrame *frame) {
   AVColorSpace spc = frame->colorspace;
   AVColorRange rng = frame->color_range;
 
+  // Packed RGB carries no YUV matrix to undo. Tone mapped HDR arrives
+  // here (see VideoDecoder::toneMapFrame), already converted to BT.709
+  // primaries and re-encoded with the BT.709 OETF, so the only sensible
+  // tag is plain sRGB -- anything else asks the GPU to convert a signal
+  // that is already in the display's space.
+  if (frame->format == AV_PIX_FMT_RGB24) {
+    return SDL_COLORSPACE_SRGB;
+  }
+
   // YUVJ420P is legacy and always full range
   if (frame->format == AV_PIX_FMT_YUVJ420P) {
     rng = AVCOL_RANGE_JPEG;
@@ -439,6 +449,13 @@ int main(int argc, char *argv[]) {
   if (!mediaPath.empty()) {
     if (controller.openFile(mediaPath)) {
       controller.play();
+    } else {
+      // Never fail silently: the welcome screen staying up with no
+      // explanation is indistinguishable from the player being broken,
+      // and the stderr message behind this is invisible in the MSVC
+      // build, which has no console attached.
+      playerUI.showToast("Could not open file: " + controller.getLastOpenError(),
+                         true, 8.0);
     }
   }
 
@@ -618,6 +635,18 @@ int main(int argc, char *argv[]) {
         case SDLK_P:
           playerUI.togglePlaylistPanel();
           break;
+        // `C` for color, since `H` is already the subtitle-delay increment.
+        // Shift+C opens the picture adjustment panel rather than claiming
+        // a second, unrelated letter: the two panels are the colour pair,
+        // and every plain letter that would have read as "picture" is
+        // already bound to something else.
+        case SDLK_C:
+          if (event.key.mod & SDL_KMOD_SHIFT) {
+            playerUI.toggleColorPanel();
+          } else {
+            playerUI.toggleHdrPanel();
+          }
+          break;
         default:
           break;
         }
@@ -631,6 +660,9 @@ int main(int argc, char *argv[]) {
     if (droppedPaths.size() == 1) {
       if (controller.openFile(droppedPaths[0])) {
         controller.play();
+      } else {
+        playerUI.showToast("Could not open file: " + controller.getLastOpenError(),
+                           true, 8.0);
       }
     } else if (droppedPaths.size() > 1) {
       size_t firstNewIndex = controller.getPlaylist().size();
@@ -720,6 +752,11 @@ int main(int argc, char *argv[]) {
           targetFormat = SDL_PIXELFORMAT_NV12;
         } else if (currentFrame.frame->format == AV_PIX_FMT_NV21) {
           targetFormat = SDL_PIXELFORMAT_NV21;
+        } else if (currentFrame.frame->format == AV_PIX_FMT_RGB24) {
+          // Tone mapped HDR: the decoder hands over packed RGB rather
+          // than YUV, so the frame skips the GPU's YUV conversion
+          // entirely instead of being packed back into YUV first.
+          targetFormat = SDL_PIXELFORMAT_RGB24;
         }
 
         SDL_Colorspace colorspace = getSDLColorspace(currentFrame.frame);
@@ -775,8 +812,12 @@ int main(int argc, char *argv[]) {
 
           auto renderStart = std::chrono::steady_clock::now();
           // Copy raw plane segments directly to GPU-mapped texture memory
-          if (texFormat == SDL_PIXELFORMAT_NV12 ||
-              texFormat == SDL_PIXELFORMAT_NV21) {
+          if (texFormat == SDL_PIXELFORMAT_RGB24) {
+            SDL_UpdateTexture(videoTexture, nullptr,
+                              currentFrame.frame->data[0],
+                              currentFrame.frame->linesize[0]);
+          } else if (texFormat == SDL_PIXELFORMAT_NV12 ||
+                     texFormat == SDL_PIXELFORMAT_NV21) {
             SDL_UpdateNVTexture(
                 videoTexture, nullptr, currentFrame.frame->data[0],
                 currentFrame.frame->linesize[0], currentFrame.frame->data[1],
@@ -813,12 +854,39 @@ int main(int argc, char *argv[]) {
       }
     }
 
+    // Tell the decoder how big the picture is actually being drawn, so an
+    // HDR source is not tone mapped at a resolution this window cannot
+    // show. The renderer's output size, not winWidth/winHeight: those are
+    // in window points, and on a HiDPI display the backbuffer is larger.
+    // Cheap and lock-free, so it just runs every frame rather than being
+    // hung off resize events -- which would also miss display-scale
+    // changes and the initial size.
+    {
+      int outW = 0;
+      int outH = 0;
+      if (SDL_GetCurrentRenderOutputSize(renderer, &outW, &outH)) {
+        controller.setDisplaySize(outW, outH);
+      }
+    }
+
     // 3. Rendering Pipeline
     SDL_SetRenderDrawColor(renderer, 15, 15, 17, 255); // Dark grey background
     SDL_RenderClear(renderer);
 
     // A. Draw Centered Letterboxed Video Frame
     if (videoTexture) {
+      // Apply GPU color modulation (white balance: temperature & tint)
+      // when eligible and not already folded into CPU software conversion or HDR tone mapping
+      const auto colorSettings = controller.getColorAdjustSettings();
+      const auto colorInfo = controller.getColorInfo();
+      if (!colorInfo.toneMapped && colorSettings.isGpuModulationEligible()) {
+        float rMod = 1.0f, gMod = 1.0f, bMod = 1.0f;
+        naikav::video::getGpuColorModulation(colorSettings, rMod, gMod, bMod);
+        SDL_SetTextureColorModFloat(videoTexture, rMod, gMod, bMod);
+      } else {
+        SDL_SetTextureColorModFloat(videoTexture, 1.0f, 1.0f, 1.0f);
+      }
+
       SDL_FRect dstRect;
       float windowAspect = static_cast<float>(winWidth) / winHeight;
       float videoAspect = static_cast<float>(texWidth) / texHeight;

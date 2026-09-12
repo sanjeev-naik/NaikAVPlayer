@@ -162,7 +162,23 @@ public:
 
     // Get max capacity of the queue
     size_t capacity() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
         return m_maxSize;
+    }
+
+    // Change how much the queue will hold. Raising it wakes any producer
+    // parked on a full queue; lowering it does not discard anything, the
+    // queue simply drains past the new limit before accepting more.
+    // Intended to be called while the pipeline is idle, between files.
+    void setCapacity(size_t maxSize) {
+        if (maxSize == 0) {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_maxSize = maxSize;
+        }
+        m_cond_push.notify_all();
     }
 
     void attachDepthMirror(std::atomic<int>* tracker = nullptr) {

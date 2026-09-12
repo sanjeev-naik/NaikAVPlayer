@@ -1,5 +1,7 @@
 #pragma once
 
+#include "core/FFmpegCompat.hpp"
+
 extern "C" {
 #include <libavfilter/avfilter.h>
 #include <libavfilter/buffersrc.h>
@@ -237,7 +239,7 @@ private:
         av_frame_unref(m_inFrame);
         m_inFrame->format = AV_SAMPLE_FMT_FLT;
         m_inFrame->sample_rate = m_sampleRate;
-        av_channel_layout_default(&m_inFrame->ch_layout, m_channels);
+        naikavSetFrameChannelLayout(m_inFrame, m_channels);
         m_inFrame->nb_samples = numFrames;
         if (av_frame_get_buffer(m_inFrame, 0) < 0) {
             m_frameCapacity = 0;
@@ -268,16 +270,14 @@ private:
             return false;
         }
 
-        AVChannelLayout chLayout;
-        av_channel_layout_default(&chLayout, m_channels);
         char layoutDesc[64];
-        av_channel_layout_describe(&chLayout, layoutDesc, sizeof(layoutDesc));
+        naikavDescribeDefaultChannelLayout(m_channels, layoutDesc,
+                                           sizeof(layoutDesc));
 
         char args[256];
         std::snprintf(args, sizeof(args),
                       "time_base=1/%d:sample_rate=%d:sample_fmt=flt:channel_layout=%s",
                       m_sampleRate, m_sampleRate, layoutDesc);
-        av_channel_layout_uninit(&chLayout);
 
         // framelog=quiet: without it, the filter prints a multi-line
         // "Integrated loudness / Loudness range / True peak" summary via

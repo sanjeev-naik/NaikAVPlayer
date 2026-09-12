@@ -1,6 +1,7 @@
 #pragma once
 
 #include "audio/dsp/LoudnessMeter.hpp"
+#include "core/FFmpegCompat.hpp"
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -53,7 +54,8 @@ inline double prescanIntegratedLufs(const std::string& filePath, int audioStream
     int streamIdx = audioStreamIndex;
     if (streamIdx < 0 || streamIdx >= static_cast<int>(fmtCtx->nb_streams) ||
         fmtCtx->streams[streamIdx]->codecpar->codec_type != AVMEDIA_TYPE_AUDIO) {
-        const AVCodec* dummyDecoder = nullptr;
+        // Type differs by FFmpeg version -- see NaikavBestStreamCodec.
+        NaikavBestStreamCodec dummyDecoder = nullptr;
         streamIdx = av_find_best_stream(fmtCtx, AVMEDIA_TYPE_AUDIO, -1, -1, &dummyDecoder, 0);
     }
     if (streamIdx < 0) {

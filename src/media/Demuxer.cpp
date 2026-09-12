@@ -1,4 +1,6 @@
 #include "media/Demuxer.hpp"
+#include "core/FFmpegCompat.hpp"
+#include <cstdio>
 #include <iostream>
 #include <chrono>
 #include <cmath>
@@ -29,6 +31,7 @@ Demuxer::Demuxer(const std::string& filename,
       m_audioCodecParams(nullptr),
       m_videoTimeBase{0, 1},
       m_audioTimeBase{0, 1},
+      m_startTimeUs(0),
       m_videoStartTime(0),
       m_audioStartTime(0),
       m_duration(0.0),
@@ -60,7 +63,124 @@ Demuxer::~Demuxer() {
     }
 }
 
+// Recover the file's static HDR metadata by decoding a frame or two in
+// software.
+//
+// Mastering-display luminance and MaxCLL usually reach the player as frame
+// side data, put there by the decoder from the codec's SEI. A *hardware*
+// decoder does not do that -- QSV hands back frames with no side data at
+// all -- and not every container keeps a stream-level copy to fall back
+// on: Matroska commonly keeps none, so a 4K HDR10 MKV played on the GPU
+// arrives with nothing at all to tone map from and silently falls back to
+// the generic 1000-nit default. On a grade mastered at 4000 nits whose
+// MaxCLL is 683 that is simply the wrong curve.
+//
+// The metadata is static for the whole file, so one software decode at
+// open time recovers it for every frame that follows, whatever decoder
+// ends up doing the real work. Only runs when the stream declares an HDR
+// transfer and the container offered nothing, so SDR files and
+// well-populated containers pay nothing.
+void Demuxer::probeHdrMetadata() {
+    if (m_videoStreamIdx < 0 || !m_videoCodecParams || !m_formatCtx) {
+        return;
+    }
+    const AVColorTransferCharacteristic trc = m_videoCodecParams->color_trc;
+    if (trc != AVCOL_TRC_SMPTE2084 && trc != AVCOL_TRC_ARIB_STD_B67) {
+        return;  // SDR: nothing to recover
+    }
+#if NAIKAV_HAVE_CODECPAR_SIDE_DATA
+    // Already present at stream level? Then VideoDecoder reads it directly.
+    // Where the codec parameters cannot carry side data at all (older
+    // FFmpeg) there is nothing to check and the probe simply always runs,
+    // which is the correct answer for those builds.
+    for (int i = 0; i < m_videoCodecParams->nb_coded_side_data; ++i) {
+        const AVPacketSideDataType t = m_videoCodecParams->coded_side_data[i].type;
+        if (t == AV_PKT_DATA_MASTERING_DISPLAY_METADATA ||
+            t == AV_PKT_DATA_CONTENT_LIGHT_LEVEL) {
+            return;
+        }
+    }
+#endif
+
+    const AVCodec* swCodec = avcodec_find_decoder(m_videoCodecParams->codec_id);
+    if (!swCodec) {
+        return;
+    }
+    AVCodecContext* ctx = avcodec_alloc_context3(swCodec);
+    if (!ctx) {
+        return;
+    }
+    if (avcodec_parameters_to_context(ctx, m_videoCodecParams) < 0) {
+        avcodec_free_context(&ctx);
+        return;
+    }
+    // One thread and no deep buffering: this wants the first frame out as
+    // cheaply as possible, not throughput.
+    ctx->thread_count = 1;
+    if (avcodec_open2(ctx, swCodec, nullptr) < 0) {
+        avcodec_free_context(&ctx);
+        return;
+    }
+
+    AVPacket* pkt = av_packet_alloc();
+    AVFrame* frame = av_frame_alloc();
+    // Bounded so a stream that never yields a decodable frame cannot turn
+    // opening a file into an unbounded scan.
+    constexpr int kMaxProbePackets = 48;
+    int packetsRead = 0;
+    bool done = false;
+
+    while (pkt && frame && !done && packetsRead < kMaxProbePackets &&
+           av_read_frame(m_formatCtx, pkt) >= 0) {
+        if (pkt->stream_index != m_videoStreamIdx) {
+            av_packet_unref(pkt);
+            continue;
+        }
+        packetsRead++;
+        if (avcodec_send_packet(ctx, pkt) >= 0) {
+            while (avcodec_receive_frame(ctx, frame) >= 0) {
+                for (int i = 0; i < frame->nb_side_data; ++i) {
+                    const AVFrameSideData* sd = frame->side_data[i];
+                    if (!sd || !sd->data) continue;
+                    if (sd->type == AV_FRAME_DATA_MASTERING_DISPLAY_METADATA) {
+                        const auto* md =
+                            reinterpret_cast<const AVMasteringDisplayMetadata*>(sd->data);
+                        if (md->has_luminance && md->max_luminance.den != 0) {
+                            const double nits = av_q2d(md->max_luminance);
+                            if (nits > 0.0) m_probedMasteringNits = static_cast<float>(nits);
+                        }
+                    } else if (sd->type == AV_FRAME_DATA_CONTENT_LIGHT_LEVEL) {
+                        const auto* cl =
+                            reinterpret_cast<const AVContentLightMetadata*>(sd->data);
+                        if (cl->MaxCLL > 0) m_probedContentLightNits = static_cast<float>(cl->MaxCLL);
+                    }
+                }
+                av_frame_unref(frame);
+                // One decoded frame is enough: this metadata is static.
+                done = true;
+            }
+        }
+        av_packet_unref(pkt);
+    }
+
+    if (pkt) av_packet_free(&pkt);
+    if (frame) av_frame_free(&frame);
+    avcodec_free_context(&ctx);
+
+    // Rewind: the real read loop must start at the beginning, not wherever
+    // the probe left the file.
+    av_seek_frame(m_formatCtx, -1, 0, AVSEEK_FLAG_BACKWARD);
+
+    if (m_probedMasteringNits > 0.0f || m_probedContentLightNits > 0.0f) {
+        std::cout << "Probed HDR metadata from bitstream: mastering peak "
+                  << m_probedMasteringNits << " nits, MaxCLL "
+                  << m_probedContentLightNits << " nits" << std::endl;
+    }
+}
+
 bool Demuxer::open() {
+    m_lastError.clear();
+
     // Open video file with protocol whitelist restrictions (local file and pipe only)
     AVDictionary* options = nullptr;
     av_dict_set(&options, "protocol_whitelist", "file,pipe", 0);
@@ -69,7 +189,18 @@ bool Demuxer::open() {
     av_dict_free(&options);
 
     if (ret < 0) {
-        std::cerr << "Error: Could not open media file " << m_filename << std::endl;
+        // av_strerror carries the reason that actually matters -- a
+        // truncated download reports "moov atom not found", which is the
+        // difference between "the player is broken" and "re-download the
+        // file". AVERROR strings are short enough to put straight in front
+        // of the user.
+        char errbuf[AV_ERROR_MAX_STRING_SIZE] = {0};
+        if (av_strerror(ret, errbuf, sizeof(errbuf)) < 0) {
+            std::snprintf(errbuf, sizeof(errbuf), "error %d", ret);
+        }
+        m_lastError = errbuf;
+        std::cerr << "Error: Could not open media file " << m_filename
+                  << ": " << m_lastError << std::endl;
         return false;
     }
 
@@ -78,6 +209,7 @@ bool Demuxer::open() {
 
     // Retrieve stream info
     if (avformat_find_stream_info(m_formatCtx, nullptr) < 0) {
+        m_lastError = "could not read stream information (file may be truncated or corrupt)";
         std::cerr << "Error: Could not find stream information" << std::endl;
         return false;
     }
@@ -96,8 +228,19 @@ bool Demuxer::open() {
             m_videoStreamIdx = i;
             m_videoCodecParams = codecParams;
             m_videoTimeBase = m_formatCtx->streams[i]->time_base;
-            m_videoStartTime = m_formatCtx->streams[i]->start_time;
-            if (m_videoStartTime == AV_NOPTS_VALUE) m_videoStartTime = 0;
+            // Start times are assigned together in computeStartTimes()
+            // once every stream is known -- they must share one origin.
+            // avg_frame_rate is the honest average over the file;
+            // r_frame_rate is the smallest rate all timestamps are
+            // multiples of, which for a variable-rate stream can be a
+            // large multiple of the real one. Prefer the former.
+            const AVRational avg = m_formatCtx->streams[i]->avg_frame_rate;
+            const AVRational rfr = m_formatCtx->streams[i]->r_frame_rate;
+            if (avg.num > 0 && avg.den > 0) {
+                m_videoFrameRate = av_q2d(avg);
+            } else if (rfr.num > 0 && rfr.den > 0) {
+                m_videoFrameRate = av_q2d(rfr);
+            }
         } else if (codecParams->codec_type == AVMEDIA_TYPE_AUDIO) {
             naikav::audio::AudioTrackInfo info;
             info.id = static_cast<int>(i);
@@ -183,6 +326,10 @@ bool Demuxer::open() {
         }
     }
 
+    // Before selecting an audio stream: selectAudioStream() derives that
+    // stream's origin from m_startTimeUs, which this establishes.
+    computeStartTimes();
+
     // Select default audio stream if audio tracks were found
     if (!m_audioTracks.empty()) {
         auto it = std::find_if(m_audioTracks.begin(), m_audioTracks.end(),
@@ -193,6 +340,7 @@ bool Demuxer::open() {
 
 
     if (m_videoStreamIdx < 0 && m_audioStreamIdx < 0) {
+        m_lastError = "no playable video or audio streams in this file";
         std::cerr << "Error: Could not find any video or audio streams" << std::endl;
         return false;
     }
@@ -210,6 +358,10 @@ bool Demuxer::open() {
               << ", Audio Stream: " << m_audioStreamIdx.load()
               << ", Audio Tracks: " << m_audioTracks.size()
               << ", Subtitle Tracks: " << m_subtitleTracks.size() << std::endl;
+
+    // After the streams are known and before the read loop starts, so the
+    // rewind it performs cannot disturb playback.
+    probeHdrMetadata();
 
     m_eof = false;
     return true;
@@ -232,8 +384,7 @@ bool Demuxer::selectAudioStream(int streamIdx) {
     m_audioStreamIdx.store(streamIdx);
     m_audioCodecParams = m_formatCtx->streams[streamIdx]->codecpar;
     m_audioTimeBase = m_formatCtx->streams[streamIdx]->time_base;
-    m_audioStartTime = m_formatCtx->streams[streamIdx]->start_time;
-    if (m_audioStartTime == AV_NOPTS_VALUE) m_audioStartTime = 0;
+    m_audioStartTime = av_rescale_q(m_startTimeUs, AV_TIME_BASE_Q, m_audioTimeBase);
     return true;
 }
 
@@ -303,6 +454,39 @@ double Demuxer::packetTimeSeconds(const AVPacket* pkt, int streamIdx) const {
     return (ts - m_audioStartTime) * av_q2d(m_audioTimeBase);
 }
 
+// Establishes the one origin every stream's timestamps are measured from.
+// Prefers the container's own start time; falls back to the earliest stream
+// start when the container declares none, and to zero when nothing does.
+void Demuxer::computeStartTimes() {
+    m_startTimeUs = 0;
+    if (!m_formatCtx) {
+        return;
+    }
+    if (m_formatCtx->start_time != AV_NOPTS_VALUE) {
+        m_startTimeUs = m_formatCtx->start_time;
+    } else {
+        int64_t earliest = INT64_MAX;
+        for (unsigned int i = 0; i < m_formatCtx->nb_streams; ++i) {
+            const AVStream* st = m_formatCtx->streams[i];
+            if (st->start_time == AV_NOPTS_VALUE) {
+                continue;
+            }
+            const int64_t us = av_rescale_q(st->start_time, st->time_base, AV_TIME_BASE_Q);
+            earliest = std::min(earliest, us);
+        }
+        if (earliest != INT64_MAX) {
+            m_startTimeUs = earliest;
+        }
+    }
+
+    if (m_videoStreamIdx >= 0) {
+        m_videoStartTime = av_rescale_q(m_startTimeUs, AV_TIME_BASE_Q, m_videoTimeBase);
+    }
+    if (m_audioStreamIdx.load() >= 0) {
+        m_audioStartTime = av_rescale_q(m_startTimeUs, AV_TIME_BASE_Q, m_audioTimeBase);
+    }
+}
+
 AVCodecParameters* Demuxer::getSubtitleCodecParams(int streamIdx) const {
     if (!m_formatCtx || streamIdx < 0 || streamIdx >= static_cast<int>(m_formatCtx->nb_streams)) {
         return nullptr;
@@ -348,12 +532,18 @@ void Demuxer::performSeek() {
     if (m_videoStreamIdx >= 0) {
         streamIdx = m_videoStreamIdx;
         // In FFmpeg, stream-specific seek requires the timestamp in stream timebase units
-        targetTs = static_cast<int64_t>(targetTime / av_q2d(m_videoTimeBase));
+        // targetTime is normalised against m_startTimeUs (see
+        // computeStartTimes()), so the origin has to be added back to land
+        // on the container's own timeline. Without this, seeking to T on a
+        // file whose streams do not begin at zero lands T - start instead.
+        targetTs = static_cast<int64_t>(targetTime / av_q2d(m_videoTimeBase)) +
+                   m_videoStartTime;
     } else if (audioIdx >= 0) {
         streamIdx = audioIdx;
-        targetTs = static_cast<int64_t>(targetTime / av_q2d(m_audioTimeBase));
+        targetTs = static_cast<int64_t>(targetTime / av_q2d(m_audioTimeBase)) +
+                   m_audioStartTime;
     } else {
-        targetTs = static_cast<int64_t>(targetTime * AV_TIME_BASE);
+        targetTs = static_cast<int64_t>(targetTime * AV_TIME_BASE) + m_startTimeUs;
     }
     
     // Seek to nearest keyframe around target timestamp using modern fast binary-search avformat_seek_file
@@ -361,7 +551,8 @@ void Demuxer::performSeek() {
     if (ret < 0) {
         std::cerr << "Warning: Could not seek to " << targetTime << "s using stream " << streamIdx << std::endl;
         // Fallback to default seek if stream-specific seek fails
-        int64_t fallbackTs = static_cast<int64_t>(targetTime * AV_TIME_BASE);
+        int64_t fallbackTs =
+            static_cast<int64_t>(targetTime * AV_TIME_BASE) + m_startTimeUs;
         avformat_seek_file(m_formatCtx, -1, INT64_MIN, fallbackTs, INT64_MAX, 0);
     } else {
         std::cout << "Successfully seeked format context to " << targetTime << "s" << std::endl;
@@ -408,8 +599,8 @@ void Demuxer::threadLoop() {
             // so a consumer can tell -- independent of its own thread
             // timing -- whether this packet predates the most recent seek.
             // See the m_seekGeneration comment in Demuxer.hpp.
-            packet->opaque = reinterpret_cast<void*>(
-                static_cast<uintptr_t>(m_seekGeneration.load(std::memory_order_relaxed)));
+            naikavTagPacketGeneration(
+                packet, m_seekGeneration.load(std::memory_order_relaxed));
 
             SeekCatchupMode cmode = m_catchupMode.load();
             int currentAudioIdx = m_audioStreamIdx.load();

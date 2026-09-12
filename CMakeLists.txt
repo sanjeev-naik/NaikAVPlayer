@@ -590,6 +590,17 @@ if(TARGET_PLATFORM_WINDOWS AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_link_options(NaikAVPlayer_tests PRIVATE -static-libgcc -static-libstdc++)
 endif()
 
+# The test suite is a handful of very long functions rather than many small
+# ones -- main() alone runs to several thousand lines, and it calls
+# real_main(), which is longer still. Built /Od for coverage, MSVC reuses no
+# stack slots between their disjoint scopes, so the two frames come to about
+# 1.2 MB together and MSVC reserves each one in full on entry. That overflows
+# the 1 MB default reserve in __chkstk, before main() prints a single line.
+# The MinGW build never hit it only because its default reserve is 2 MB.
+if(MSVC)
+    target_link_options(NaikAVPlayer_tests PRIVATE /STACK:16777216)
+endif()
+
 # Apply compiler warning flags to test suite target
 target_compile_options(NaikAVPlayer_tests PRIVATE ${PROJECT_WARNING_FLAGS})
 
@@ -634,6 +645,41 @@ if(TARGET_PLATFORM_WINDOWS AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 
 setup_target_dependencies(NaikAVPlayer_dsp_repro)
+
+# -------------------------------------------------------------
+# Standalone HDR conversion timing harness (not part of the regular
+# test suite -- see tests/hdr_bench_standalone.cpp). Feeds real packets
+# through VideoDecoder with no window, audio device or render loop in
+# the way, and times decodeNextFrame() and convertFrame() separately.
+# Needs a 4K HDR file passed on the command line to say anything useful.
+# -------------------------------------------------------------
+add_executable(NaikAVPlayer_hdr_bench
+    tests/hdr_bench_standalone.cpp
+    src/video/VideoDecoder.cpp
+)
+
+target_include_directories(NaikAVPlayer_hdr_bench PRIVATE "${PLAYER_INCLUDE_DIR}")
+
+if(FFMPEG_USE_SYSTEM)
+    target_link_libraries(NaikAVPlayer_hdr_bench PRIVATE PkgConfig::FFMPEG)
+else()
+    target_include_directories(NaikAVPlayer_hdr_bench SYSTEM PRIVATE "${FFMPEG_DIR}/include")
+    target_link_directories(NaikAVPlayer_hdr_bench PRIVATE "${FFMPEG_DIR}/lib")
+    target_link_libraries(NaikAVPlayer_hdr_bench PRIVATE
+        avcodec
+        avformat
+        avutil
+        swscale
+    )
+endif()
+if(TARGET_PLATFORM_LINUX)
+    target_link_libraries(NaikAVPlayer_hdr_bench PRIVATE pthread dl)
+endif()
+if(TARGET_PLATFORM_WINDOWS AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_link_options(NaikAVPlayer_hdr_bench PRIVATE -static-libgcc -static-libstdc++)
+endif()
+
+setup_target_dependencies(NaikAVPlayer_hdr_bench)
 
 # -------------------------------------------------------------
 # Standalone getColorInfo() data-race diagnostic (see

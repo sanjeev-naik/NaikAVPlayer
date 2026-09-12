@@ -14,6 +14,7 @@ extern "C" {
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
 #include <libavutil/channel_layout.h>
+#include <libavutil/mastering_display_metadata.h>
 }
 
 // Coordinates the seek catch-up phase between PlayerController and the
@@ -25,6 +26,11 @@ enum class SeekCatchupMode { NONE = 0, LANDING };
 class Demuxer {
 private:
     std::string m_filename;
+    std::string m_lastError;
+    double m_videoFrameRate = 0.0;
+    float m_probedMasteringNits = 0.0f;
+    float m_probedContentLightNits = 0.0f;
+    void probeHdrMetadata();
     AVFormatContext* m_formatCtx;
     
     std::atomic<int> m_videoStreamIdx;
@@ -38,8 +44,23 @@ private:
     
     AVRational m_videoTimeBase;
     AVRational m_audioTimeBase;
+
+    // The instant the *file* begins, in AV_TIME_BASE units, and the same
+    // instant expressed in each stream's own time base.
+    //
+    // Every stream timestamp is normalised against this one shared origin,
+    // never against the stream's own start_time. Those differ: this
+    // project's 4K HDR10+ test clip starts its video stream at 0.838s and
+    // its audio stream at 0.000s, so subtracting each stream's own start
+    // shifted video 838ms earlier than audio -- audible as the audio
+    // lagging by most of a second. A common origin preserves the relative
+    // offset the container describes while still letting the timeline
+    // start at zero for a file that begins at some large timestamp (an
+    // MPEG-TS recording, say).
+    int64_t m_startTimeUs;
     int64_t m_videoStartTime;
     int64_t m_audioStartTime;
+    void computeStartTimes();
     
     double m_duration; // in seconds
     
@@ -93,6 +114,12 @@ public:
     ~Demuxer();
 
     bool open();
+
+    // Why the last open() returned false, in a form fit to show a user.
+    // Empty when open() succeeded. Demuxer::open() reports its failures on
+    // stderr, which the MSVC build has no console for -- without this a bad
+    // file leaves the welcome screen up with no explanation at all.
+    const std::string& getLastError() const { return m_lastError; }
     void start();
     void stop();
     
@@ -137,6 +164,19 @@ public:
     int64_t getSubtitleStartTime(int streamIdx) const;
 
     AVRational getVideoTimeBase() const { return m_videoTimeBase; }
+
+    // Frames per second of the video stream, or 0 when the container
+    // declares no usable rate. AVCodecParameters::framerate is frequently
+    // left unset by demuxers, so this comes off the stream itself.
+    double getVideoFrameRate() const { return m_videoFrameRate; }
+
+    // Static HDR metadata recovered from the video bitstream, in nits, or
+    // 0 when the stream carries none. Some containers (Matroska in
+    // particular) keep no stream-level copy, so the only place these
+    // exist is the codec's own SEI -- which a *hardware* decoder does not
+    // expose. Probed once at open(); see probeHdrMetadata().
+    float getProbedMasteringPeakNits() const { return m_probedMasteringNits; }
+    float getProbedContentLightNits() const { return m_probedContentLightNits; }
     AVRational getAudioTimeBase() const { return m_audioTimeBase; }
     int64_t getVideoStartTime() const { return m_videoStartTime; }
     int64_t getAudioStartTime() const { return m_audioStartTime; }
